@@ -102,6 +102,8 @@ pub struct Settings {
     pub group_bars: GroupBars,
     #[derive_args(StatusIconPartial)]
     pub status_icon: StatusIcon,
+    #[derive_args(DragDropConfigPartial)]
+    pub drag_drop: DragDropConfig,
     #[derive_args(ExperimentalPartial)]
     pub experimental: Experimental,
 }
@@ -226,6 +228,36 @@ pub struct ScrollConfig {
     pub invert_scroll_direction: bool,
     pub infinite_loop: bool,
     pub single_column_aspect_ratio: String,
+}
+
+#[derive(PartialConfig!)]
+#[derive_args(DragDropConfigPartial)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DragDropConfig {
+    /// Enable drag-to-rearrange windows.
+    pub enable: bool,
+    /// Minimum drag distance in pixels before showing drop zones.
+    pub drag_threshold: f64,
+    /// Width/height of edge zones as a ratio of window dimension (0.0-0.5).
+    pub edge_zone_ratio: f64,
+    /// Time in milliseconds to hover in an edge zone before split activates.
+    pub split_dwell_ms: u64,
+}
+
+impl Default for DragDropConfig {
+    fn default() -> Self {
+        Config::default().settings.drag_drop
+    }
+}
+
+impl DragDropConfig {
+    pub fn validated(mut self) -> Self {
+        self.drag_threshold = self.drag_threshold.clamp(1.0, 100.0);
+        self.edge_zone_ratio = self.edge_zone_ratio.clamp(0.05, 0.4);
+        self.split_dwell_ms = self.split_dwell_ms.clamp(0, 2000);
+        self
+    }
 }
 
 impl Default for ScrollConfig {

@@ -121,12 +121,24 @@ pub fn hide_preferences() {
     }
 }
 
+/// Action type for drop zones
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DropActionType {
+    /// Swap window assignments (safest)
+    Swap = 0,
+    /// Insert as sibling
+    Insert = 1,
+    /// Split into new container
+    Split = 2,
+}
+
 /// Represents a drop zone for drag-and-drop window rearrangement
 #[derive(Debug, Clone, Copy)]
 pub struct DropZone {
-    /// X coordinate of the zone
+    /// X coordinate of the zone (screen-local)
     pub x: f32,
-    /// Y coordinate of the zone
+    /// Y coordinate of the zone (screen-local)
     pub y: f32,
     /// Width of the zone
     pub width: f32,
@@ -136,6 +148,14 @@ pub struct DropZone {
     pub position_type: i32,
     /// Target window ID for the drop
     pub target_window_id: u64,
+    /// Action type (0=swap, 1=insert, 2=split)
+    pub action_type: DropActionType,
+    /// Whether this zone is currently active (hovered)
+    pub is_active: bool,
+    /// Dwell progress for split zones (0.0-1.0)
+    pub dwell_progress: f32,
+    /// Screen index this zone belongs to
+    pub screen_index: i32,
 }
 
 impl DropZone {
@@ -155,11 +175,42 @@ impl DropZone {
             height,
             position_type,
             target_window_id,
+            action_type: DropActionType::Swap,
+            is_active: false,
+            dwell_progress: 0.0,
+            screen_index: 0,
         }
     }
 
-    /// Convert to flat array for FFI
-    fn to_floats(&self) -> [f32; 6] {
+    /// Create a drop zone with extended info
+    pub fn with_action(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        position_type: i32,
+        target_window_id: u64,
+        action_type: DropActionType,
+        is_active: bool,
+        dwell_progress: f32,
+        screen_index: i32,
+    ) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            position_type,
+            target_window_id,
+            action_type,
+            is_active,
+            dwell_progress,
+            screen_index,
+        }
+    }
+
+    /// Convert to flat array for FFI (10 floats per zone)
+    fn to_floats(&self) -> [f32; 10] {
         [
             self.x,
             self.y,
@@ -167,6 +218,10 @@ impl DropZone {
             self.height,
             self.position_type as f32,
             self.target_window_id as f32,
+            self.action_type as u8 as f32,
+            if self.is_active { 1.0 } else { 0.0 },
+            self.dwell_progress,
+            self.screen_index as f32,
         ]
     }
 }

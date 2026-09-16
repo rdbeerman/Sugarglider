@@ -33,7 +33,9 @@ use tracing::{Span, debug, error, info, instrument, trace, warn};
 
 use super::mouse;
 use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, pid_t};
-use crate::actor::layout::{self, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo};
+use crate::actor::layout::{
+    self, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo,
+};
 use crate::actor::raise::{self, RaiseManager, RaiseRequest};
 use crate::actor::space_manager::SpaceManager;
 use crate::actor::{group_bars, space_manager, status, window_server, wm_controller};
@@ -46,6 +48,7 @@ use crate::sys::geometry::{CGRectDef, CGRectExt, SameAs, round_to_physical};
 use crate::sys::screen::{CoordinateConverter, SpaceId};
 use crate::sys::timer::Timer;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
+use crate::ui::swift_bridge;
 
 pub type Sender = crate::actor::Sender<Event>;
 pub type Receiver = crate::actor::Receiver<Event>;
@@ -251,6 +254,8 @@ pub struct Reactor {
     mouse_tx: Option<mouse::Sender>,
     status_tx: Option<status::Sender>,
     group_indicators_tx: group_bars::Sender,
+    /// Debug overlay showing drop zones for all windows.
+    debug_drop_zones_visible: bool,
 }
 
 /// How many times in a row we write the same frame to a window before giving
@@ -419,6 +424,7 @@ impl Reactor {
             mouse_tx: None,
             status_tx: None,
             group_indicators_tx: group_indicators_tx,
+            debug_drop_zones_visible: false,
         }
     }
 
@@ -722,6 +728,12 @@ impl Reactor {
                     {
                         self.layout.begin_interactive_move(space, wid, node, point);
                         self.in_drag = true;
+                    } else if let Some((wid, node)) =
+                        self.layout.hit_test_window(space, point, screen.frame, &self.config)
+                    {
+                        // Start drag-to-rearrange for any tiled window
+                        self.layout.begin_interactive_drag(space, wid, node, point);
+                        self.in_drag = true;
                     }
                 }
             }
@@ -736,6 +748,12 @@ impl Reactor {
                             &self.config,
                         ) {
                             self.update_layout(&[], false);
+                        } else if let Some((_source_node, action)) = self.layout
+                            .update_interactive_drag(point, screen.frame, &self.config, Instant::now())
+                        {
+                            // TODO: Show drop zone overlay via swift_bridge
+                            // For now, just log the current action for debugging
+                            trace!(?action, "drag action");
                         }
                     }
                 }
@@ -746,6 +764,14 @@ impl Reactor {
                         if let Some(space) = screen.space {
                             self.layout.end_interactive_resize(space, screen.frame, &self.config);
                             self.layout.end_interactive_move(space, screen.frame, &self.config);
+                            // Apply drag-to-rearrange action if any
+                            if let Some((source_node, action)) =
+                                self.layout.end_interactive_drag(space)
+                            {
+                                self.layout.apply_drop_action(space, source_node, action);
+                                // TODO: Hide drop zone overlay via swift_bridge
+                                self.update_layout(&[], false);
+                            }
                         }
                     }
                 }
@@ -852,6 +878,15 @@ impl Reactor {
                     if let Some(space) = screen.space {
                         self.layout.debug_tree_desc(space, "", true);
                     }
+                }
+                // Toggle debug drop zone overlay
+                self.debug_drop_zones_visible = !self.debug_drop_zones_visible;
+                if self.debug_drop_zones_visible {
+                    self.refresh_debug_drop_zones();
+                    info!("Debug drop zones enabled");
+                } else {
+                    swift_bridge::hide_drop_zones();
+                    info!("Debug drop zones disabled");
                 }
             }
             Event::Command(Command::Reactor(ReactorCommand::Serialize)) => {
@@ -1284,6 +1319,40 @@ impl Reactor {
         } else {
             anim.skip_to_end();
         }
+
+        // Refresh debug overlay if visible
+        self.refresh_debug_drop_zones();
+    }
+
+    /// Refresh the debug drop zone overlay if it's currently visible.
+    fn refresh_debug_drop_zones(&self) {
+        if !self.debug_drop_zones_visible {
+            return;
+        }
+
+        let mut all_zones = Vec::new();
+        for (idx, screen) in self.screens.iter().enumerate() {
+            if let Some(space) = screen.space {
+                let zones = self.layout.generate_debug_drop_zones(
+                    space,
+                    screen.frame,
+                    &self.config,
+                    idx as i32,
+                );
+                debug!(
+                    "Debug zones: screen {} space {:?} frame {:?} -> {} zones",
+                    idx,
+                    space,
+                    screen.frame,
+                    zones.len()
+                );
+                all_zones.extend(zones);
+            } else {
+                debug!("Debug zones: screen {} has no space", idx);
+            }
+        }
+        debug!("Debug zones: total {} zones", all_zones.len());
+        swift_bridge::show_drop_zones(&all_zones);
     }
 }
 

@@ -39,6 +39,12 @@ group_bars.vertical_placement = "right"
 # Enables the status icon.
 status_icon.enable = true
 
+# Drag-to-rearrange windows settings.
+drag_drop.enable = true
+drag_drop.drag_threshold = 10.0
+drag_drop.edge_zone_ratio = 0.15
+drag_drop.split_dwell_ms = 300
+
 # Whether to include Glide's default key bindings.
 #
 # Note: Default keys are always included if there is no keys section of the

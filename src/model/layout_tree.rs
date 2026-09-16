@@ -231,6 +231,26 @@ impl LayoutTree {
         }
     }
 
+    pub fn move_node_before(&mut self, sibling: NodeId, moving_node: NodeId) {
+        let map = &self.tree.map;
+        let Some(old_parent) = moving_node.parent(map) else {
+            return;
+        };
+        let is_selection =
+            self.tree.data.selection.local_selection(map, old_parent) == Some(moving_node);
+        if sibling.parent(self.map()).is_none() {
+            // Don't attempt to add before the root node.
+            moving_node.detach(&mut self.tree).push_front(sibling);
+        } else {
+            moving_node.detach(&mut self.tree).insert_before(sibling);
+        }
+        if is_selection {
+            for node in moving_node.ancestors(&self.tree.map).take_while(|&a| a != old_parent) {
+                self.tree.data.selection.select_locally(&self.tree.map, node);
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn add_windows_if_missing(
         &mut self,
