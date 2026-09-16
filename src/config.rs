@@ -499,6 +499,7 @@ pub fn write_preferences_to_file(
 ) -> anyhow::Result<PathBuf> {
     use std::fs;
     use std::io::Write;
+
     use toml_edit::{DocumentMut, value};
 
     let path = config_path();
