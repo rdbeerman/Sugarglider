@@ -33,9 +33,7 @@ use tracing::{Span, debug, error, info, instrument, trace, warn};
 
 use super::mouse;
 use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, pid_t};
-use crate::actor::layout::{
-    self, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo,
-};
+use crate::actor::layout::{self, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo};
 use crate::actor::raise::{self, RaiseManager, RaiseRequest};
 use crate::actor::space_manager::SpaceManager;
 use crate::actor::{group_bars, space_manager, status, window_server, wm_controller};
@@ -748,8 +746,13 @@ impl Reactor {
                             &self.config,
                         ) {
                             self.update_layout(&[], false);
-                        } else if let Some((_source_node, action)) = self.layout
-                            .update_interactive_drag(point, screen.frame, &self.config, Instant::now())
+                        } else if let Some((_source_node, action)) =
+                            self.layout.update_interactive_drag(
+                                point,
+                                screen.frame,
+                                &self.config,
+                                Instant::now(),
+                            )
                         {
                             // TODO: Show drop zone overlay via swift_bridge
                             // For now, just log the current action for debugging

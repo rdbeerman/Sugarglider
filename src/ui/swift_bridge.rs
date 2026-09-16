@@ -75,7 +75,9 @@ pub fn init() -> bool {
 
     #[cfg(not(feature = "swift-ui"))]
     {
-        tracing::warn!("SugargliderUI Swift library not available (compiled without swift-ui feature)");
+        tracing::warn!(
+            "SugargliderUI Swift library not available (compiled without swift-ui feature)"
+        );
         false
     }
 }
@@ -389,8 +391,9 @@ fn error_string(msg: &str) -> *mut c_char {
 }
 
 /// Channel sender for config updates, set during initialization.
-static CONFIG_UPDATE_SENDER: OnceLock<std::sync::Mutex<Option<crate::actor::wm_controller::Sender>>> =
-    OnceLock::new();
+static CONFIG_UPDATE_SENDER: OnceLock<
+    std::sync::Mutex<Option<crate::actor::wm_controller::Sender>>,
+> = OnceLock::new();
 
 /// Set the sender for config updates. Called during WmController initialization.
 pub fn set_config_update_sender(sender: crate::actor::wm_controller::Sender) {

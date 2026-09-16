@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
+use notify::RecursiveMode;
+use notify_debouncer_mini::new_debouncer;
 use sugarglider::actor::server::{self, AsciiEscaped, Request, Response, ServiceRequest};
 use sugarglider::config::{Config, config_path};
 use sugarglider::sys::bundle::{self, BundleError};
 use sugarglider::sys::message_port::{RemoteMessagePort, RemotePortCreateError, SendError};
-use notify::RecursiveMode;
-use notify_debouncer_mini::new_debouncer;
 
 const TIMEOUT: Duration = Duration::from_millis(1000);
 

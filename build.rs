@@ -47,19 +47,11 @@ fn build_swift_ui() {
     }
 
     // Link the Swift library
-    let swift_build_dir = swift_package_dir
-        .join(".build")
-        .join(swift_config);
+    let swift_build_dir = swift_package_dir.join(".build").join(swift_config);
 
-    println!(
-        "cargo:rustc-link-search=native={}",
-        swift_build_dir.display()
-    );
+    println!("cargo:rustc-link-search=native={}", swift_build_dir.display());
     println!("cargo:rustc-link-lib=dylib=SugargliderUI");
 
     // Set rpath so the dylib can be found at runtime
-    println!(
-        "cargo:rustc-link-arg=-Wl,-rpath,{}",
-        swift_build_dir.display()
-    );
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", swift_build_dir.display());
 }

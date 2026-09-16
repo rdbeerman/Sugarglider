@@ -132,11 +132,7 @@ impl PreferencesJson {
         // Build new keys from hotkeys, matching by command_id
         let keys = self.build_keys_from_hotkeys(config);
 
-        Config {
-            settings,
-            window_rules,
-            keys,
-        }
+        Config { settings, window_rules, keys }
     }
 
     /// Build the keys vector from hotkeys JSON, using original commands from config.

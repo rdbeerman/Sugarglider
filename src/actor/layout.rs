@@ -205,7 +205,10 @@ pub enum DropAction {
     /// Insert the dragged node as a sibling of the target.
     Insert { target_node: NodeId, before: bool },
     /// Create a new container around the target and insert the dragged node.
-    Split { target_node: NodeId, orientation: ContainerKind },
+    Split {
+        target_node: NodeId,
+        orientation: ContainerKind,
+    },
 }
 
 /// Region within a window frame for drop zone detection.
@@ -677,8 +680,17 @@ impl LayoutManager {
                     focus_window: None,
                 };
             }
-            LayoutEvent::WindowsOnScreenUpdated(space, pid, windows) => {
+            LayoutEvent::WindowsOnScreenUpdated(space, pid, mut windows) => {
                 self.debug_tree(space);
+                // Sort windows by x position so they're added to the tree in spatial order.
+                // This prevents reshuffling windows that are already arranged correctly.
+                windows.sort_by(|(_, a), (_, b)| {
+                    a.frame
+                        .origin
+                        .x
+                        .partial_cmp(&b.frame.origin.x)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 // The windows may already be in the layout if we restored a saved state, so
                 // make sure not to duplicate or erase them here.
                 for (wid, info) in &windows {
@@ -1799,8 +1811,7 @@ impl LayoutManager {
             }
             if frame.contains(mouse) {
                 if let Some(node) = self.tree.window_node(layout, *wid) {
-                    let zone =
-                        DropZoneRegion::from_point(mouse, *frame, drag_cfg.edge_zone_ratio);
+                    let zone = DropZoneRegion::from_point(mouse, *frame, drag_cfg.edge_zone_ratio);
                     new_target = Some(HoverTarget {
                         node,
                         wid: *wid,
@@ -1865,10 +1876,7 @@ impl LayoutManager {
                     self.tree.move_node_after(target_node, source_node);
                 }
             }
-            DropAction::Split {
-                target_node,
-                orientation,
-            } => {
+            DropAction::Split { target_node, orientation } => {
                 // Create container around target, then insert source
                 self.tree.nest_in_container(layout, target_node, orientation);
                 self.tree.move_node_after(target_node, source_node);

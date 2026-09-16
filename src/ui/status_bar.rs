@@ -14,8 +14,9 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::CGSize;
 use objc2_foundation::{NSData, NSObject, NSString, ns_string};
-use tracing::{Span, debug, error, warn};
+use tracing::{Span, debug, warn};
 
+use crate::actor::layout::LayoutCommand;
 use crate::actor::reactor;
 use crate::actor::wm_controller::{self, WmCmd, WmCommand, WmEvent};
 use crate::config;
@@ -24,7 +25,7 @@ use crate::ui::swift_bridge;
 const SAVE_AND_QUIT_TAG: i64 = 1;
 const TOGGLE_GLOBAL_TAG: i64 = 2;
 const TOGGLE_SPACE_TAG: i64 = 3;
-const SHOW_DOCS_TAG: i64 = 4;
+const FLOAT_WINDOW_TAG: i64 = 4;
 const SHOW_PREFERENCES_TAG: i64 = 5;
 
 pub struct StatusIcon {
@@ -33,6 +34,8 @@ pub struct StatusIcon {
     _menu_handler: Retained<MenuHandler>,
     toggle_item: Retained<NSMenuItem>,
     space_toggle_item: Retained<NSMenuItem>,
+    /// Animation frames for the tail swing animation (frame 0 = rest, 1 = right, 2 = left).
+    animation_frames: Vec<Retained<NSImage>>,
 }
 
 impl StatusIcon {
@@ -45,11 +48,28 @@ impl StatusIcon {
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
 
-        // Create parachute icon
-        if let Some(button) = status_item.button(mtm)
-            && let Some(parachute_image) = create_parachute_icon(config)
-        {
-            button.setImage(Some(&parachute_image));
+        // Create animation frames (frame 0 = rest, 1 = swing right, 2 = swing left)
+        let animation_frames = vec![
+            create_icon_from_svg(
+                include_str!("../../site/src/assets/sugarglider-frame0.svg"),
+                config.color,
+            )
+            .expect("Failed to create animation frame 0"),
+            create_icon_from_svg(
+                include_str!("../../site/src/assets/sugarglider-frame1.svg"),
+                config.color,
+            )
+            .expect("Failed to create animation frame 1"),
+            create_icon_from_svg(
+                include_str!("../../site/src/assets/sugarglider-frame2.svg"),
+                config.color,
+            )
+            .expect("Failed to create animation frame 2"),
+        ];
+
+        // Set initial icon (rest frame)
+        if let Some(button) = status_item.button(mtm) {
+            button.setImage(Some(&animation_frames[0]));
         }
 
         let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Sugarglider"));
@@ -59,8 +79,22 @@ impl StatusIcon {
 
         let menu_handler = MenuHandler::new(mtm, wm_tx);
 
-        // Space toggle item
-        let space_toggle_ns_title = ns_string!("Enable Space");
+        // Global toggle item - "Stop Globally" when enabled, "Start Globally" when disabled
+        let toggle_ns_title = ns_string!("Stop Globally");
+        let toggle_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &toggle_ns_title,
+                Some(sel!(handleAction:)),
+                ns_string!(""),
+            )
+        };
+        unsafe { toggle_item.setTarget(Some(&*menu_handler)) };
+        toggle_item.setTag(TOGGLE_GLOBAL_TAG as isize);
+        menu.addItem(&toggle_item);
+
+        // Space toggle item - "Stop Space" when enabled, "Start Space" when disabled
+        let space_toggle_ns_title = ns_string!("Stop Space");
         let space_toggle_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
@@ -73,19 +107,20 @@ impl StatusIcon {
         space_toggle_item.setTag(TOGGLE_SPACE_TAG as isize);
         menu.addItem(&space_toggle_item);
 
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
-
-        // Version item (disabled, informational)
-        let version_item = unsafe {
+        // Float window item
+        let float_window_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
-                &NSString::from_str(&format!("Sugarglider v{}", env!("CARGO_PKG_VERSION"))),
-                None,
+                ns_string!("Float Window"),
+                Some(sel!(handleAction:)),
                 ns_string!(""),
             )
         };
-        version_item.setEnabled(false);
-        menu.addItem(&version_item);
+        unsafe { float_window_item.setTarget(Some(&*menu_handler)) };
+        float_window_item.setTag(FLOAT_WINDOW_TAG as isize);
+        menu.addItem(&float_window_item);
+
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
 
         // Preferences item with ⌘, shortcut
         let preferences_item = unsafe {
@@ -100,34 +135,7 @@ impl StatusIcon {
         preferences_item.setTag(SHOW_PREFERENCES_TAG as isize);
         menu.addItem(&preferences_item);
 
-        // Documentation item
-        let docs_item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                ns_string!("Documentation"),
-                Some(sel!(handleAction:)),
-                ns_string!(""),
-            )
-        };
-        unsafe { docs_item.setTarget(Some(&*menu_handler)) };
-        docs_item.setTag(SHOW_DOCS_TAG as isize);
-        menu.addItem(&docs_item);
-
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-
-        // Global toggle item
-        let toggle_ns_title = ns_string!("Enable Sugarglider");
-        let toggle_item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &toggle_ns_title,
-                Some(sel!(handleAction:)),
-                ns_string!(""),
-            )
-        };
-        unsafe { toggle_item.setTarget(Some(&*menu_handler)) };
-        toggle_item.setTag(TOGGLE_GLOBAL_TAG as isize);
-        menu.addItem(&toggle_item);
 
         // Quit item
         let save_quit_item = unsafe {
@@ -150,6 +158,7 @@ impl StatusIcon {
             _menu_handler: menu_handler,
             toggle_item,
             space_toggle_item,
+            animation_frames,
         }
     }
 
@@ -178,6 +187,15 @@ impl StatusIcon {
     /// Sets whether the space toggle menu item is enabled.
     pub fn set_space_toggle_enabled(&mut self, enabled: bool) {
         self.space_toggle_item.setEnabled(enabled);
+    }
+
+    /// Sets the icon to the specified animation frame.
+    /// Frame 0 = rest position, 1 = swing right, 2 = swing left.
+    pub fn set_animation_frame(&mut self, frame_index: usize) {
+        let frame_index = frame_index.min(self.animation_frames.len() - 1);
+        if let Some(button) = self.status_item.button(self.mtm) {
+            button.setImage(Some(&self.animation_frames[frame_index]));
+        }
     }
 }
 
@@ -232,15 +250,14 @@ define_class!(
                         WmEvent::Command(WmCommand::Wm(WmCmd::ToggleSpaceActivated)),
                     ));
                 }
-                SHOW_DOCS_TAG => {
-                    debug!("Opening docs in browser");
-                    // TODO: Update URL when Sugarglider documentation site is ready
-                    if let Err(e) = std::process::Command::new("/usr/bin/open")
-                        .arg("https://github.com/rdbeerman/sugarglider#readme")
-                        .spawn()
-                    {
-                        error!("Failed to open documentation: {e}");
-                    }
+                FLOAT_WINDOW_TAG => {
+                    debug!("Sending ToggleWindowFloating command");
+                    let _ = wm_tx.send((
+                        Span::current(),
+                        WmEvent::Command(WmCommand::ReactorCommand(
+                            reactor::Command::Layout(LayoutCommand::ToggleWindowFloating),
+                        )),
+                    ));
                 }
                 SHOW_PREFERENCES_TAG => {
                     debug!("Opening preferences window");
@@ -263,13 +280,7 @@ impl MenuHandler {
     }
 }
 
-fn create_parachute_icon(config: &config::StatusIconExperimental) -> Option<Retained<NSImage>> {
-    // Load the SVG file
-    let svg_data = if config.color {
-        include_str!("../../site/src/assets/sugarglider-small.svg")
-    } else {
-        include_str!("../../site/src/assets/sugarglider-nocolor.svg")
-    };
+fn create_icon_from_svg(svg_data: &str, use_color: bool) -> Option<Retained<NSImage>> {
     let ns_data =
         unsafe { NSData::dataWithBytes_length(svg_data.as_ptr() as *const c_void, svg_data.len()) };
 
@@ -280,7 +291,7 @@ fn create_parachute_icon(config: &config::StatusIconExperimental) -> Option<Reta
     // Set the image size to be appropriate for menu bar (16x16 points)
     image.setSize(CGSize { width: 16.0, height: 16.0 });
 
-    if !config.color {
+    if !use_color {
         // Set as template image so it follows system appearance
         image.setTemplate(true);
     }

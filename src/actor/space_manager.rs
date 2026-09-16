@@ -466,11 +466,13 @@ mod tests {
         SpaceId::new(id)
     }
 
-    /// With default_disable=true (the default config), spaces start disabled.
+    /// With default_disable=true, spaces start disabled.
     /// ToggleSpace enables the current space.
     #[test]
     fn toggle_enables_space_when_default_disable() {
-        let mut h = TestHarness::new();
+        let mut config = Config::default();
+        config.settings.default_disable = true;
+        let mut h = TestHarness::new_with(false, config);
         h.setup_space(screen(1), space(10));
 
         // Space is disabled by default.
@@ -487,10 +489,12 @@ mod tests {
         assert_eq!(*space_changed_spaces(&events).unwrap(), vec![Some(space(10))]);
     }
 
-    /// Toggle twice returns to the original state.
+    /// Toggle twice returns to the original state (with default_disable=true).
     #[test]
     fn toggle_space_twice_restores_state() {
-        let mut h = TestHarness::new();
+        let mut config = Config::default();
+        config.settings.default_disable = true;
+        let mut h = TestHarness::new_with(false, config);
         h.setup_space(screen(1), space(10));
 
         // Enable then disable again.
@@ -506,7 +510,9 @@ mod tests {
 
     #[test]
     fn toggle_focused_space_matches_the_reported_space() {
-        let mut h = TestHarness::new();
+        let mut config = Config::default();
+        config.settings.default_disable = true;
+        let mut h = TestHarness::new_with(false, config);
         h.on_event(Event::ScreenParametersChanged {
             screens: vec![screen(1), screen(2)],
             frames: vec![CGRect::ZERO, CGRect::ZERO],
@@ -575,7 +581,9 @@ mod tests {
 
     #[test]
     fn set_global_enabled_pauses_and_resumes() {
-        let mut h = TestHarness::new();
+        let mut config = Config::default();
+        config.settings.default_disable = true;
+        let mut h = TestHarness::new_with(false, config);
         h.setup_space(screen(1), space(10));
         // Enable the space so we can observe pause/resume affecting it.
         h.on_event(Event::ToggleSpace(screen(1)));
@@ -609,7 +617,9 @@ mod tests {
 
     #[test]
     fn one_space_disables_non_starting_space() {
-        let mut h = TestHarness::new_with(true, Config::default());
+        let mut config = Config::default();
+        config.settings.default_disable = true;
+        let mut h = TestHarness::new_with(true, config);
         // Enable the space and establish it as starting_space.
         h.on_event(Event::ScreenParametersChanged {
             screens: vec![screen(1)],

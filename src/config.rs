@@ -504,7 +504,11 @@ pub fn write_preferences_to_file(
     let path = config_path();
 
     // Load existing config or create empty document
-    let existing = if path.exists() { fs::read_to_string(&path)? } else { String::new() };
+    let existing = if path.exists() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
 
     let mut doc: DocumentMut = existing.parse().unwrap_or_default();
 

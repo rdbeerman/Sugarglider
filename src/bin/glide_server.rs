@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use objc2::MainThreadMarker;
+use objc2_app_kit::{NSAlert, NSApp, NSApplicationActivationPolicy};
+use objc2_foundation::ns_string;
 use sugarglider::actor::dock::Dock;
 use sugarglider::actor::group_bars::GroupBars;
 use sugarglider::actor::layout::LayoutManager;
@@ -23,9 +26,6 @@ use sugarglider::actor::{channel, server};
 use sugarglider::config::{Config, restore_file};
 use sugarglider::log;
 use sugarglider::sys::executor::Executor;
-use objc2::MainThreadMarker;
-use objc2_app_kit::{NSAlert, NSApp, NSApplicationActivationPolicy};
-use objc2_foundation::ns_string;
 use tokio::join;
 use tracing::warn;
 
@@ -126,7 +126,8 @@ fn main() {
 
     let (group_indicators_tx, group_indicators_rx) = sugarglider::actor::channel();
     let (events_tx, events_rx) = reactor::channel();
-    let (skylight_tx, skylight_rx) = sugarglider::actor::channel::<window_server::SkylightRequest>();
+    let (skylight_tx, skylight_rx) =
+        sugarglider::actor::channel::<window_server::SkylightRequest>();
     let wm_config = wm_controller::Config {
         one_space: opt.one,
         restore_file: restore_file(),
