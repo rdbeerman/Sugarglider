@@ -734,7 +734,42 @@ impl LayoutManager {
                         }
                     })
                     .collect();
+                // Count columns before adding windows to detect first-time discovery.
+                let columns_before = if !self.tree.is_scroll_layout(layout) {
+                    self.tree.columns(layout).len()
+                } else {
+                    0
+                };
+
                 self.tree.set_windows_for_app(self.layout(space), pid, tree_windows);
+
+                // Import column weights from actual window positions to avoid
+                // reshuffling windows that are already in a tiled layout.
+                // Only do this when windows are first discovered (columns were empty).
+                if !self.tree.is_scroll_layout(layout) && columns_before == 0 {
+                    let columns = self.tree.columns(layout);
+                    let mut column_widths: Vec<(NodeId, f64)> = Vec::new();
+                    for col in columns {
+                        // Get the first window in this column to determine its width
+                        if let Some(wid) = col
+                            .traverse_preorder(self.tree.map())
+                            .find_map(|n| self.tree.window_at(n))
+                        {
+                            if let Some(info) = window_map.get(&wid) {
+                                column_widths.push((col, info.frame.size.width));
+                            }
+                        }
+                    }
+                    // Set weights proportional to actual widths
+                    let total_width: f64 = column_widths.iter().map(|(_, w)| w).sum();
+                    if total_width > 0.0 {
+                        for (col, width) in column_widths {
+                            let weight = (width / total_width) as f32;
+                            self.tree.set_column_weight(col, weight);
+                        }
+                    }
+                }
+
                 for wid in new_windows {
                     self.add_scroll_window(layout, wid);
                 }

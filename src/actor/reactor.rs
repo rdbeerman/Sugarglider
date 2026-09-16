@@ -254,6 +254,8 @@ pub struct Reactor {
     group_indicators_tx: group_bars::Sender,
     /// Debug overlay showing drop zones for all windows.
     debug_drop_zones_visible: bool,
+    /// Whether all apps have been registered at startup.
+    startup_complete: bool,
 }
 
 /// How many times in a row we write the same frame to a window before giving
@@ -423,6 +425,7 @@ impl Reactor {
             status_tx: None,
             group_indicators_tx: group_indicators_tx,
             debug_drop_zones_visible: false,
+            startup_complete: false,
         }
     }
 
@@ -501,6 +504,10 @@ impl Reactor {
                 self.send_layout_event(LayoutEvent::AppsRunningUpdated(
                     self.apps.keys().copied().collect(),
                 ));
+                self.startup_complete = true;
+                // Don't force layout on startup - windows may already be in
+                // correct positions from a previous run. Layout will be
+                // enforced when something actually changes.
             }
             Event::ApplicationTerminated(pid) => {
                 if let Some(app) = self.apps.get_mut(&pid) {
@@ -2256,6 +2263,7 @@ pub mod tests {
         let mut windows = make_windows(2);
         windows[1].frame.origin = CGPoint::new(1100., 100.);
         reactor.handle_events(apps.make_app(1, windows));
+        reactor.handle_event(Event::StartupComplete);
 
         let _events = apps.simulate_events();
         assert_eq!(
