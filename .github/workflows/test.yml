@@ -20,7 +20,7 @@ jobs:
       - name: Install latest stable
         run: rustup update stable
       - name: Install nightly for fmt
-        run: rustup install nightly
+        run: rustup install nightly && rustup component add rustfmt --toolchain nightly
       - name: Formatting
         run: cargo +nightly fmt --check --verbose
       - name: Build
