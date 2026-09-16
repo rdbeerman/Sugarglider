@@ -15,15 +15,15 @@ use accessibility::{AXUIElement, AXUIElementAttributes};
 use accessibility_sys::pid_t;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use glide_wm::actor::{self, reactor};
-use glide_wm::sys::app::{AXUIElementExt, AppInfo, NSRunningApplicationExt, WindowInfo};
-use glide_wm::sys::event::{self, get_mouse_pos};
-use glide_wm::sys::executor::Executor;
-use glide_wm::sys::screen::{self, ScreenCache};
-use glide_wm::sys::window_server::{
+use sugarglider::actor::{self, reactor};
+use sugarglider::sys::app::{AXUIElementExt, AppInfo, NSRunningApplicationExt, WindowInfo};
+use sugarglider::sys::event::{self, get_mouse_pos};
+use sugarglider::sys::executor::Executor;
+use sugarglider::sys::screen::{self, ScreenCache};
+use sugarglider::sys::window_server::{
     self, SkylightConnection, WindowServerId, get_window, kCGSWindowCreated,
 };
-use glide_wm::sys::{self};
+use sugarglider::sys::{self};
 use livesplit_hotkey::{ConsumePreference, Modifiers};
 use objc2_app_kit::{
     NSRunningApplication, NSScreen, NSWindow, NSWindowNumberListOptions, NSWorkspace,
@@ -183,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     tracing_subscriber::registry()
-        .with(glide_wm::log::tree_layer())
+        .with(sugarglider::log::tree_layer())
         .with(EnvFilter::from_default_env())
         .init();
     let opt: Opt = Parser::parse();

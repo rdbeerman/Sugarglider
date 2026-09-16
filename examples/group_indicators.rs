@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use glide_wm::ui::{GroupDisplayData, GroupIndicatorNSView, GroupKind};
+use sugarglider::ui::{GroupDisplayData, GroupIndicatorNSView, GroupKind};
 use objc2::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2_app_kit::{
