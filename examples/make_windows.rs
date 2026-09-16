@@ -7,7 +7,6 @@
 use std::time::Duration;
 
 use accessibility::{AXUIElement, AXUIElementActions, AXUIElementAttributes};
-use sugarglider::sys::window_server::{self, WindowServerId};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
@@ -18,6 +17,7 @@ use objc2_app_kit::{
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
+use sugarglider::sys::window_server::{self, WindowServerId};
 
 #[derive(Debug)]
 struct Ivars;

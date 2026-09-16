@@ -15,15 +15,6 @@ use accessibility::{AXUIElement, AXUIElementAttributes};
 use accessibility_sys::pid_t;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use sugarglider::actor::{self, reactor};
-use sugarglider::sys::app::{AXUIElementExt, AppInfo, NSRunningApplicationExt, WindowInfo};
-use sugarglider::sys::event::{self, get_mouse_pos};
-use sugarglider::sys::executor::Executor;
-use sugarglider::sys::screen::{self, ScreenCache};
-use sugarglider::sys::window_server::{
-    self, SkylightConnection, WindowServerId, get_window, kCGSWindowCreated,
-};
-use sugarglider::sys::{self};
 use livesplit_hotkey::{ConsumePreference, Modifiers};
 use objc2_app_kit::{
     NSRunningApplication, NSScreen, NSWindow, NSWindowNumberListOptions, NSWorkspace,
@@ -34,6 +25,15 @@ use objc2_core_graphics::{
     kCGNullWindowID,
 };
 use objc2_foundation::{MainThreadMarker, NSString};
+use sugarglider::actor::{self, reactor};
+use sugarglider::sys::app::{AXUIElementExt, AppInfo, NSRunningApplicationExt, WindowInfo};
+use sugarglider::sys::event::{self, get_mouse_pos};
+use sugarglider::sys::executor::Executor;
+use sugarglider::sys::screen::{self, ScreenCache};
+use sugarglider::sys::window_server::{
+    self, SkylightConnection, WindowServerId, get_window, kCGSWindowCreated,
+};
+use sugarglider::sys::{self};
 use tokio::sync::mpsc::{self, UnboundedReceiver, unbounded_channel};
 use tracing::info;
 use tracing_subscriber::EnvFilter;

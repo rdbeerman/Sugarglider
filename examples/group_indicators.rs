@@ -9,7 +9,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use sugarglider::ui::{GroupDisplayData, GroupIndicatorNSView, GroupKind};
 use objc2::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2_app_kit::{
@@ -18,6 +17,7 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
+use sugarglider::ui::{GroupDisplayData, GroupIndicatorNSView, GroupKind};
 
 struct IndicatorDemo {
     indicators: Vec<Rc<RefCell<GroupIndicatorNSView>>>,
