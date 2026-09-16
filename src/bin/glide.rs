@@ -1,0 +1,277 @@
+// Copyright The Glide Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use std::borrow::Borrow;
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use anyhow::{Context, bail};
+use clap::{Parser, Subcommand};
+use sugarglider::actor::server::{self, AsciiEscaped, Request, Response, ServiceRequest};
+use sugarglider::config::{Config, config_path};
+use sugarglider::sys::bundle::{self, BundleError};
+use sugarglider::sys::message_port::{RemoteMessagePort, RemotePortCreateError, SendError};
+use notify::RecursiveMode;
+use notify_debouncer_mini::new_debouncer;
+
+const TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Client to control a running Glide server.
+#[derive(Parser)]
+#[command(version, name = "glide")]
+struct Opt {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Clone)]
+enum Command {
+    /// Launch Glide.
+    Launch(CmdLaunch),
+    #[command(subcommand)]
+    Service(CmdService),
+    #[command()]
+    Ping(CmdPing),
+    #[command()]
+    Config(CmdConfig),
+    /// Pause window management on all spaces.
+    Pause,
+    /// Resume window management after pausing.
+    Resume,
+}
+
+/// Manage Glide as a system service.
+#[derive(Subcommand, Clone)]
+enum CmdService {
+    /// Add Glide to login items.
+    Install,
+    /// Remove Glide from login items.
+    Uninstall,
+}
+
+/// Checks if the server is running.
+#[derive(Parser, Clone)]
+struct CmdPing {
+    msg: Option<String>,
+}
+
+/// Launch Glide with optional configuration.
+#[derive(Parser, Clone)]
+struct CmdLaunch {
+    /// Path to a custom config file.
+    #[arg(long, short)]
+    config: Option<PathBuf>,
+
+    /// Restore the layout saved with the save_and_exit command. This is only
+    /// useful within the same login session.
+    #[arg(long)]
+    restore: bool,
+}
+
+/// Manage server config.
+#[derive(Parser, Clone)]
+struct CmdConfig {
+    /// Path to a custom config file.
+    #[arg(long, short, global = true)]
+    config: Option<PathBuf>,
+    #[command(subcommand)]
+    action: ConfigSubcommand,
+}
+
+#[derive(Subcommand, Clone)]
+enum ConfigSubcommand {
+    /// Read the config file and update the config on the running server.
+    Update(CmdUpdate),
+    /// Check the config file for errors.
+    Verify,
+}
+
+/// Updates the server config by parsing the config file on disk.
+///
+/// The config file lives at ~/.glide.toml.
+#[derive(Parser, Clone)]
+struct CmdUpdate {
+    /// Watch for config changes, continuously updating the file.
+    #[arg(long)]
+    watch: bool,
+}
+
+fn main() -> Result<(), anyhow::Error> {
+    let opt: Opt = Parser::parse();
+
+    // Not all commands require a client, so defer it.
+    let make_client = || Client::new().context("Could not find server");
+
+    match opt.command {
+        Command::Launch(CmdLaunch { config, restore }) => launch(config, restore)?,
+        Command::Service(req) => {
+            let (req, verb) = match req {
+                CmdService::Install => (ServiceRequest::Install, "registered"),
+                CmdService::Uninstall => (ServiceRequest::Uninstall, "unregistered"),
+            };
+            let response = make_client()?.send(Request::Service(req))?;
+            match response {
+                Response::Success => println!("Glide was {verb} as a service"),
+                Response::Error(e) => bail!("{e}"),
+                _ => bail!("Unexpected response"),
+            }
+        }
+        Command::Ping(send) => {
+            let response = make_client()?.send(Request::Ping(send.msg.unwrap_or_default()))?;
+            match response {
+                Response::Pong(data) => eprintln!("Got response {data}"),
+                _ => bail!("Unexpected response"),
+            }
+        }
+        Command::Pause => set_enabled(make_client()?, false)?,
+        Command::Resume => set_enabled(make_client()?, true)?,
+        Command::Config(CmdConfig {
+            config,
+            action: ConfigSubcommand::Update(CmdUpdate { watch }),
+        }) => {
+            let mut client = make_client()?;
+            let mut update_config = || {
+                if !config.as_deref().unwrap_or(&config_path()).exists() {
+                    eprintln!("Warning: Config file missing; will load defaults");
+                }
+                let config = match Config::load(config.as_deref()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("{e}\n");
+                        return;
+                    }
+                };
+                let request = Request::UpdateConfig(config);
+                loop {
+                    match client.send(&request) {
+                        Ok(Response::Success) => eprintln!("config updated"),
+                        Ok(resp) => eprintln!("Unexpected response: {resp:?}"),
+                        Err(ClientError::SendError(SendError::InvalidPort)) => {
+                            eprintln!("Could not send to server; will attempt reconnect");
+                            client = make_client().unwrap();
+                            continue;
+                        }
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                    break;
+                }
+            };
+            if watch {
+                let (tx, rx) = mpsc::channel();
+                let mut debouncer = new_debouncer(Duration::from_millis(50), tx)?;
+                debouncer.watcher().watch(&config_path(), RecursiveMode::NonRecursive)?;
+                update_config();
+                for event in rx {
+                    event?;
+                    update_config();
+                }
+            } else {
+                update_config();
+            }
+        }
+        Command::Config(CmdConfig {
+            config,
+            action: ConfigSubcommand::Verify,
+        }) => {
+            if !config.as_deref().unwrap_or(&config_path()).exists() {
+                bail!("Config file missing");
+            }
+            if let Err(e) = Config::load(config.as_deref()) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+            eprintln!("config ok");
+        }
+    }
+
+    Ok(())
+}
+
+fn set_enabled(client: Client, enabled: bool) -> Result<(), anyhow::Error> {
+    match client.send(Request::SetEnabled(enabled))? {
+        Response::Success => {
+            println!("Glide {}", if enabled { "resumed" } else { "paused" });
+            Ok(())
+        }
+        Response::Error(e) => bail!("{e}"),
+        _ => bail!("Unexpected response"),
+    }
+}
+
+fn launch(config: Option<PathBuf>, restore: bool) -> Result<(), anyhow::Error> {
+    match bundle::glide_bundle() {
+        Err(BundleError::NotInBundle) => bail!(
+            "Not running in a bundle.
+                \n\
+                To run glide from the command line, use `cargo run` or start glide_server directly."
+        ),
+        Err(BundleError::BundleNotGlide { identifier }) => {
+            bail!("Don't recognize bundle identifier {identifier}")
+        }
+        Ok(bundle) => {
+            let config_result = Config::load(config.as_deref());
+            if let Err(e) = config_result {
+                bail!("Config is invalid; refusing to launch:\n{e}");
+            }
+            if Client::new().is_ok() {
+                bail!(
+                    "Glide appears to be running already.
+                        \n\
+                        Tip: The default key binding to exit Glide is Alt+Shift+E."
+                );
+            }
+            let mut args = Vec::new();
+            if let Some(path) = &config {
+                args.push("--config".into());
+                args.push(path.canonicalize()?.into_os_string());
+            }
+            if restore {
+                args.push("--restore".into());
+            }
+            bundle::launch(&bundle, &args)?;
+            eprintln!(
+                "Glide is starting.
+                    \n\
+                    Tip: Use Alt+Z to start managing the current space.\n\
+                    Tip: Use Alt+Shift+E to exit Glide."
+            );
+            Ok(())
+        }
+    }
+}
+
+struct Client {
+    port: RemoteMessagePort,
+}
+
+#[derive(thiserror::Error, Debug)]
+enum ClientError {
+    #[error("Serialization error")]
+    SerializationError(#[source] anyhow::Error),
+    #[error("Sending message failed")]
+    SendError(#[source] SendError),
+}
+
+impl Client {
+    fn new() -> Result<Self, RemotePortCreateError> {
+        Ok(Self {
+            port: RemoteMessagePort::new(server::PORT_NAME)?,
+        })
+    }
+
+    fn send(&self, req: impl Borrow<Request>) -> Result<Response, ClientError> {
+        let msg = ron::ser::to_string(req.borrow())
+            .context("Serializing message failed")
+            .map_err(ClientError::SerializationError)?;
+        let resp = self
+            .port
+            .send_message(0, msg.as_bytes(), TIMEOUT)
+            .map_err(ClientError::SendError)?;
+        let response = ron::de::from_bytes(&resp)
+            .with_context(|| format!("Response: \"{}\"", AsciiEscaped(&resp)))
+            .context("Deserializing response failed")
+            .map_err(ClientError::SerializationError)?;
+        Ok(response)
+    }
+}

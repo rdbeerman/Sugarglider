@@ -1,0 +1,39 @@
+name: Tests
+
+on:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Rust check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install latest stable
+        run: rustup update stable
+      - name: Install Apple targets
+        run: rustup target add aarch64-apple-darwin
+      - name: Formatting
+        run: cargo fmt --check --verbose
+      - name: Check
+        run: cargo check --verbose --locked --target aarch64-apple-darwin
+
+  build:
+    name: Rust build and test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install latest stable
+        run: rustup update stable
+      - name: Build
+        run: cargo build --verbose --locked
+      - name: Run tests
+        run: cargo test --workspace --verbose --locked
