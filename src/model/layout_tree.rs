@@ -180,6 +180,16 @@ impl LayoutTree {
         self.tree.data.size.set_weight(node, weight, &self.tree.map);
     }
 
+    /// Resets all node weights in the layout to 1.0, giving equal distribution.
+    pub fn reset_weights(&mut self, layout: LayoutId) {
+        let root = self.root(layout);
+        for node in root.traverse_preorder(&self.tree.map).collect::<Vec<_>>() {
+            if node != root {
+                self.tree.data.size.set_weight(node, 1.0, &self.tree.map);
+            }
+        }
+    }
+
     pub fn clone_layout(&mut self, layout: LayoutId) -> LayoutId {
         let source_root = self.layout_roots[layout].id();
         let cloned = source_root.deep_copy(&mut self.tree).make_root("layout_root");

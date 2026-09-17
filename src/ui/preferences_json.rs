@@ -511,6 +511,11 @@ fn describe_layout_command(cmd: &LayoutCommand) -> (String, String, String) {
             "Scroll Layout".to_string(),
             "toggle_column_tabbed".to_string(),
         ),
+        LayoutCommand::CleanUpSpace => (
+            "Clean up space".to_string(),
+            "Layout".to_string(),
+            "clean_up_space".to_string(),
+        ),
     }
 }
 

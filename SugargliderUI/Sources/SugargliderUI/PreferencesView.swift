@@ -60,7 +60,7 @@ public struct PreferencesView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 650, height: 500)
+        .frame(width: 650, height: 620)
     }
 }
 

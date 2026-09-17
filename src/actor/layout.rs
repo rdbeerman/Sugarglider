@@ -53,6 +53,7 @@ pub enum LayoutCommand {
     ToggleColumnTabbed,
     FocusNext,
     FocusPrev,
+    CleanUpSpace,
 }
 
 fn default_resize_percent() -> f64 {
@@ -151,7 +152,8 @@ impl LayoutCommand {
             | Ungroup
             | Resize { .. }
             | CycleColumnWidth
-            | ToggleColumnTabbed => true,
+            | ToggleColumnTabbed
+            | CleanUpSpace => true,
 
             NextLayout | PrevLayout | MoveFocus(_) | Ascend | Descend | Split(_)
             | ToggleFocusFloating | ToggleWindowFloating | ToggleFullscreen | ChangeLayoutKind
@@ -1281,6 +1283,10 @@ impl LayoutManager {
                 );
                 mapping.replace_active_layout(new_layout);
                 self.viewports.remove(&layout);
+                EventResponse::default()
+            }
+            LayoutCommand::CleanUpSpace => {
+                self.tree.reset_weights(layout);
                 EventResponse::default()
             }
         }

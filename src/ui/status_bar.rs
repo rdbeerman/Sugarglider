@@ -27,6 +27,7 @@ const TOGGLE_GLOBAL_TAG: i64 = 2;
 const TOGGLE_SPACE_TAG: i64 = 3;
 const FLOAT_WINDOW_TAG: i64 = 4;
 const SHOW_PREFERENCES_TAG: i64 = 5;
+const CLEAN_UP_SPACE_TAG: i64 = 6;
 
 pub struct StatusIcon {
     status_item: Retained<NSStatusItem>,
@@ -119,6 +120,19 @@ impl StatusIcon {
         unsafe { float_window_item.setTarget(Some(&*menu_handler)) };
         float_window_item.setTag(FLOAT_WINDOW_TAG as isize);
         menu.addItem(&float_window_item);
+
+        // Clean up space item
+        let clean_up_space_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                ns_string!("Clean Up Space"),
+                Some(sel!(handleAction:)),
+                ns_string!(""),
+            )
+        };
+        unsafe { clean_up_space_item.setTarget(Some(&*menu_handler)) };
+        clean_up_space_item.setTag(CLEAN_UP_SPACE_TAG as isize);
+        menu.addItem(&clean_up_space_item);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
@@ -256,6 +270,15 @@ define_class!(
                         Span::current(),
                         WmEvent::Command(WmCommand::ReactorCommand(
                             reactor::Command::Layout(LayoutCommand::ToggleWindowFloating),
+                        )),
+                    ));
+                }
+                CLEAN_UP_SPACE_TAG => {
+                    debug!("Sending CleanUpSpace command");
+                    let _ = wm_tx.send((
+                        Span::current(),
+                        WmEvent::Command(WmCommand::ReactorCommand(
+                            reactor::Command::Layout(LayoutCommand::CleanUpSpace),
                         )),
                     ));
                 }
