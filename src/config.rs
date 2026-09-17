@@ -1027,4 +1027,21 @@ mod tests {
         assert!(config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + ArrowUp"));
         assert!(config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + ArrowRight"));
     }
+
+    #[test]
+    fn clean_up_space_is_default_key() {
+        let config = Config::default();
+        assert!(
+            config.keys.iter().any(|(hk, cmd)| {
+                hk.to_string() == "Alt + Shift + KeyC"
+                    && matches!(
+                        cmd,
+                        WmCommand::ReactorCommand(ReactorCommand::Layout(
+                            LayoutCommand::CleanUpSpace
+                        ))
+                    )
+            }),
+            "Alt+Shift+C should be bound to clean_up_space by default"
+        );
+    }
 }

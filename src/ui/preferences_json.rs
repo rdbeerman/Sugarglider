@@ -513,7 +513,7 @@ fn describe_layout_command(cmd: &LayoutCommand) -> (String, String, String) {
         ),
         LayoutCommand::CleanUpSpace => (
             "Clean up space".to_string(),
-            "Layout".to_string(),
+            "System".to_string(),
             "clean_up_space".to_string(),
         ),
     }

@@ -85,6 +85,9 @@ default_keys = false
 # Toggle whether the current space is managed by Glide.
 "Ctrl + Alt + Z" = "toggle_space_activated"
 
+# Clean up the current space by re-tiling all windows.
+"Alt + Shift + C" = "clean_up_space"
+
 # Focus the window in the specified direction.
 "Alt + H" = { move_focus = "left" }
 "Alt + J" = { move_focus = "down" }
