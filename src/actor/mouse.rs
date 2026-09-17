@@ -165,7 +165,9 @@ impl Mouse {
         match event_type {
             CGEventType::LeftMouseDown => {
                 let loc = event.location();
-                self.events_tx.send(Event::LeftMouseDown(loc.to_icrate()));
+                let window_at_point =
+                    window_server::get_window_at_point(loc.to_icrate(), state.converter, mtm);
+                self.events_tx.send(Event::LeftMouseDown(loc.to_icrate(), window_at_point));
             }
             CGEventType::LeftMouseUp => {
                 self.events_tx.send(Event::MouseUp);

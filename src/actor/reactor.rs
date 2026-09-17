@@ -23,7 +23,7 @@ use std::{mem, thread};
 
 use animation::{Animation, AnimationManager, Message as AnimationMessage};
 use main_window::MainWindowTracker;
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CGPoint, CGRect};
 use redact::Secret;
 pub use replay::{Record, replay};
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,7 @@ use crate::actor::{group_bars, space_manager, status, window_server, wm_controll
 use crate::collections::{HashMap, HashSet};
 use crate::config::Config;
 use crate::log::{self, MetricsCommand};
+use crate::model::NodeId;
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
 use crate::sys::geometry::{CGRectDef, CGRectExt, SameAs, round_to_physical};
@@ -189,6 +190,9 @@ pub enum Event {
 
     LeftMouseDown(
         #[serde(with = "crate::sys::geometry::CGPointDef")] objc2_core_foundation::CGPoint,
+        /// The window at the click point, if any. Used to detect clicks on
+        /// non-managed windows (like floating panels or Sugarglider's own windows).
+        Option<WindowServerId>,
     ),
     LeftMouseDragged(
         #[serde(with = "crate::sys::geometry::CGPointDef")] objc2_core_foundation::CGPoint,
@@ -223,6 +227,15 @@ pub enum ReactorCommand {
     SaveAndExit,
 }
 
+/// Tracks a potential title bar drag (when window_drag is disabled).
+/// We track whether macOS actually moved the window to distinguish between
+/// clicks on floating windows (like preferences) and actual title bar drags.
+struct TitleBarDrag {
+    wid: WindowId,
+    node: NodeId,
+    frame_changed: bool,
+}
+
 pub struct Reactor {
     config: Arc<Config>,
     apps: HashMap<pid_t, AppState>,
@@ -238,6 +251,10 @@ pub struct Reactor {
     active_screen_idx: Option<u16>,
     main_window_tracker: MainWindowTracker,
     in_drag: bool,
+    /// Window being dragged by title bar (when window_drag is disabled).
+    /// Tracks the window ID, node, and whether we received a frame change event
+    /// confirming macOS actually moved the window.
+    title_bar_drag: Option<TitleBarDrag>,
     /// The window the user is currently resizing with the mouse, if any.
     ///
     /// We don't write frames to this window until the resize ends, since a
@@ -416,6 +433,7 @@ impl Reactor {
             active_screen_idx: None,
             main_window_tracker: MainWindowTracker::default(),
             in_drag: false,
+            title_bar_drag: None,
             resizing_window: None,
             frame_attempts: HashMap::default(),
             record,
@@ -476,7 +494,7 @@ impl Reactor {
             // Record more noisy events as trace logs instead of debug.
             Event::WindowFrameChanged(..)
             | Event::MouseUp
-            | Event::LeftMouseDown(_)
+            | Event::LeftMouseDown(..)
             | Event::LeftMouseDragged(_) => trace!(?event, "Event"),
             _ => debug!(?event, "Event"),
         }
@@ -590,6 +608,12 @@ impl Reactor {
                 let old_frame = mem::replace(&mut window.frame_monotonic, new_frame);
                 if old_frame == new_frame {
                     return;
+                }
+                // Track that the window being title-bar-dragged actually moved
+                if let Some(ref mut drag) = self.title_bar_drag {
+                    if drag.wid == wid {
+                        drag.frame_changed = true;
+                    }
                 }
                 self.send_layout_event(LayoutEvent::WindowFrameChanged { wid, frame: new_frame });
                 let old_screen = self.best_screen_idx_for_window(&old_frame);
@@ -719,10 +743,26 @@ impl Reactor {
                 self.update_active_screen();
                 self.update_visible_windows();
             }
-            Event::LeftMouseDown(point) => {
+            Event::LeftMouseDown(point, window_at_point) => {
                 if let Some(screen) = self.active_screen()
                     && let Some(space) = screen.space
                 {
+                    // Check if the click is on a window that we don't manage as a tiled window.
+                    // This includes: Sugarglider's own windows (preferences), floating windows,
+                    // ignored windows, and windows from apps we don't track.
+                    if let Some(wsid) = window_at_point {
+                        // If the clicked window is not in our managed window list, ignore the drag
+                        if !self.window_ids.contains_key(&wsid) {
+                            return;
+                        }
+                        // If the clicked window is managed but floating, also ignore
+                        if let Some(&wid) = self.window_ids.get(&wsid) {
+                            if self.layout.floating_windows_in_space(space).contains(&wid) {
+                                return;
+                            }
+                        }
+                    }
+
                     if let Some((col, win, edges)) =
                         self.layout.hit_test_scroll_edges(space, point, screen.frame, &self.config)
                     {
@@ -737,8 +777,17 @@ impl Reactor {
                         self.layout.hit_test_window(space, point, screen.frame, &self.config)
                     {
                         // Start drag-to-rearrange for any tiled window
-                        self.layout.begin_interactive_drag(space, wid, node, point);
-                        self.in_drag = true;
+                        if self.layout.begin_interactive_drag(space, wid, node, point) {
+                            self.in_drag = true;
+                        } else if self.config.settings.drag_drop.enable {
+                            // window_drag is disabled but enable is on - track for title bar drag
+                            self.title_bar_drag = Some(TitleBarDrag {
+                                wid,
+                                node,
+                                frame_changed: false,
+                            });
+                            self.in_drag = true;
+                        }
                     }
                 }
             }
@@ -781,6 +830,37 @@ impl Reactor {
                                 self.layout.apply_drop_action(space, source_node, action);
                                 // TODO: Hide drop zone overlay via swift_bridge
                                 self.update_layout(&[], false);
+                            }
+                        }
+                    }
+                }
+                // Handle title bar drags (when window_drag is disabled)
+                // Only proceed if we received WindowFrameChanged events for this window,
+                // which confirms macOS actually moved it (not just a click on a floating window)
+                if let Some(drag) = self.title_bar_drag.take() {
+                    if drag.frame_changed {
+                        if let Some(window) = self.windows.get(&drag.wid) {
+                            let current_frame = window.frame_monotonic;
+                            if let Some(&screen) = self.active_screen() {
+                                if let Some(space) = screen.space {
+                                    // Find overlapping window to swap with
+                                    let center = CGPoint {
+                                        x: current_frame.origin.x + current_frame.size.width / 2.0,
+                                        y: current_frame.origin.y + current_frame.size.height / 2.0,
+                                    };
+                                    if let Some(action) =
+                                        self.layout.compute_drop_action_for_position(
+                                            space,
+                                            drag.wid,
+                                            center,
+                                            screen.frame,
+                                            &self.config,
+                                        )
+                                    {
+                                        self.layout.apply_drop_action(space, drag.node, action);
+                                        self.update_layout(&[], false);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1230,6 +1310,8 @@ impl Reactor {
 
     #[instrument(skip(self), fields())]
     pub fn update_layout(&mut self, new_wids: &[WindowId], skip_anim: bool) {
+        // Clear title bar drag tracking since layout changes will move windows
+        self.title_bar_drag = None;
         let main_window = self.main_window();
         trace!(?main_window);
         let mut anim = Animation::new();

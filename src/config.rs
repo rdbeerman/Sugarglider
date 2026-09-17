@@ -237,6 +237,9 @@ pub struct ScrollConfig {
 pub struct DragDropConfig {
     /// Enable drag-to-rearrange windows.
     pub enable: bool,
+    /// Enable drag-to-rearrange by clicking anywhere in a window.
+    /// When false, only normal macOS title bar dragging triggers rearrangement.
+    pub window_drag: bool,
     /// Minimum drag distance in pixels before showing drop zones.
     pub drag_threshold: f64,
     /// Width/height of edge zones as a ratio of window dimension (0.0-0.5).

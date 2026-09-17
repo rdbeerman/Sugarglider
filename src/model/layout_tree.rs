@@ -166,6 +166,16 @@ impl LayoutTree {
         root.children(&self.tree.map).collect()
     }
 
+    /// Reorders columns to match the given order.
+    /// `sorted_columns` should contain the same NodeIds as `columns()` but in the desired order.
+    pub fn reorder_columns(&mut self, layout: LayoutId, sorted_columns: Vec<NodeId>) {
+        let root = self.root(layout);
+        // Detach all columns and reattach in sorted order
+        for col in &sorted_columns {
+            col.detach(&mut self.tree).push_back(root);
+        }
+    }
+
     pub fn set_column_weight(&mut self, node: NodeId, weight: f32) {
         self.tree.data.size.set_weight(node, weight, &self.tree.map);
     }

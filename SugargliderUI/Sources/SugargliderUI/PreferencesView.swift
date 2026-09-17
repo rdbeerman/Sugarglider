@@ -85,6 +85,12 @@ struct GeneralPane: View {
                 Toggle("Mouse follows focus", isOn: $viewModel.mouseFollowsFocus)
             }
 
+            Section("Dragging Behavior") {
+                Toggle("Enable drag to rearrange", isOn: $viewModel.dragDropEnable)
+                Toggle("Drag from window content", isOn: $viewModel.dragDropWindowDrag)
+                    .disabled(!viewModel.dragDropEnable)
+            }
+
             Section("Window Gaps") {
                 HStack {
                     Text("Outer gap:")

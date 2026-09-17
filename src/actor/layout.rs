@@ -705,6 +705,7 @@ impl LayoutManager {
                 let floating_active = self.active_floating_windows.reset_app(space, pid);
                 let mut add_floating = Vec::new();
                 let mut new_windows = Vec::new();
+                let mut has_new_tree_windows = false;
                 let tree_windows = windows
                     .iter()
                     .map(|(wid, _info)| *wid)
@@ -728,46 +729,20 @@ impl LayoutManager {
                                     new_windows.push(*wid);
                                     false
                                 } else {
+                                    has_new_tree_windows = true;
                                     true
                                 }
                             }
                         }
                     })
                     .collect();
-                // Count columns before adding windows to detect first-time discovery.
-                let columns_before = if !self.tree.is_scroll_layout(layout) {
-                    self.tree.columns(layout).len()
-                } else {
-                    0
-                };
-
                 self.tree.set_windows_for_app(self.layout(space), pid, tree_windows);
 
-                // Import column weights from actual window positions to avoid
-                // reshuffling windows that are already in a tiled layout.
-                // Only do this when windows are first discovered (columns were empty).
-                if !self.tree.is_scroll_layout(layout) && columns_before == 0 {
-                    let columns = self.tree.columns(layout);
-                    let mut column_widths: Vec<(NodeId, f64)> = Vec::new();
-                    for col in columns {
-                        // Get the first window in this column to determine its width
-                        if let Some(wid) = col
-                            .traverse_preorder(self.tree.map())
-                            .find_map(|n| self.tree.window_at(n))
-                        {
-                            if let Some(info) = window_map.get(&wid) {
-                                column_widths.push((col, info.frame.size.width));
-                            }
-                        }
-                    }
-                    // Set weights proportional to actual widths
-                    let total_width: f64 = column_widths.iter().map(|(_, w)| w).sum();
-                    if total_width > 0.0 {
-                        for (col, width) in column_widths {
-                            let weight = (width / total_width) as f32;
-                            self.tree.set_column_weight(col, weight);
-                        }
-                    }
+                // Reorder columns to match actual window positions on screen.
+                // Only do this when new windows are added, not when returning to
+                // a space where windows are already positioned correctly.
+                if !self.tree.is_scroll_layout(layout) && has_new_tree_windows {
+                    self.reorder_columns_by_position(layout, &window_map);
                 }
 
                 for wid in new_windows {
@@ -1286,6 +1261,45 @@ impl LayoutManager {
 }
 
 impl LayoutManager {
+    /// Reorders columns in the layout to match the spatial positions of their windows.
+    /// This ensures windows are assigned to columns in left-to-right order based on
+    /// their actual screen positions, preventing unnecessary swapping on startup.
+    fn reorder_columns_by_position(
+        &mut self,
+        layout: LayoutId,
+        window_map: &HashMap<WindowId, LayoutWindowInfo>,
+    ) {
+        let columns = self.tree.columns(layout);
+        if columns.len() <= 1 {
+            return; // Nothing to reorder
+        }
+
+        // Collect columns with the x position of their first window
+        let mut columns_with_pos: Vec<(NodeId, f64)> = columns
+            .iter()
+            .filter_map(|&col| {
+                // Find the first window in this column
+                let wid =
+                    col.traverse_preorder(self.tree.map()).find_map(|n| self.tree.window_at(n))?;
+                let x = window_map.get(&wid)?.frame.origin.x;
+                Some((col, x))
+            })
+            .collect();
+
+        // Sort by x position (left to right)
+        columns_with_pos.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Extract just the sorted column IDs
+        let sorted_columns: Vec<NodeId> = columns_with_pos.iter().map(|(col, _)| *col).collect();
+
+        // Check if already in correct order
+        if sorted_columns == columns {
+            return;
+        }
+
+        self.tree.reorder_columns(layout, sorted_columns);
+    }
+
     fn is_floating(&self) -> bool {
         if let Some(focus) = self.focused_window {
             self.floating_windows.contains(&focus)
@@ -1796,6 +1810,9 @@ impl LayoutManager {
         if !self.config.settings.drag_drop.enable {
             return false;
         }
+        if !self.config.settings.drag_drop.window_drag {
+            return false;
+        }
         let layout_id = self.layout(space);
         self.interactive_drag = Some(InteractiveDrag {
             layout_id,
@@ -1895,6 +1912,34 @@ impl LayoutManager {
             return None;
         }
         state.current_action.map(|a| (state.source_node, a))
+    }
+
+    /// Compute a drop action based on a window's current position.
+    /// Used for title bar drags when window_drag is disabled.
+    pub fn compute_drop_action_for_position(
+        &self,
+        space: SpaceId,
+        source_wid: WindowId,
+        position: CGPoint,
+        screen: CGRect,
+        config: &Config,
+    ) -> Option<DropAction> {
+        let layout = self.try_layout(space)?;
+        let frames = self.tree.calculate_layout(layout, screen, config);
+
+        // Find window under the drop position (excluding source)
+        for (wid, frame) in &frames {
+            if *wid == source_wid {
+                continue;
+            }
+            if frame.contains(position) {
+                if let Some(target_node) = self.tree.window_node(layout, *wid) {
+                    // Simple swap action for title bar drags
+                    return Some(DropAction::Swap { target_node });
+                }
+            }
+        }
+        None
     }
 
     /// Apply a drop action to the layout tree.
@@ -2089,8 +2134,7 @@ impl LayoutManager {
         self.tree.layout_kind(self.layout(space))
     }
 
-    #[cfg(test)]
-    pub(super) fn floating_windows_in_space(&self, space: SpaceId) -> BTreeSet<WindowId> {
+    pub(crate) fn floating_windows_in_space(&self, space: SpaceId) -> BTreeSet<WindowId> {
         self.active_floating_windows.in_space(space).collect()
     }
 

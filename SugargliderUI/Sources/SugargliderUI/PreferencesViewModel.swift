@@ -50,6 +50,10 @@ public class PreferencesViewModel: ObservableObject {
     @Published public var outerGap: Double = 0
     @Published public var innerGap: Double = 0
 
+    // Dragging behavior
+    @Published public var dragDropEnable: Bool = true
+    @Published public var dragDropWindowDrag: Bool = true
+
     // Layout
     @Published public var defaultLayout: LayoutMode = .tree
     @Published public var defaultSplitDirection: SplitDirection = .auto
@@ -137,6 +141,8 @@ public class PreferencesViewModel: ObservableObject {
         mouseFollowsFocus = config.mouseFollowsFocus
         outerGap = config.outerGap
         innerGap = config.innerGap
+        dragDropEnable = config.dragDropEnable
+        dragDropWindowDrag = config.dragDropWindowDrag
 
         // Map layout kind: "scroll" -> .column, "tree" -> .tree
         defaultLayout = config.defaultLayoutKind == "scroll" ? .column : .tree
@@ -171,6 +177,8 @@ public class PreferencesViewModel: ObservableObject {
             $mouseFollowsFocus.map { _ in () }.eraseToAnyPublisher(),
             $outerGap.map { _ in () }.eraseToAnyPublisher(),
             $innerGap.map { _ in () }.eraseToAnyPublisher(),
+            $dragDropEnable.map { _ in () }.eraseToAnyPublisher(),
+            $dragDropWindowDrag.map { _ in () }.eraseToAnyPublisher(),
             $defaultLayout.map { _ in () }.eraseToAnyPublisher(),
             $appRules.map { _ in () }.eraseToAnyPublisher(),
         ]
@@ -210,6 +218,8 @@ public class PreferencesViewModel: ObservableObject {
             mouseFollowsFocus: mouseFollowsFocus,
             outerGap: outerGap,
             innerGap: innerGap,
+            dragDropEnable: dragDropEnable,
+            dragDropWindowDrag: dragDropWindowDrag,
             // Map layout mode: .column -> "scroll", .tree -> "tree"
             defaultLayoutKind: defaultLayout == .column ? "scroll" : "tree",
             windowRules: appRules.map { rule in
