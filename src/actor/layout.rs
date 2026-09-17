@@ -211,6 +211,23 @@ pub enum DropAction {
     },
 }
 
+/// Update from drag operation for the reactor to handle.
+#[derive(Debug)]
+pub enum DragUpdate {
+    /// Preview frames changed, animate windows to new preview positions.
+    PreviewChanged {
+        source_node: NodeId,
+        action: DropAction,
+        preview_frames: Vec<(WindowId, CGRect)>,
+    },
+    /// No valid drop target, restore windows to original positions.
+    RestoreOriginal {
+        original_frames: Vec<(WindowId, CGRect)>,
+    },
+    /// Action unchanged, no update needed.
+    NoChange,
+}
+
 /// Region within a window frame for drop zone detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DropZoneRegion {
@@ -231,6 +248,8 @@ struct InteractiveDrag {
     hover_target: Option<HoverTarget>,
     hover_start: Option<Instant>,
     current_action: Option<DropAction>,
+    /// Preview state for real-time window rearrangement.
+    preview: DragPreviewState,
 }
 
 /// Information about the window currently being hovered during drag.
@@ -241,6 +260,14 @@ struct HoverTarget {
     wid: WindowId,
     frame: CGRect,
     zone: DropZoneRegion,
+}
+
+/// State for real-time preview of window positions during drag.
+struct DragPreviewState {
+    /// Original window frames before drag began (for restoration).
+    original_frames: HashMap<WindowId, CGRect>,
+    /// The last action that was applied as a preview.
+    last_action: Option<DropAction>,
 }
 
 const RESIZE_EDGE_THRESHOLD: f64 = 8.0;
@@ -1800,6 +1827,8 @@ impl LayoutManager {
         wid: WindowId,
         node: NodeId,
         mouse: CGPoint,
+        screen: CGRect,
+        config: &Config,
     ) -> bool {
         if self.interactive_drag.is_some()
             || self.interactive_resize.is_some()
@@ -1814,6 +1843,14 @@ impl LayoutManager {
             return false;
         }
         let layout_id = self.layout(space);
+
+        // Cache original frames for preview restoration.
+        let frames = self.tree.calculate_layout(layout_id, screen, config);
+        let original_frames: HashMap<WindowId, CGRect> = frames
+            .into_iter()
+            .filter(|(w, _)| *w != wid) // Exclude dragged window
+            .collect();
+
         self.interactive_drag = Some(InteractiveDrag {
             layout_id,
             source_wid: wid,
@@ -1823,22 +1860,28 @@ impl LayoutManager {
             hover_target: None,
             hover_start: None,
             current_action: None,
+            preview: DragPreviewState {
+                original_frames,
+                last_action: None,
+            },
         });
         true
     }
 
     /// Update drag state based on current mouse position.
     ///
-    /// Returns the source node and current action if active, for use by the caller
-    /// to show drop zone overlay.
+    /// Returns a `DragUpdate` indicating what changed, for use by the reactor
+    /// to animate preview positions or restore original positions.
     pub fn update_interactive_drag(
         &mut self,
         mouse: CGPoint,
         screen: CGRect,
         config: &Config,
         now: Instant,
-    ) -> Option<(NodeId, DropAction)> {
-        let state = self.interactive_drag.as_mut()?;
+    ) -> DragUpdate {
+        let Some(state) = self.interactive_drag.as_mut() else {
+            return DragUpdate::NoChange;
+        };
         let drag_cfg = &config.settings.drag_drop;
 
         // Check drag threshold
@@ -1846,13 +1889,14 @@ impl LayoutManager {
             let dx = mouse.x - state.start_mouse.x;
             let dy = mouse.y - state.start_mouse.y;
             if (dx * dx + dy * dy).sqrt() < drag_cfg.drag_threshold {
-                return None;
+                return DragUpdate::NoChange;
             }
             state.drag_active = true;
         }
 
         let layout = state.layout_id;
         let source_wid = state.source_wid;
+        let source_node = state.source_node;
         let frames = self.tree.calculate_layout(layout, screen, config);
 
         // Find target window under cursor
@@ -1901,8 +1945,43 @@ impl LayoutManager {
         });
 
         state.current_action = action;
-        let source_node = state.source_node;
-        action.map(|a| (source_node, a))
+
+        // Check if action changed from preview state
+        let last_action = state.preview.last_action;
+        let action_changed = action != last_action;
+
+        if !action_changed {
+            return DragUpdate::NoChange;
+        }
+
+        // Update preview state and extract data we need before releasing the borrow
+        state.preview.last_action = action;
+        let target_wid = state.hover_target.as_ref().map(|t| t.wid);
+        let original_frames: Vec<_> = state
+            .preview
+            .original_frames
+            .iter()
+            .map(|(wid, frame)| (*wid, *frame))
+            .collect();
+
+        match (action, target_wid) {
+            (Some(action), Some(target_wid)) => {
+                // Calculate preview frames for the new action
+                let preview_frames = self.calculate_preview_frames(
+                    layout, source_wid, target_wid, action, screen, config,
+                );
+                DragUpdate::PreviewChanged {
+                    source_node,
+                    action,
+                    preview_frames,
+                }
+            }
+            (None, _) if last_action.is_some() => {
+                // Action became None, restore original positions
+                DragUpdate::RestoreOriginal { original_frames }
+            }
+            _ => DragUpdate::NoChange,
+        }
     }
 
     /// End the drag operation and return the action to apply.
@@ -1912,6 +1991,59 @@ impl LayoutManager {
             return None;
         }
         state.current_action.map(|a| (state.source_node, a))
+    }
+
+    /// Calculate preview frames by simulating a drop action on a temporary layout clone.
+    ///
+    /// Returns frames for all windows except the dragged window.
+    fn calculate_preview_frames(
+        &mut self,
+        layout: LayoutId,
+        source_wid: WindowId,
+        target_wid: WindowId,
+        action: DropAction,
+        screen: CGRect,
+        config: &Config,
+    ) -> Vec<(WindowId, CGRect)> {
+        // Clone the layout to avoid modifying the real tree.
+        let temp_layout = self.tree.clone_layout(layout);
+
+        // Find the corresponding nodes in the cloned layout.
+        let Some(source_node) = self.tree.window_node(temp_layout, source_wid) else {
+            self.tree.remove_layout(temp_layout);
+            return Vec::new();
+        };
+        let Some(target_node) = self.tree.window_node(temp_layout, target_wid) else {
+            self.tree.remove_layout(temp_layout);
+            return Vec::new();
+        };
+
+        // Apply the action to the cloned layout.
+        match action {
+            DropAction::Swap { .. } => {
+                self.tree.swap_windows(source_node, target_node);
+            }
+            DropAction::Insert { before, .. } => {
+                if before {
+                    self.tree.move_node_before(target_node, source_node);
+                } else {
+                    self.tree.move_node_after(target_node, source_node);
+                }
+            }
+            DropAction::Split { orientation, .. } => {
+                self.tree.nest_in_container(temp_layout, target_node, orientation);
+                self.tree.move_node_after(target_node, source_node);
+            }
+        }
+
+        // Calculate frames from the modified clone.
+        let frames = self.tree.calculate_layout(temp_layout, screen, config);
+
+        // Clean up the temporary layout.
+        self.tree.remove_layout(temp_layout);
+
+        // Return all frames except the dragged window.
+        frames.into_iter().filter(|(wid, _)| *wid != source_wid).collect()
     }
 
     /// Compute a drop action based on a window's current position.
@@ -1936,6 +2068,38 @@ impl LayoutManager {
                 if let Some(target_node) = self.tree.window_node(layout, *wid) {
                     // Simple swap action for title bar drags
                     return Some(DropAction::Swap { target_node });
+                }
+            }
+        }
+        None
+    }
+
+    /// Compute a drop action and preview frames for title bar drags.
+    /// Returns the action and preview frames if a valid drop target is found.
+    pub fn compute_titlebar_preview(
+        &mut self,
+        space: SpaceId,
+        source_wid: WindowId,
+        position: CGPoint,
+        screen: CGRect,
+        config: &Config,
+    ) -> Option<(DropAction, Vec<(WindowId, CGRect)>)> {
+        let layout = self.try_layout(space)?;
+        let frames = self.tree.calculate_layout(layout, screen, config);
+
+        // Find window under the drop position (excluding source)
+        for (wid, frame) in &frames {
+            if *wid == source_wid {
+                continue;
+            }
+            if frame.contains(position) {
+                if let Some(target_node) = self.tree.window_node(layout, *wid) {
+                    let target_wid = *wid;
+                    let action = DropAction::Swap { target_node };
+                    let preview_frames = self.calculate_preview_frames(
+                        layout, source_wid, target_wid, action, screen, config,
+                    );
+                    return Some((action, preview_frames));
                 }
             }
         }

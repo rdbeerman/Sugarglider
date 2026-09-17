@@ -184,6 +184,18 @@ impl Animation {
         }
     }
 
+    /// Create a faster animation for drag preview transitions.
+    pub fn new_preview() -> Self {
+        const FPS: f64 = 100.0;
+        const DURATION: f64 = 0.12; // 120ms for snappy preview
+        let interval = Duration::from_secs_f64(1.0 / FPS);
+        Animation {
+            interval,
+            frames: (DURATION * FPS).round() as u32,
+            windows: vec![],
+        }
+    }
+
     pub fn add_window(
         &mut self,
         handle: &AppThreadHandle,

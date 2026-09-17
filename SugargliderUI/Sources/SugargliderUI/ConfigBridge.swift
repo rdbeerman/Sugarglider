@@ -19,6 +19,7 @@ public struct PreferencesConfig: Codable {
     // Dragging behavior
     public var dragDropEnable: Bool
     public var dragDropWindowDrag: Bool
+    public var dragDropLivePreview: Bool
 
     // Layout settings
     public var defaultLayoutKind: String
@@ -38,6 +39,7 @@ public struct PreferencesConfig: Codable {
         innerGap: Double = 0,
         dragDropEnable: Bool = true,
         dragDropWindowDrag: Bool = true,
+        dragDropLivePreview: Bool = true,
         defaultLayoutKind: String = "tree",
         windowRules: [WindowRuleJson] = [],
         hotkeys: [HotkeyBinding] = []
@@ -50,6 +52,7 @@ public struct PreferencesConfig: Codable {
         self.innerGap = innerGap
         self.dragDropEnable = dragDropEnable
         self.dragDropWindowDrag = dragDropWindowDrag
+        self.dragDropLivePreview = dragDropLivePreview
         self.defaultLayoutKind = defaultLayoutKind
         self.windowRules = windowRules
         self.hotkeys = hotkeys

@@ -33,7 +33,9 @@ use tracing::{Span, debug, error, info, instrument, trace, warn};
 
 use super::mouse;
 use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, pid_t};
-use crate::actor::layout::{self, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo};
+use crate::actor::layout::{
+    self, DragUpdate, DropAction, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo,
+};
 use crate::actor::raise::{self, RaiseManager, RaiseRequest};
 use crate::actor::space_manager::SpaceManager;
 use crate::actor::{group_bars, space_manager, status, window_server, wm_controller};
@@ -234,6 +236,10 @@ struct TitleBarDrag {
     wid: WindowId,
     node: NodeId,
     frame_changed: bool,
+    /// Original window frames before drag, for preview restoration.
+    original_frames: HashMap<WindowId, CGRect>,
+    /// Last action applied as preview (to detect changes).
+    last_preview_action: Option<DropAction>,
 }
 
 pub struct Reactor {
@@ -610,9 +616,91 @@ impl Reactor {
                     return;
                 }
                 // Track that the window being title-bar-dragged actually moved
-                if let Some(ref mut drag) = self.title_bar_drag {
+                // and compute live preview if enabled
+                //
+                // Copy screen data first to avoid borrow conflicts
+                let screen_data = self.active_screen().copied();
+                let live_preview_enabled = self.config.settings.drag_drop.live_preview;
+
+                let titlebar_preview_update = if let Some(ref mut drag) = self.title_bar_drag {
                     if drag.wid == wid {
                         drag.frame_changed = true;
+
+                        // Live preview for title bar drags
+                        if live_preview_enabled {
+                            if let Some(screen) = screen_data {
+                                if let Some(space) = screen.space {
+                                    // Use center of the dragged window as the position
+                                    let center = CGPoint {
+                                        x: new_frame.origin.x + new_frame.size.width / 2.0,
+                                        y: new_frame.origin.y + new_frame.size.height / 2.0,
+                                    };
+
+                                    // Extract data before mutable borrow
+                                    let source_wid = drag.wid;
+                                    let last_action = drag.last_preview_action;
+                                    let original_frames: Vec<_> = drag
+                                        .original_frames
+                                        .iter()
+                                        .map(|(&w, &f)| (w, f))
+                                        .collect();
+
+                                    Some((
+                                        source_wid,
+                                        center,
+                                        space,
+                                        screen,
+                                        last_action,
+                                        original_frames,
+                                    ))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Process preview update after releasing the borrow on title_bar_drag
+                if let Some((source_wid, center, space, screen, last_action, original_frames)) =
+                    titlebar_preview_update
+                {
+                    let preview_result = self.layout.compute_titlebar_preview(
+                        space,
+                        source_wid,
+                        center,
+                        screen.frame,
+                        &self.config,
+                    );
+
+                    match (&preview_result, &last_action) {
+                        (Some((action, preview_frames)), last) if last.as_ref() != Some(action) => {
+                            // Action changed, animate to new preview
+                            trace!(?action, "titlebar drag preview changed");
+                            if let Some(ref mut drag) = self.title_bar_drag {
+                                drag.last_preview_action = Some(*action);
+                            }
+                            self.animate_to_preview(preview_frames, screen.scale_factor);
+                        }
+                        (None, Some(_)) => {
+                            // Action became None, restore original frames
+                            trace!("titlebar drag restore original");
+                            if let Some(ref mut drag) = self.title_bar_drag {
+                                drag.last_preview_action = None;
+                            }
+                            self.animate_to_preview(&original_frames, screen.scale_factor);
+                        }
+                        _ => {
+                            // No change
+                        }
                     }
                 }
                 self.send_layout_event(LayoutEvent::WindowFrameChanged { wid, frame: new_frame });
@@ -744,7 +832,7 @@ impl Reactor {
                 self.update_visible_windows();
             }
             Event::LeftMouseDown(point, window_at_point) => {
-                if let Some(screen) = self.active_screen()
+                if let Some(screen) = self.active_screen().copied()
                     && let Some(space) = screen.space
                 {
                     // Check if the click is on a window that we don't manage as a tiled window.
@@ -777,14 +865,30 @@ impl Reactor {
                         self.layout.hit_test_window(space, point, screen.frame, &self.config)
                     {
                         // Start drag-to-rearrange for any tiled window
-                        if self.layout.begin_interactive_drag(space, wid, node, point) {
+                        if self.layout.begin_interactive_drag(
+                            space,
+                            wid,
+                            node,
+                            point,
+                            screen.frame,
+                            &self.config,
+                        ) {
                             self.in_drag = true;
                         } else if self.config.settings.drag_drop.enable {
                             // window_drag is disabled but enable is on - track for title bar drag
+                            // Cache original frames for live preview
+                            let original_frames: HashMap<WindowId, CGRect> = self
+                                .layout
+                                .calculate_layout(space, screen.frame, &self.config)
+                                .into_iter()
+                                .filter(|(w, _)| *w != wid)
+                                .collect();
                             self.title_bar_drag = Some(TitleBarDrag {
                                 wid,
                                 node,
                                 frame_changed: false,
+                                original_frames,
+                                last_preview_action: None,
                             });
                             self.in_drag = true;
                         }
@@ -802,17 +906,35 @@ impl Reactor {
                             &self.config,
                         ) {
                             self.update_layout(&[], false);
-                        } else if let Some((_source_node, action)) =
-                            self.layout.update_interactive_drag(
+                        } else {
+                            let drag_update = self.layout.update_interactive_drag(
                                 point,
                                 screen.frame,
                                 &self.config,
                                 Instant::now(),
-                            )
-                        {
-                            // TODO: Show drop zone overlay via swift_bridge
-                            // For now, just log the current action for debugging
-                            trace!(?action, "drag action");
+                            );
+                            // Only animate preview if live_preview is enabled
+                            if self.config.settings.drag_drop.live_preview {
+                                match drag_update {
+                                    DragUpdate::PreviewChanged {
+                                        action, preview_frames, ..
+                                    } => {
+                                        trace!(?action, "drag preview changed");
+                                        self.animate_to_preview(
+                                            &preview_frames,
+                                            screen.scale_factor,
+                                        );
+                                    }
+                                    DragUpdate::RestoreOriginal { original_frames } => {
+                                        trace!("drag restore original");
+                                        self.animate_to_preview(
+                                            &original_frames,
+                                            screen.scale_factor,
+                                        );
+                                    }
+                                    DragUpdate::NoChange => {}
+                                }
+                            }
                         }
                     }
                 }
@@ -1414,6 +1536,45 @@ impl Reactor {
 
         // Refresh debug overlay if visible
         self.refresh_debug_drop_zones();
+    }
+
+    /// Animate windows to preview positions during a drag operation.
+    ///
+    /// This updates `frame_monotonic` to track the preview target positions,
+    /// so that subsequent animations (including the final `update_layout` on drop)
+    /// can correctly animate from the current position.
+    fn animate_to_preview(&mut self, targets: &[(WindowId, CGRect)], scale_factor: f64) {
+        let mut anim = Animation::new_preview();
+
+        for &(wid, target_frame) in targets {
+            let Some(window) = self.windows.get_mut(&wid) else {
+                continue;
+            };
+            let target_frame = round_to_physical(target_frame, scale_factor);
+            let current_frame = window.frame_monotonic;
+            if target_frame.same_as(current_frame) {
+                continue;
+            }
+            let Some(app) = self.apps.get(&wid.pid) else {
+                continue;
+            };
+            let txid = window.next_txid();
+            anim.add_window(&app.handle, wid, current_frame, target_frame, false, txid);
+            // Update frame_monotonic to track where the window will be
+            window.frame_monotonic = target_frame;
+        }
+
+        if let Some(tx) = &self.animation_tx
+            && !anim.is_empty()
+        {
+            if let Err(err) = tx.send(AnimationMessage::Replace(anim)) {
+                error!("Animation manager exited unexpectedly");
+                match err.0 {
+                    AnimationMessage::Replace(animation) => animation.skip_to_end(),
+                    AnimationMessage::SkipToEnd(animation) => animation.skip_to_end(),
+                }
+            }
+        }
     }
 
     /// Refresh the debug drop zone overlay if it's currently visible.

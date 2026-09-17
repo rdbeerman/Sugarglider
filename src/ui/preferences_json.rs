@@ -35,6 +35,7 @@ pub struct PreferencesJson {
     // Dragging behavior
     pub drag_drop_enable: bool,
     pub drag_drop_window_drag: bool,
+    pub drag_drop_live_preview: bool,
 
     // Layout settings
     pub default_layout_kind: String,
@@ -85,6 +86,7 @@ impl PreferencesJson {
             inner_gap: settings.inner_gap,
             drag_drop_enable: settings.drag_drop.enable,
             drag_drop_window_drag: settings.drag_drop.window_drag,
+            drag_drop_live_preview: settings.drag_drop.live_preview,
             default_layout_kind: match settings.default_layout_kind {
                 LayoutKind::Tree => "tree".to_string(),
                 LayoutKind::Scroll => "scroll".to_string(),
@@ -129,6 +131,7 @@ impl PreferencesJson {
         settings.inner_gap = self.inner_gap;
         settings.drag_drop.enable = self.drag_drop_enable;
         settings.drag_drop.window_drag = self.drag_drop_window_drag;
+        settings.drag_drop.live_preview = self.drag_drop_live_preview;
         settings.default_layout_kind = match self.default_layout_kind.as_str() {
             "scroll" => LayoutKind::Scroll,
             _ => LayoutKind::Tree,
@@ -564,6 +567,8 @@ mod tests {
             outer_gap: 10.0,
             inner_gap: 5.0,
             drag_drop_enable: true,
+            drag_drop_window_drag: true,
+            drag_drop_live_preview: true,
             default_layout_kind: "tree".to_string(),
             window_rules: vec![WindowRuleJson {
                 app_name: Some("Finder".to_string()),
