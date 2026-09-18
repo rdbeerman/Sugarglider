@@ -716,6 +716,10 @@ impl LayoutTree {
         &self.tree.map
     }
 
+    pub fn node_exists(&self, node: NodeId) -> bool {
+        self.tree.map.contains(node)
+    }
+
     pub fn container_kind(&self, node: NodeId) -> ContainerKind {
         self.tree.data.size.kind(node)
     }

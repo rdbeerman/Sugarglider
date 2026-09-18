@@ -53,6 +53,10 @@ impl NodeMap {
     pub fn reserve(&mut self, additional: usize) {
         self.map.reserve(additional)
     }
+
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.map.contains_key(id)
+    }
 }
 
 impl Index<NodeId> for NodeMap {

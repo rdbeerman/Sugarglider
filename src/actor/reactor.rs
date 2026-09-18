@@ -240,6 +240,8 @@ struct TitleBarDrag {
     original_frames: HashMap<WindowId, CGRect>,
     /// Last action applied as preview (to detect changes).
     last_preview_action: Option<DropAction>,
+    /// Last known mouse position for zone detection.
+    last_mouse_position: Option<CGPoint>,
 }
 
 pub struct Reactor {
@@ -630,11 +632,12 @@ impl Reactor {
                         if live_preview_enabled {
                             if let Some(screen) = screen_data {
                                 if let Some(space) = screen.space {
-                                    // Use center of the dragged window as the position
-                                    let center = CGPoint {
+                                    // Use tracked mouse position for zone detection,
+                                    // fall back to window center if not available
+                                    let position = drag.last_mouse_position.unwrap_or(CGPoint {
                                         x: new_frame.origin.x + new_frame.size.width / 2.0,
                                         y: new_frame.origin.y + new_frame.size.height / 2.0,
-                                    };
+                                    });
 
                                     // Extract data before mutable borrow
                                     let source_wid = drag.wid;
@@ -647,7 +650,7 @@ impl Reactor {
 
                                     Some((
                                         source_wid,
-                                        center,
+                                        position,
                                         space,
                                         screen,
                                         last_action,
@@ -670,13 +673,13 @@ impl Reactor {
                 };
 
                 // Process preview update after releasing the borrow on title_bar_drag
-                if let Some((source_wid, center, space, screen, last_action, original_frames)) =
+                if let Some((source_wid, position, space, screen, last_action, original_frames)) =
                     titlebar_preview_update
                 {
                     let preview_result = self.layout.compute_titlebar_preview(
                         space,
                         source_wid,
-                        center,
+                        position,
                         screen.frame,
                         &self.config,
                     );
@@ -889,6 +892,7 @@ impl Reactor {
                                 frame_changed: false,
                                 original_frames,
                                 last_preview_action: None,
+                                last_mouse_position: Some(point),
                             });
                             self.in_drag = true;
                         }
@@ -896,6 +900,11 @@ impl Reactor {
                 }
             }
             Event::LeftMouseDragged(point) => {
+                // Update mouse position for title bar drags
+                if let Some(ref mut drag) = self.title_bar_drag {
+                    drag.last_mouse_position = Some(point);
+                }
+
                 if let Some(&screen) = self.active_screen() {
                     if screen.space.is_some() {
                         if self.layout.update_interactive_resize(point, screen.frame) {
@@ -911,7 +920,6 @@ impl Reactor {
                                 point,
                                 screen.frame,
                                 &self.config,
-                                Instant::now(),
                             );
                             // Only animate preview if live_preview is enabled
                             if self.config.settings.drag_drop.live_preview {
@@ -961,28 +969,36 @@ impl Reactor {
                 // which confirms macOS actually moved it (not just a click on a floating window)
                 if let Some(drag) = self.title_bar_drag.take() {
                     if drag.frame_changed {
-                        if let Some(window) = self.windows.get(&drag.wid) {
+                        // Use the action from live preview if available, otherwise compute it.
+                        let action = if let Some(action) = drag.last_preview_action {
+                            Some(action)
+                        } else if let Some(window) = self.windows.get(&drag.wid)
+                            && let Some(&screen) = self.active_screen()
+                            && let Some(space) = screen.space
+                        {
+                            // Use tracked mouse position, fall back to window center
                             let current_frame = window.frame_monotonic;
-                            if let Some(&screen) = self.active_screen() {
-                                if let Some(space) = screen.space {
-                                    // Find overlapping window to swap with
-                                    let center = CGPoint {
-                                        x: current_frame.origin.x + current_frame.size.width / 2.0,
-                                        y: current_frame.origin.y + current_frame.size.height / 2.0,
-                                    };
-                                    if let Some(action) =
-                                        self.layout.compute_drop_action_for_position(
-                                            space,
-                                            drag.wid,
-                                            center,
-                                            screen.frame,
-                                            &self.config,
-                                        )
-                                    {
-                                        self.layout.apply_drop_action(space, drag.node, action);
-                                        self.update_layout(&[], false);
-                                    }
-                                }
+                            let position = drag.last_mouse_position.unwrap_or(CGPoint {
+                                x: current_frame.origin.x + current_frame.size.width / 2.0,
+                                y: current_frame.origin.y + current_frame.size.height / 2.0,
+                            });
+                            self.layout.compute_drop_action_for_position(
+                                space,
+                                drag.wid,
+                                position,
+                                screen.frame,
+                                &self.config,
+                            )
+                        } else {
+                            None
+                        };
+
+                        if let Some(action) = action {
+                            if let Some(&screen) = self.active_screen()
+                                && let Some(space) = screen.space
+                            {
+                                self.layout.apply_drop_action(space, drag.node, action);
+                                self.update_layout(&[], false);
                             }
                         }
                     }
