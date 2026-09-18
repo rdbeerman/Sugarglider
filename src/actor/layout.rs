@@ -720,6 +720,7 @@ impl LayoutManager {
                         .partial_cmp(&b.frame.origin.x)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
+
                 // The windows may already be in the layout if we restored a saved state, so
                 // make sure not to duplicate or erase them here.
                 for (wid, info) in &windows {
@@ -771,11 +772,19 @@ impl LayoutManager {
                 // Only do this when new windows are added, not when returning to
                 // a space where windows are already positioned correctly.
                 if !self.tree.is_scroll_layout(layout) && has_new_tree_windows {
-                    self.reorder_columns_by_position(layout, &window_map);
+                    self.reorder_columns_by_position(layout);
                 }
 
+                let has_new_scroll_windows = !new_windows.is_empty();
                 for wid in new_windows {
                     self.add_scroll_window(layout, wid);
+                }
+
+                // For scroll layouts, reorder columns after adding windows to match
+                // their actual screen positions. This prevents shuffling windows
+                // that are already arranged correctly (e.g., on startup).
+                if self.tree.is_scroll_layout(layout) && has_new_scroll_windows {
+                    self.reorder_columns_by_position(layout);
                 }
                 for wid in add_floating {
                     self.add_floating_window(wid, Some(space));
@@ -1297,35 +1306,35 @@ impl LayoutManager {
     /// Reorders columns in the layout to match the spatial positions of their windows.
     /// This ensures windows are assigned to columns in left-to-right order based on
     /// their actual screen positions, preventing unnecessary swapping on startup.
-    fn reorder_columns_by_position(
-        &mut self,
-        layout: LayoutId,
-        window_map: &HashMap<WindowId, LayoutWindowInfo>,
-    ) {
+    fn reorder_columns_by_position(&mut self, layout: LayoutId) {
         let columns = self.tree.columns(layout);
         if columns.len() <= 1 {
-            return; // Nothing to reorder
+            return;
         }
 
-        // Collect columns with the x position of their first window
+        // Collect columns with the x position of their first window.
+        // Use floating_restore_frames which contains frames for ALL windows,
+        // not just the current app's windows.
         let mut columns_with_pos: Vec<(NodeId, f64)> = columns
             .iter()
             .filter_map(|&col| {
-                // Find the first window in this column
                 let wid =
                     col.traverse_preorder(self.tree.map()).find_map(|n| self.tree.window_at(n))?;
-                let x = window_map.get(&wid)?.frame.origin.x;
+                let x = self.floating_restore_frames.get(&wid)?.frame.origin.x;
                 Some((col, x))
             })
             .collect();
 
+        // Only reorder if we have position info for all columns
+        if columns_with_pos.len() != columns.len() {
+            return;
+        }
+
         // Sort by x position (left to right)
         columns_with_pos.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Extract just the sorted column IDs
         let sorted_columns: Vec<NodeId> = columns_with_pos.iter().map(|(col, _)| *col).collect();
 
-        // Check if already in correct order
         if sorted_columns == columns {
             return;
         }
