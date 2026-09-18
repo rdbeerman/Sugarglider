@@ -3,9 +3,7 @@
 A tiling window manager for macOS with drag-to-rearrange and a native menu bar GUI.
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  ▓ Sugarglider        Automatically tile and organize your windows  │
-└─────────────────────────────────────────────────────────────────────┘
+<img width="1600" height="668" alt="Screen Recording 2026-09-18 at 17 07 42" src="https://github.com/user-attachments/assets/7576e03f-ab84-40ba-b2b7-cd734118b39e" />
 ```
 
 Based on [Glide](https://github.com/tmandry/glide) by Tyler Mandry.
@@ -15,8 +13,7 @@ Based on [Glide](https://github.com/tmandry/glide) by Tyler Mandry.
 - **Automatic Window Tiling** - Windows automatically arrange in a tree or column layout
 - **Menu Bar GUI** - Quick access to controls, layout switching, and preferences
 - **Drag-to-Rearrange** - Visually drag windows to reposition them in the layout
-- **Per-Space Control** - Enable/disable tiling on individual spaces
-- **Native SwiftUI Preferences** - Beautiful, native macOS preferences window
+- **Native SwiftUI Preferences** - Native macOS preferences window
 - **Keyboard-First** - Full keyboard control with customizable hotkeys
 - **Smooth Animations** - Fluid window transitions
 
@@ -164,75 +161,9 @@ Drag windows to visually rearrange them in the layout.
 
 ### How It Works
 
-1. **Grab** a window's title bar
-2. **Drag** to see drop zone indicators appear
+1. **Grab** a window's title bar or from anywhere in the window content (disabled by default)
+2. **Drag** to where you want the window to appear, on top of another to swap or below to split horizontally
 3. **Drop** on a zone to reposition the window
-
-### Drop Zone Indicators
-
-When dragging, visual indicators show where you can drop:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│     ┌───────┐                                               │
-│     │  ◀──  │   ← Drop LEFT of window                      │
-│     └───────┘                                               │
-│                    ┌─────────────────┐                      │
-│                    │                 │                      │
-│                    │     Window      │                      │
-│                    │                 │                      │
-│                    └─────────────────┘                      │
-│     ┌───────┐              │              ┌───────┐         │
-│     │  ──▶  │              ▼              │  TAB  │         │
-│     └───────┘         ┌─────────┐         └───────┘         │
-│                       │  ──▼──  │                           │
-│  Drop RIGHT ───►      └─────────┘      ◄─── Stack as TAB   │
-│                       Drop BELOW                            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Drop Position Reference
-
-| Zone | Icon | Result |
-|------|------|--------|
-| **Left** | `◀──` | Split window, place dragged window on left |
-| **Right** | `──▶` | Split window, place dragged window on right |
-| **Top** | `──▲──` | Split window, place dragged window above |
-| **Bottom** | `──▼──` | Split window, place dragged window below |
-| **Tab** | `TAB` | Stack windows together (tabbed) |
-
-### Visual Example: Moving a Window
-
-Before:
-```
-┌─────────────┬─────────────┐
-│             │             │
-│   Win A     │   Win B     │
-│             │             │
-└─────────────┴─────────────┘
-```
-
-Drag Win A to the RIGHT of Win B:
-```
-┌─────────────┬─────────────┐
-│             │┌───────────┐│
-│   Win B     ││   ──▶     ││  ← Drop zone highlighted
-│             │└───────────┘│
-└─────────────┴─────────────┘
-```
-
-After:
-```
-┌─────────────┬─────────────┐
-│             │             │
-│   Win B     │   Win A     │
-│             │             │
-└─────────────┴─────────────┘
-```
-
----
 
 ## Keyboard Shortcuts
 
@@ -499,41 +430,6 @@ cargo run --example devtool -- replay traces/example.ron
 
 ```bash
 RUST_LOG=info sugarglider_server --record traces/debug-$(date +%Y%m%d-%H%M%S).ron
-```
-
----
-
-## Troubleshooting
-
-### Windows not tiling
-
-1. Check Accessibility permissions in System Settings
-2. Ensure Sugarglider is enabled (⌥Z or via menu bar)
-3. Check if the app is set to `float` or `ignore` in app rules
-4. Some apps with non-standard windows may not tile properly
-
-### High CPU usage
-
-1. Check for apps that rapidly resize windows
-2. Try disabling animations: `enable_animations = false`
-3. Record a trace and report an issue
-
-### Menu bar icon not appearing
-
-1. Check `show_menu_bar_icon = true` in config
-2. Restart Sugarglider
-3. Check if too many menu bar icons are hiding it
-
-### Save and Restore
-
-When updating or restarting:
-
-```bash
-# Exit with state save (or press ⌥⇧E)
-sugarglider save-and-exit
-
-# Launch with restore
-sugarglider launch --restore
 ```
 
 ---
