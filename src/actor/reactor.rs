@@ -1073,6 +1073,10 @@ impl Reactor {
             }
             Event::Command(Command::Layout(cmd)) => {
                 info!(?cmd);
+                let animate = matches!(
+                    cmd,
+                    LayoutCommand::CleanUpSpace | LayoutCommand::ToggleWindowFloating
+                );
                 let visible_spaces =
                     self.screens.iter().flat_map(|screen| screen.space).collect::<Vec<_>>();
                 // macOS can temporarily have no main window (for example after
@@ -1083,6 +1087,11 @@ impl Reactor {
                     .or_else(|| self.active_screen().and_then(|screen| screen.space));
                 let response = self.layout.handle_command(command_space, &visible_spaces, cmd);
                 self.handle_layout_response(response);
+                if animate {
+                    if let Some(status_tx) = &self.status_tx {
+                        status_tx.send(status::Event::Animate);
+                    }
+                }
             }
             Event::Command(Command::Metrics(cmd)) => log::handle_command(cmd),
             Event::Command(Command::Reactor(ReactorCommand::Debug)) => {

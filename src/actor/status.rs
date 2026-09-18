@@ -32,6 +32,8 @@ pub enum Event {
     GlobalEnabledChanged(bool),
     SpaceEnabledChanged(bool),
     ConfigUpdated(Arc<Config>),
+    /// Trigger the tail swing animation (e.g., after clean up space).
+    Animate,
 }
 
 /// Animation state for the status icon tail swing.
@@ -138,6 +140,7 @@ impl Status {
                 self.config = config;
                 self.apply_config();
             }
+            Event::Animate => self.start_animation(),
         }
     }
 

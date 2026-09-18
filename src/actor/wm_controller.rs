@@ -201,9 +201,11 @@ impl WmController {
             }
             Command(Wm(ToggleSpaceActivated)) => {
                 self.sm_tx.send(space_manager::Event::ToggleFocusedSpace);
+                self.status_tx.send(status::Event::Animate);
             }
             Command(Wm(ToggleGlobalEnabled)) => {
                 self.sm_tx.send(space_manager::Event::ToggleGlobalEnabled);
+                self.status_tx.send(status::Event::Animate);
             }
             Command(Wm(SetGlobalEnabled(enabled))) => {
                 self.sm_tx.send(space_manager::Event::SetGlobalEnabled(enabled));
