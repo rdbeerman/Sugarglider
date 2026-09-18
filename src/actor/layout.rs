@@ -232,7 +232,7 @@ pub enum DragUpdate {
 
 /// Region within a window frame for drop zone detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DropZoneRegion {
+pub enum DropZoneRegion {
     Center,
     Left,
     Right,
@@ -248,7 +248,6 @@ struct InteractiveDrag {
     start_mouse: CGPoint,
     drag_active: bool,
     hover_target: Option<HoverTarget>,
-    hover_start: Option<Instant>,
     current_action: Option<DropAction>,
     /// Preview state for real-time window rearrangement.
     preview: DragPreviewState,
@@ -277,22 +276,35 @@ const MOVE_DRAG_THRESHOLD: f64 = 10.0;
 
 impl DropZoneRegion {
     /// Compute which zone a point falls into within a frame.
+    ///
+    /// Zone sizes:
+    /// - Left/Right (insert zones): use `edge_ratio` (default 15%)
+    /// - Bottom (horizontal split zone): 1/3 of height
+    /// - Top zone is disabled (resolves to center or left/right at corners)
     fn from_point(point: CGPoint, frame: CGRect, edge_ratio: f64) -> Self {
         let rel_x = (point.x - frame.origin.x) / frame.size.width;
         let rel_y = (point.y - frame.origin.y) / frame.size.height;
 
+        // Left/right use edge_ratio, bottom uses 1/3 for horizontal split
+        const BOTTOM_ZONE_RATIO: f64 = 1.0 / 3.0;
+
         let in_left = rel_x < edge_ratio;
         let in_right = rel_x > (1.0 - edge_ratio);
         let in_top = rel_y < edge_ratio;
-        let in_bottom = rel_y > (1.0 - edge_ratio);
+        let in_bottom = rel_y > (1.0 - BOTTOM_ZONE_RATIO);
 
         // Corners: pick the edge we're deeper into
         // Top zone is disabled - corners resolve to left/right, top edge resolves to center
         match (in_left, in_right, in_top, in_bottom) {
             // Top-left corner: always pick left (top zone disabled)
             (true, _, true, _) => DropZoneRegion::Left,
+            // Bottom-left corner: compare depth into each zone
             (true, _, _, true) => {
-                if rel_x < (1.0 - rel_y) {
+                // Depth into left zone (from left edge)
+                let left_depth = rel_x / edge_ratio;
+                // Depth into bottom zone (from bottom edge)
+                let bottom_depth = (rel_y - (1.0 - BOTTOM_ZONE_RATIO)) / BOTTOM_ZONE_RATIO;
+                if left_depth < bottom_depth {
                     DropZoneRegion::Left
                 } else {
                     DropZoneRegion::Bottom
@@ -300,8 +312,13 @@ impl DropZoneRegion {
             }
             // Top-right corner: always pick right (top zone disabled)
             (_, true, true, _) => DropZoneRegion::Right,
+            // Bottom-right corner: compare depth into each zone
             (_, true, _, true) => {
-                if (1.0 - rel_x) < (1.0 - rel_y) {
+                // Depth into right zone (from right edge)
+                let right_depth = (rel_x - (1.0 - edge_ratio)) / edge_ratio;
+                // Depth into bottom zone (from bottom edge)
+                let bottom_depth = (rel_y - (1.0 - BOTTOM_ZONE_RATIO)) / BOTTOM_ZONE_RATIO;
+                if right_depth < bottom_depth {
                     DropZoneRegion::Right
                 } else {
                     DropZoneRegion::Bottom
@@ -317,42 +334,32 @@ impl DropZoneRegion {
 
     /// Convert a zone to a drop action based on parent container orientation.
     ///
-    /// - Center always maps to Swap (safest).
+    /// - Center always maps to Swap.
     /// - Edges along the parent's orientation map to Insert.
-    /// - Edges perpendicular to parent's orientation map to Split (if dwell_ok).
-    fn to_action(
-        self,
-        target_node: NodeId,
-        parent_orientation: Orientation,
-        dwell_ok: bool,
-    ) -> DropAction {
+    /// - Edges perpendicular to parent's orientation map to Split.
+    fn to_action(self, target_node: NodeId, parent_orientation: Orientation) -> DropAction {
         match self {
             DropZoneRegion::Center => DropAction::Swap { target_node },
             DropZoneRegion::Left | DropZoneRegion::Right => {
                 let before = self == DropZoneRegion::Left;
                 if parent_orientation == Orientation::Horizontal {
                     DropAction::Insert { target_node, before }
-                } else if dwell_ok {
+                } else {
                     DropAction::Split {
                         target_node,
                         orientation: ContainerKind::Horizontal,
                     }
-                } else {
-                    // Fall back to swap if dwell time not satisfied
-                    DropAction::Swap { target_node }
                 }
             }
             DropZoneRegion::Top | DropZoneRegion::Bottom => {
                 let before = self == DropZoneRegion::Top;
                 if parent_orientation == Orientation::Vertical {
                     DropAction::Insert { target_node, before }
-                } else if dwell_ok {
+                } else {
                     DropAction::Split {
                         target_node,
                         orientation: ContainerKind::Vertical,
                     }
-                } else {
-                    DropAction::Swap { target_node }
                 }
             }
         }
@@ -1873,7 +1880,6 @@ impl LayoutManager {
             start_mouse: mouse,
             drag_active: false,
             hover_target: None,
-            hover_start: None,
             current_action: None,
             preview: DragPreviewState {
                 original_frames,
@@ -1892,7 +1898,6 @@ impl LayoutManager {
         mouse: CGPoint,
         screen: CGRect,
         config: &Config,
-        now: Instant,
     ) -> DragUpdate {
         let Some(state) = self.interactive_drag.as_mut() else {
             return DragUpdate::NoChange;
@@ -1934,29 +1939,14 @@ impl LayoutManager {
             }
         }
 
-        // Update hover timing - reset if target or zone changed
-        let target_changed = match (&state.hover_target, &new_target) {
-            (Some(old), Some(new)) => old.node != new.node || old.zone != new.zone,
-            (None, Some(_)) | (Some(_), None) => true,
-            (None, None) => false,
-        };
+        // Update hover target
+        state.hover_target = new_target.clone();
 
-        if target_changed {
-            state.hover_target = new_target.clone();
-            state.hover_start = new_target.as_ref().map(|_| now);
-        }
-
-        // Compute action with dwell time check
+        // Compute action based on zone
         let action = new_target.as_ref().and_then(|target| {
             let parent = target.node.parent(self.tree.map())?;
             let parent_orientation = self.tree.container_kind(parent).orientation();
-            let dwell_time = state
-                .hover_start
-                .map(|start| now.duration_since(start).as_millis() as u64)
-                .unwrap_or(0);
-            let dwell_ok = dwell_time >= drag_cfg.split_dwell_ms;
-
-            Some(target.zone.to_action(target.node, parent_orientation, dwell_ok))
+            Some(target.zone.to_action(target.node, parent_orientation))
         });
 
         state.current_action = action;
@@ -2061,6 +2051,38 @@ impl LayoutManager {
         frames.into_iter().filter(|(wid, _)| *wid != source_wid).collect()
     }
 
+    /// Compute drop zone information for a title bar drag.
+    /// Returns the target node, window, zone, and action if a valid target is found.
+    pub fn compute_titlebar_drag_action(
+        &self,
+        space: SpaceId,
+        source_wid: WindowId,
+        position: CGPoint,
+        screen: CGRect,
+        config: &Config,
+    ) -> Option<(NodeId, WindowId, DropZoneRegion, DropAction)> {
+        let layout = self.try_layout(space)?;
+        let frames = self.tree.calculate_layout(layout, screen, config);
+        let edge_ratio = config.settings.drag_drop.edge_zone_ratio;
+
+        // Find window under the drop position (excluding source)
+        for (wid, frame) in &frames {
+            if *wid == source_wid {
+                continue;
+            }
+            if frame.contains(position) {
+                if let Some(target_node) = self.tree.window_node(layout, *wid) {
+                    let zone = DropZoneRegion::from_point(position, *frame, edge_ratio);
+                    let parent = target_node.parent(self.tree.map())?;
+                    let parent_orientation = self.tree.container_kind(parent).orientation();
+                    let action = zone.to_action(target_node, parent_orientation);
+                    return Some((target_node, *wid, zone, action));
+                }
+            }
+        }
+        None
+    }
+
     /// Compute a drop action based on a window's current position.
     /// Used for title bar drags when window_drag is disabled.
     pub fn compute_drop_action_for_position(
@@ -2071,26 +2093,13 @@ impl LayoutManager {
         screen: CGRect,
         config: &Config,
     ) -> Option<DropAction> {
-        let layout = self.try_layout(space)?;
-        let frames = self.tree.calculate_layout(layout, screen, config);
-
-        // Find window under the drop position (excluding source)
-        for (wid, frame) in &frames {
-            if *wid == source_wid {
-                continue;
-            }
-            if frame.contains(position) {
-                if let Some(target_node) = self.tree.window_node(layout, *wid) {
-                    // Simple swap action for title bar drags
-                    return Some(DropAction::Swap { target_node });
-                }
-            }
-        }
-        None
+        self.compute_titlebar_drag_action(space, source_wid, position, screen, config)
+            .map(|(_, _, _, action)| action)
     }
 
     /// Compute a drop action and preview frames for title bar drags.
-    /// Returns the action and preview frames if a valid drop target is found.
+    /// Returns target info (node, wid, zone, action) and preview frames if a valid drop target
+    /// is found.
     pub fn compute_titlebar_preview(
         &mut self,
         space: SpaceId,
@@ -2100,29 +2109,28 @@ impl LayoutManager {
         config: &Config,
     ) -> Option<(DropAction, Vec<(WindowId, CGRect)>)> {
         let layout = self.try_layout(space)?;
-        let frames = self.tree.calculate_layout(layout, screen, config);
-
-        // Find window under the drop position (excluding source)
-        for (wid, frame) in &frames {
-            if *wid == source_wid {
-                continue;
-            }
-            if frame.contains(position) {
-                if let Some(target_node) = self.tree.window_node(layout, *wid) {
-                    let target_wid = *wid;
-                    let action = DropAction::Swap { target_node };
-                    let preview_frames = self.calculate_preview_frames(
-                        layout, source_wid, target_wid, action, screen, config,
-                    );
-                    return Some((action, preview_frames));
-                }
-            }
-        }
-        None
+        let (_, target_wid, _, action) =
+            self.compute_titlebar_drag_action(space, source_wid, position, screen, config)?;
+        let preview_frames =
+            self.calculate_preview_frames(layout, source_wid, target_wid, action, screen, config);
+        Some((action, preview_frames))
     }
 
     /// Apply a drop action to the layout tree.
     pub fn apply_drop_action(&mut self, space: SpaceId, source_node: NodeId, action: DropAction) {
+        // Validate that source node still exists (window may have closed during drag).
+        if !self.tree.node_exists(source_node) {
+            return;
+        }
+        let target_node = match &action {
+            DropAction::Swap { target_node }
+            | DropAction::Insert { target_node, .. }
+            | DropAction::Split { target_node, .. } => *target_node,
+        };
+        if !self.tree.node_exists(target_node) {
+            return;
+        }
+
         let layout = self.layout(space);
         match action {
             DropAction::Swap { target_node } => {
@@ -2180,9 +2188,9 @@ impl LayoutManager {
             let y = frame.origin.y as f32;
             let w = frame.size.width as f32;
             let h = frame.size.height as f32;
-            // Left/right zones are 25% wider, bottom zone is 25% taller
-            let edge_w = w * edge_ratio as f32 * 1.25;
-            let edge_h = h * edge_ratio as f32 * 1.25;
+            // Left/right zones use edge_ratio (15%), bottom zone uses 1/3
+            let edge_w = w * edge_ratio as f32;
+            let bottom_h = h / 3.0;
             // Use wsid if available, otherwise use a hash of pid
             let wid_u64 = wid.wsid().map(|w| w.0 as u64).unwrap_or(wid.pid as u64);
 
@@ -2191,7 +2199,7 @@ impl LayoutManager {
                 x + edge_w,
                 y,
                 w - 2.0 * edge_w,
-                h - edge_h,
+                h - bottom_h,
                 4, // tab position type (center-ish)
                 wid_u64,
                 DropActionType::Swap,
@@ -2210,7 +2218,7 @@ impl LayoutManager {
                 x,
                 y,
                 edge_w,
-                h - edge_h,
+                h - bottom_h,
                 0, // left
                 wid_u64,
                 left_action,
@@ -2225,7 +2233,7 @@ impl LayoutManager {
                 x + w - edge_w,
                 y,
                 edge_w,
-                h - edge_h,
+                h - bottom_h,
                 1, // right
                 wid_u64,
                 right_action,
@@ -2234,7 +2242,7 @@ impl LayoutManager {
                 screen_index,
             ));
 
-            // Bottom edge zone
+            // Bottom edge zone (1/3 of height for horizontal split)
             let bottom_action = if parent_orientation == Orientation::Vertical {
                 DropActionType::Insert
             } else {
@@ -2242,9 +2250,9 @@ impl LayoutManager {
             };
             zones.push(DropZone::with_action(
                 x + edge_w,
-                y + h - edge_h,
+                y + h - bottom_h,
                 w - 2.0 * edge_w,
-                edge_h,
+                bottom_h,
                 3, // bottom
                 wid_u64,
                 bottom_action,
@@ -3827,34 +3835,30 @@ mod tests {
         let node = NodeId::from(slotmap::KeyData::from_ffi(1));
 
         // Horizontal parent, left zone -> Insert before
-        let action = DropZoneRegion::Left.to_action(node, Orientation::Horizontal, false);
+        let action = DropZoneRegion::Left.to_action(node, Orientation::Horizontal);
         assert!(matches!(action, DropAction::Insert { before: true, .. }));
 
         // Horizontal parent, right zone -> Insert after
-        let action = DropZoneRegion::Right.to_action(node, Orientation::Horizontal, false);
+        let action = DropZoneRegion::Right.to_action(node, Orientation::Horizontal);
         assert!(matches!(action, DropAction::Insert { before: false, .. }));
 
         // Vertical parent, top zone -> Insert before
-        let action = DropZoneRegion::Top.to_action(node, Orientation::Vertical, false);
+        let action = DropZoneRegion::Top.to_action(node, Orientation::Vertical);
         assert!(matches!(action, DropAction::Insert { before: true, .. }));
 
         // Vertical parent, bottom zone -> Insert after
-        let action = DropZoneRegion::Bottom.to_action(node, Orientation::Vertical, false);
+        let action = DropZoneRegion::Bottom.to_action(node, Orientation::Vertical);
         assert!(matches!(action, DropAction::Insert { before: false, .. }));
     }
 
     #[test]
-    fn drop_zone_to_action_cross_orientation_needs_dwell() {
+    fn drop_zone_to_action_cross_orientation_splits() {
         use crate::model::NodeId;
 
         let node = NodeId::from(slotmap::KeyData::from_ffi(1));
 
-        // Vertical parent, left zone without dwell -> Swap (fallback)
-        let action = DropZoneRegion::Left.to_action(node, Orientation::Vertical, false);
-        assert!(matches!(action, DropAction::Swap { .. }));
-
-        // Vertical parent, left zone with dwell -> Split horizontal
-        let action = DropZoneRegion::Left.to_action(node, Orientation::Vertical, true);
+        // Vertical parent, left zone -> Split horizontal
+        let action = DropZoneRegion::Left.to_action(node, Orientation::Vertical);
         assert!(matches!(
             action,
             DropAction::Split {
@@ -3863,12 +3867,28 @@ mod tests {
             }
         ));
 
-        // Horizontal parent, top zone without dwell -> Swap (fallback)
-        let action = DropZoneRegion::Top.to_action(node, Orientation::Horizontal, false);
-        assert!(matches!(action, DropAction::Swap { .. }));
+        // Vertical parent, right zone -> Split horizontal
+        let action = DropZoneRegion::Right.to_action(node, Orientation::Vertical);
+        assert!(matches!(
+            action,
+            DropAction::Split {
+                orientation: ContainerKind::Horizontal,
+                ..
+            }
+        ));
 
-        // Horizontal parent, top zone with dwell -> Split vertical
-        let action = DropZoneRegion::Top.to_action(node, Orientation::Horizontal, true);
+        // Horizontal parent, top zone -> Split vertical
+        let action = DropZoneRegion::Top.to_action(node, Orientation::Horizontal);
+        assert!(matches!(
+            action,
+            DropAction::Split {
+                orientation: ContainerKind::Vertical,
+                ..
+            }
+        ));
+
+        // Horizontal parent, bottom zone -> Split vertical
+        let action = DropZoneRegion::Bottom.to_action(node, Orientation::Horizontal);
         assert!(matches!(
             action,
             DropAction::Split {
@@ -3885,10 +3905,10 @@ mod tests {
         let node = NodeId::from(slotmap::KeyData::from_ffi(1));
 
         // Center zone always results in swap, regardless of orientation
-        let action = DropZoneRegion::Center.to_action(node, Orientation::Horizontal, false);
+        let action = DropZoneRegion::Center.to_action(node, Orientation::Horizontal);
         assert!(matches!(action, DropAction::Swap { .. }));
 
-        let action = DropZoneRegion::Center.to_action(node, Orientation::Vertical, true);
+        let action = DropZoneRegion::Center.to_action(node, Orientation::Vertical);
         assert!(matches!(action, DropAction::Swap { .. }));
     }
 }
