@@ -2,9 +2,8 @@
 
 A tiling window manager for macOS with drag-to-rearrange and a native menu bar GUI.
 
-```
-<img width="1600" height="668" alt="Screen Recording 2026-09-18 at 17 07 42" src="https://github.com/user-attachments/assets/7576e03f-ab84-40ba-b2b7-cd734118b39e" />
-```
+<img width="1600" height="668" alt="Screen Recording 2026-09-18 at 17 07 42" src="https://github.com/user-attachments/assets/ca848321-c101-4528-a4cb-eb83ee730001" />
+
 
 Based on [Glide](https://github.com/tmandry/glide) by Tyler Mandry.
 
