@@ -89,16 +89,16 @@ default_keys = false
 "Alt + Shift + C" = "clean_up_space"
 
 # Focus the window in the specified direction.
-"Alt + H" = { move_focus = "left" }
-"Alt + J" = { move_focus = "down" }
-"Alt + K" = { move_focus = "up" }
-"Alt + L" = { move_focus = "right" }
+"Ctrl + Alt + Shift + ArrowLeft" = { move_focus = "left" }
+"Ctrl + Alt + Shift + ArrowDown" = { move_focus = "down" }
+"Ctrl + Alt + Shift + ArrowUp" = { move_focus = "up" }
+"Ctrl + Alt + Shift + ArrowRight" = { move_focus = "right" }
 
 # Move the focused window in the specified direction.
-"Alt + Shift + H" = { move_node = "left" }
-"Alt + Shift + J" = { move_node = "down" }
-"Alt + Shift + K" = { move_node = "up" }
-"Alt + Shift + L" = { move_node = "right" }
+"Ctrl + Alt + ArrowLeft" = { move_node = "left" }
+"Ctrl + Alt + ArrowDown" = { move_node = "down" }
+"Ctrl + Alt + ArrowUp" = { move_node = "up" }
+"Ctrl + Alt + ArrowRight" = { move_node = "right" }
 
 # Resize the focused window in the specified direction by percentage.
 "Alt + Ctrl + H" = { resize = { direction = "left", percent = 5 } }
@@ -178,7 +178,7 @@ default_keys = false
 #
 
 # Print the current layout in the logs.
-"Alt + Shift + D" = "debug"
+"Ctrl + Alt + D" = "debug"
 
 # "<key>" = "show_timings"
 # "<key>" = "serialize"
