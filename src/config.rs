@@ -907,11 +907,11 @@ mod tests {
 
     #[test]
     fn disable_can_override_default_key() {
-        // First verify Alt+H exists in defaults
+        // First verify Alt+T exists in defaults
         let default_config = Config::default();
         assert!(
-            default_config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + KeyH"),
-            "Alt+H should be a default key binding"
+            default_config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + KeyT"),
+            "Alt+T should be a default key binding"
         );
 
         let config = Config::parse(
@@ -920,15 +920,15 @@ mod tests {
             default_keys = true
 
             [keys]
-            "Alt + H" = "disable"
+            "Alt + T" = "disable"
             "#,
         )
         .unwrap();
 
-        // Alt+H should be removed even though it's in defaults
-        assert!(!config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + KeyH"));
+        // Alt+T should be removed even though it's in defaults
+        assert!(!config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + KeyT"));
         // But other default keys should still be present
-        assert!(config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + KeyJ"));
+        assert!(config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + Slash"));
     }
 
     #[test]
