@@ -11,7 +11,7 @@ use std::str::FromStr;
 use livesplit_hotkey::Hotkey;
 use serde::{Deserialize, Serialize};
 
-use crate::actor::layout::LayoutCommand;
+use crate::actor::layout::{LayoutCommand, SizeShare};
 use crate::actor::reactor::{Command as ReactorCommand, ReactorCommand as ReactorCmd};
 use crate::actor::wm_controller::{WmCmd, WmCommand};
 use crate::config::{Config, WindowRule, WindowRuleConditions};
@@ -538,6 +538,19 @@ fn describe_layout_command(cmd: &LayoutCommand) -> (String, String, String) {
             "System".to_string(),
             "clean_up_space".to_string(),
         ),
+        LayoutCommand::SetSizeShare(share) => {
+            let name = match share.fraction() {
+                Some(fraction) => format!("{}%", (fraction * 100.0).round()),
+                None => "a share".to_string(),
+            };
+            let id = match share {
+                SizeShare::Fraction(fraction) => format!("set_size_share_{fraction}"),
+                SizeShare::Denominator { denominator } => {
+                    format!("set_size_share_1_{denominator}")
+                }
+            };
+            (format!("Freeze window size at {name}"), "Layout".to_string(), id)
+        }
     }
 }
 
