@@ -105,6 +105,7 @@ impl StatusIcon {
         mtm: MainThreadMarker,
         wm_tx: wm_controller::Sender,
         clean_up_keybinding: Option<MenuKeyEquivalent>,
+        toggle_floating_keybinding: Option<MenuKeyEquivalent>,
     ) -> Self {
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
@@ -168,17 +169,26 @@ impl StatusIcon {
         space_toggle_item.setTag(TOGGLE_SPACE_TAG as isize);
         menu.addItem(&space_toggle_item);
 
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
         // Float window item
+        let float_window_key_equiv = toggle_floating_keybinding
+            .as_ref()
+            .map(|k| NSString::from_str(&k.key))
+            .unwrap_or_else(|| NSString::from_str(""));
         let float_window_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
                 ns_string!("Float Window"),
                 Some(sel!(handleAction:)),
-                ns_string!(""),
+                &float_window_key_equiv,
             )
         };
         unsafe { float_window_item.setTarget(Some(&*menu_handler)) };
         float_window_item.setTag(FLOAT_WINDOW_TAG as isize);
+        if let Some(ref kb) = toggle_floating_keybinding {
+            float_window_item.setKeyEquivalentModifierMask(kb.modifiers);
+        }
         menu.addItem(&float_window_item);
 
         // Clean up space item

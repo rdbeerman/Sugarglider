@@ -52,6 +52,17 @@ unsafe extern "C" {
 
     /// Hides drop zone overlays (defined in DropZoneOverlay.swift)
     fn sugarglider_hide_drop_zones();
+
+    /// Shows a transient size share badge (defined in SizeShareBadge.swift)
+    fn sugarglider_show_size_share_badge(
+        text: *const c_char,
+        kind: i32,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        screen_index: i32,
+    );
 }
 
 /// Initialize the Swift UI bridge.
@@ -265,6 +276,57 @@ pub fn hide_drop_zones() {
             tracing::debug!("Hiding drop zones");
             unsafe { sugarglider_hide_drop_zones() };
         }
+    }
+}
+
+/// How a size share badge should be styled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum SizeShareBadgeKind {
+    Applied = 0,
+    Released = 1,
+    Rejected = 2,
+}
+
+/// Shows a transient badge with the window's new size share.
+///
+/// `frame` is the window's frame in screen-local coordinates, used to place
+/// the badge near the window.
+pub fn show_size_share_badge(
+    text: &str,
+    kind: SizeShareBadgeKind,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    screen_index: i32,
+) {
+    #[cfg(feature = "swift-ui")]
+    {
+        if !is_available() {
+            return;
+        }
+        let Ok(text) = CString::new(text) else {
+            return;
+        };
+        tracing::debug!("Showing size share badge {text:?} at {x},{y} {width}x{height}");
+        unsafe {
+            sugarglider_show_size_share_badge(
+                text.as_ptr(),
+                kind as i32,
+                x,
+                y,
+                width,
+                height,
+                screen_index,
+            );
+        }
+    }
+
+    #[cfg(not(feature = "swift-ui"))]
+    {
+        let _ = (text, kind, x, y, width, height, screen_index);
+        tracing::trace!("Size share badge not available (compiled without swift-ui feature)");
     }
 }
 

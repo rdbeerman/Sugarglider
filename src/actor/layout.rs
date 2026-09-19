@@ -16,7 +16,9 @@ use tracing::{debug, error, warn};
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::collections::{BTreeExt, BTreeSet, HashMap, HashSet};
-use crate::config::{Config, NewWindowPlacement, ScrollConfig, WindowRule, WindowRuleConditions};
+use crate::config::{
+    Config, NewWindowPlacement, ScrollConfig, SizeShareOverflow, WindowRule, WindowRuleConditions,
+};
 use crate::model::scroll_viewport::ViewportState;
 use crate::model::{
     ContainerKind, Direction, LayoutId, LayoutKind, LayoutTree, NodeId, Orientation,
@@ -54,6 +56,53 @@ pub enum LayoutCommand {
     FocusNext,
     FocusPrev,
     CleanUpSpace,
+    /// Freeze the focused window's share of the tiled area.
+    SetSizeShare(SizeShare),
+    /// Toggle a size lock at the window's current share.
+    ToggleSizeLock,
+}
+
+/// A share of the tiled area requested by [`LayoutCommand::SetSizeShare`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(untagged)]
+pub enum SizeShare {
+    /// A fraction of the tiled area, e.g. `0.5` for half the screen.
+    Fraction(f64),
+    /// One nth of the tiled area, e.g. `{ denominator = 3 }` for a third.
+    Denominator { denominator: u32 },
+}
+
+impl SizeShare {
+    /// The fraction of the tiled area this share represents, if valid.
+    ///
+    /// Returns `None` for shares <= 0 or >= 1 (use fullscreen for 100%).
+    pub fn fraction(self) -> Option<f64> {
+        match self {
+            SizeShare::Fraction(share) if share > 0.0 && share < 1.0 => Some(share),
+            SizeShare::Denominator { denominator } if denominator >= 2 => {
+                Some(1.0 / f64::from(denominator))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What happened to a [`LayoutCommand::SetSizeShare`], for UI feedback.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SizeShareFeedback {
+    pub wid: WindowId,
+    pub share: f64,
+    pub outcome: SizeShareOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeShareOutcome {
+    /// The window's estate is now locked at `share`.
+    Applied,
+    /// The window's estate is no longer locked.
+    Released,
+    /// The lock was refused because it would cover more than the screen.
+    Rejected,
 }
 
 fn default_resize_percent() -> f64 {
@@ -122,12 +171,15 @@ pub struct EventResponse {
     /// Window to focus. This window will be raised after the windows in
     /// raise_windows and a WindowFocused event will be generated.
     pub focus_window: Option<WindowId>,
+    /// One-shot UI feedback for a size share command, if any.
+    pub size_share_feedback: Option<SizeShareFeedback>,
 }
 
 impl EventResponse {
     pub fn coalesce(mut self, other: Self) -> Self {
         self.frame_overrides.extend(other.frame_overrides);
         self.raise_windows.extend(other.raise_windows);
+        self.size_share_feedback = self.size_share_feedback.or(other.size_share_feedback);
         match (self.focus_window, other.focus_window) {
             (Some(focus_window), Some(other_focus)) => {
                 self.focus_window = Some(focus_window);
@@ -157,7 +209,7 @@ impl LayoutCommand {
 
             NextLayout | PrevLayout | MoveFocus(_) | Ascend | Descend | Split(_)
             | ToggleFocusFloating | ToggleWindowFloating | ToggleFullscreen | ChangeLayoutKind
-            | FocusNext | FocusPrev => false,
+            | FocusNext | FocusPrev | SetSizeShare(_) | ToggleSizeLock => false,
         }
     }
 }
@@ -714,6 +766,7 @@ impl LayoutManager {
                     frame_overrides: vec![],
                     raise_windows: self.top_layer_windows(space),
                     focus_window: None,
+                    ..Default::default()
                 };
             }
             LayoutEvent::WindowsOnScreenUpdated(space, pid, mut windows) => {
@@ -799,10 +852,12 @@ impl LayoutManager {
             }
             LayoutEvent::AppsRunningUpdated(hash_set) => {
                 self.tree.retain_apps(|pid| hash_set.contains(&pid));
+                self.tree.retain_size_locks(|wid| hash_set.contains(&wid.pid));
                 self.floating_restore_frames.retain(|wid, _| hash_set.contains(&wid.pid));
             }
             LayoutEvent::AppClosed(pid) => {
                 self.tree.remove_windows_for_app(pid);
+                self.tree.retain_size_locks(|wid| wid.pid != pid);
                 self.floating_windows.remove_all_for_pid(pid);
                 self.floating_restore_frames.retain(|wid, _| wid.pid != pid);
             }
@@ -826,6 +881,7 @@ impl LayoutManager {
             }
             LayoutEvent::WindowRemoved(wid) => {
                 self.tree.remove_window(wid);
+                self.tree.clear_size_lock(wid);
                 self.floating_windows.remove(&wid);
                 self.floating_restore_frames.remove(&wid);
             }
@@ -962,6 +1018,7 @@ impl LayoutManager {
                         frame_overrides: vec![],
                         raise_windows: vec![],
                         focus_window: Some(new_wid),
+                        ..Default::default()
                     };
                 }
             }
@@ -1046,6 +1103,7 @@ impl LayoutManager {
                     frame_overrides: vec![],
                     raise_windows,
                     focus_window,
+                    ..Default::default()
                 };
             } else {
                 let mut raise_windows: Vec<_> = self
@@ -1060,6 +1118,7 @@ impl LayoutManager {
                     frame_overrides: vec![],
                     raise_windows,
                     focus_window,
+                    ..Default::default()
                 };
             }
         }
@@ -1144,6 +1203,7 @@ impl LayoutManager {
                     frame_overrides: vec![],
                     focus_window,
                     raise_windows,
+                    ..Default::default()
                 }
             }
             LayoutCommand::FocusNext => {
@@ -1156,6 +1216,7 @@ impl LayoutManager {
                     frame_overrides: vec![],
                     focus_window,
                     raise_windows,
+                    ..Default::default()
                 }
             }
             LayoutCommand::FocusPrev => {
@@ -1168,6 +1229,7 @@ impl LayoutManager {
                     frame_overrides: vec![],
                     focus_window,
                     raise_windows,
+                    ..Default::default()
                 }
             }
             LayoutCommand::Ascend => {
@@ -1234,6 +1296,7 @@ impl LayoutManager {
                         frame_overrides: vec![],
                         raise_windows: node_windows,
                         focus_window: None,
+                        ..Default::default()
                     }
                 } else {
                     EventResponse::default()
@@ -1242,6 +1305,9 @@ impl LayoutManager {
             LayoutCommand::Resize { direction, percent } => {
                 let percent = percent.clamp(-100.0, 100.0);
                 let node = self.tree.selection(layout);
+                // A manual resize is a deliberate override, so it releases a
+                // size share lock on the resized estate.
+                self.tree.clear_estate_size_lock(node);
                 self.tree.resize(node, percent / 100.0, direction);
                 EventResponse::default()
             }
@@ -1303,9 +1369,135 @@ impl LayoutManager {
             }
             LayoutCommand::CleanUpSpace => {
                 self.tree.reset_weights(layout);
+                self.tree.clear_size_locks();
                 EventResponse::default()
             }
+            LayoutCommand::SetSizeShare(share) => {
+                let Some(share) = share.fraction() else {
+                    warn!("Ignoring invalid size share {share:?}");
+                    return EventResponse::default();
+                };
+                let Some(wid) = self.focused_window else {
+                    return EventResponse::default();
+                };
+                let Some(node) = self.tree.window_node(layout, wid) else {
+                    return EventResponse::default();
+                };
+                let overflow = self.config.settings.size_share.overflow;
+                Self::set_size_share(&mut self.tree, layout, wid, node, share, overflow)
+                    .map(|feedback| EventResponse {
+                        size_share_feedback: Some(feedback),
+                        ..Default::default()
+                    })
+                    .unwrap_or_default()
+            }
+            LayoutCommand::ToggleSizeLock => {
+                let Some(wid) = self.focused_window else {
+                    return EventResponse::default();
+                };
+                let Some(node) = self.tree.window_node(layout, wid) else {
+                    return EventResponse::default();
+                };
+                Self::toggle_size_lock(&mut self.tree, layout, wid, node)
+                    .map(|feedback| EventResponse {
+                        size_share_feedback: Some(feedback),
+                        ..Default::default()
+                    })
+                    .unwrap_or_default()
+            }
         }
+    }
+
+    /// Toggles a size lock at the window's current share.
+    fn toggle_size_lock(
+        tree: &mut LayoutTree,
+        layout: LayoutId,
+        wid: WindowId,
+        node: NodeId,
+    ) -> Option<SizeShareFeedback> {
+        // If already locked, release the lock.
+        if let Some(current) = tree.estate_size_lock(node) {
+            tree.clear_estate_size_lock(node);
+            return Some(SizeShareFeedback {
+                wid,
+                share: current,
+                outcome: SizeShareOutcome::Released,
+            });
+        }
+
+        // Calculate the current share of the estate.
+        let share = tree.estate_share(layout, node)?;
+
+        // Don't lock if share would be invalid (>= 1.0 or <= 0.0).
+        if share <= 0.0 || share >= 1.0 {
+            return None;
+        }
+
+        // A fullscreen window can't show its locked share.
+        tree.clear_fullscreen_for(node);
+        tree.set_size_lock(wid, share);
+        Some(SizeShareFeedback {
+            wid,
+            share,
+            outcome: SizeShareOutcome::Applied,
+        })
+    }
+
+    /// Applies, releases, or refuses a size share for the estate containing
+    /// `node`, returning what happened.
+    fn set_size_share(
+        tree: &mut LayoutTree,
+        layout: LayoutId,
+        wid: WindowId,
+        node: NodeId,
+        share: f64,
+        overflow: SizeShareOverflow,
+    ) -> Option<SizeShareFeedback> {
+        let current = tree.estate_size_lock(node);
+        if let Some(current) = current
+            && (current - share).abs() < 1e-6
+        {
+            tree.clear_estate_size_lock(node);
+            return Some(SizeShareFeedback {
+                wid,
+                share: current,
+                outcome: SizeShareOutcome::Released,
+            });
+        }
+
+        let locked_elsewhere = tree.locked_share_total(layout) - current.unwrap_or(0.0);
+        if locked_elsewhere + share > 1.0 + 1e-9 && overflow == SizeShareOverflow::Reject {
+            return Some(SizeShareFeedback {
+                wid,
+                share,
+                outcome: SizeShareOutcome::Rejected,
+            });
+        }
+
+        // A new share replaces any lock in the same estate, such as a lock on
+        // another window in the same group.
+        tree.clear_estate_size_lock(node);
+        // A fullscreen window can't show its locked share.
+        tree.clear_fullscreen_for(node);
+        tree.set_size_lock(wid, share);
+        Some(SizeShareFeedback {
+            wid,
+            share,
+            outcome: SizeShareOutcome::Applied,
+        })
+    }
+
+    /// Releases any size share lock on `wid`'s estate, returning whether one
+    /// was released.
+    ///
+    /// Used when the user resizes a locked window by hand. The lock value is
+    /// baked into the stored weights so the window maintains its current size.
+    pub fn release_size_share(&mut self, wid: WindowId) -> bool {
+        let mut released = false;
+        for node in self.tree.nodes_for_window(wid) {
+            released |= self.tree.clear_estate_size_lock_and_bake(node);
+        }
+        released
     }
 }
 
@@ -1639,6 +1831,7 @@ impl LayoutManager {
             frame_overrides: vec![],
             focus_window,
             raise_windows,
+            ..Default::default()
         }
     }
 
@@ -3559,6 +3752,80 @@ mod tests {
     }
 
     #[test]
+    fn a_keyboard_resize_releases_a_size_share_lock() {
+        let (mut mgr, space, screen) = setup_size_share_test(2);
+        _ = set_size_share(&mut mgr, space, SizeShare::Fraction(0.5));
+        assert_eq!(
+            vec![
+                (WindowId::new(1, 1), rect(0, 0, 600, 1200)),
+                (WindowId::new(1, 2), rect(600, 0, 600, 1200)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+
+        // The focused window is locked; resizing it unfreezes it.
+        _ = mgr.handle_command(
+            Some(space),
+            &[space],
+            LayoutCommand::Resize {
+                direction: Direction::Right,
+                percent: 10.0,
+            },
+        );
+        assert!(mgr.tree.size_lock(WindowId::new(1, 1)).is_none());
+        assert_eq!(
+            vec![
+                (WindowId::new(1, 1), rect(0, 0, 720, 1200)),
+                (WindowId::new(1, 2), rect(720, 0, 480, 1200)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+    }
+
+    #[test]
+    fn a_keyboard_resize_leaves_a_neighboring_size_lock_alone() {
+        let (mut mgr, space, screen) = setup_size_share_test(2);
+        _ = set_size_share(&mut mgr, space, SizeShare::Fraction(0.5));
+        _ = mgr.handle_event(LayoutEvent::WindowFocused(vec![space], WindowId::new(1, 2)));
+
+        // Window 2 resizes away from window 1, whose share stays locked.
+        _ = mgr.handle_command(
+            Some(space),
+            &[space],
+            LayoutCommand::Resize {
+                direction: Direction::Right,
+                percent: 10.0,
+            },
+        );
+        assert_eq!(mgr.tree.size_lock(WindowId::new(1, 1)), Some(0.5));
+        assert_eq!(
+            vec![
+                (WindowId::new(1, 1), rect(0, 0, 600, 1200)),
+                (WindowId::new(1, 2), rect(600, 0, 600, 1200)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+
+        // Resizing toward the locked window does nothing: that boundary is
+        // frozen.
+        _ = mgr.handle_command(
+            Some(space),
+            &[space],
+            LayoutCommand::Resize {
+                direction: Direction::Left,
+                percent: 10.0,
+            },
+        );
+        assert_eq!(
+            vec![
+                (WindowId::new(1, 1), rect(0, 0, 600, 1200)),
+                (WindowId::new(1, 2), rect(600, 0, 600, 1200)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+    }
+
+    #[test]
     fn it_flips_the_container_with_toggle_orientation() {
         use LayoutCommand::*;
         use LayoutEvent::*;
@@ -3756,11 +4023,13 @@ mod tests {
             frame_overrides: vec![],
             raise_windows: vec![WindowId::new(1, 1)],
             focus_window: Some(WindowId::new(1, 2)),
+            ..Default::default()
         }
         .coalesce(EventResponse {
             frame_overrides: vec![],
             raise_windows: vec![WindowId::new(1, 3)],
             focus_window: Some(WindowId::new(1, 4)),
+            ..Default::default()
         });
 
         assert_eq!(
@@ -3932,5 +4201,189 @@ mod tests {
 
         let action = DropZoneRegion::Center.to_action(node, Orientation::Vertical);
         assert!(matches!(action, DropAction::Swap { .. }));
+    }
+
+    /// Sets up a manager on one space with `num` windows and returns it.
+    fn setup_size_share_test(num: u32) -> (LayoutManager, SpaceId, CGRect) {
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let pid = 1;
+        let screen = rect(0, 0, 1200, 1200);
+        _ = mgr.handle_event(LayoutEvent::SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(LayoutEvent::WindowsOnScreenUpdated(
+            space,
+            pid,
+            make_windows(pid, num),
+        ));
+        _ = mgr.handle_event(LayoutEvent::WindowFocused(vec![space], WindowId::new(pid, 1)));
+        (mgr, space, screen)
+    }
+
+    fn set_size_share(
+        mgr: &mut LayoutManager,
+        space: SpaceId,
+        share: SizeShare,
+    ) -> Option<SizeShareFeedback> {
+        mgr.handle_command(Some(space), &[space], LayoutCommand::SetSizeShare(share))
+            .size_share_feedback
+    }
+
+    #[test]
+    fn it_locks_and_releases_a_size_share() {
+        use SizeShareOutcome::*;
+        let (mut mgr, space, screen) = setup_size_share_test(3);
+        let before = mgr.layout_sorted(space, screen);
+
+        let feedback = set_size_share(&mut mgr, space, SizeShare::Fraction(0.5));
+        assert_eq!(
+            feedback,
+            Some(SizeShareFeedback {
+                wid: WindowId::new(1, 1),
+                share: 0.5,
+                outcome: Applied,
+            })
+        );
+        assert_eq!(
+            vec![
+                (WindowId::new(1, 1), rect(0, 0, 600, 1200)),
+                (WindowId::new(1, 2), rect(600, 0, 300, 1200)),
+                (WindowId::new(1, 3), rect(900, 0, 300, 1200)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+
+        // The same share again releases the lock and restores the layout.
+        let feedback = set_size_share(&mut mgr, space, SizeShare::Fraction(0.5));
+        assert_eq!(feedback.map(|f| f.outcome), Some(Released));
+        assert_eq!(before, mgr.layout_sorted(space, screen));
+    }
+
+    #[test]
+    fn it_locks_a_denominator_size_share() {
+        let (mut mgr, space, screen) = setup_size_share_test(3);
+        let feedback = set_size_share(&mut mgr, space, SizeShare::Denominator { denominator: 3 });
+        assert_eq!(feedback.map(|f| f.share), Some(1.0 / 3.0));
+        assert_eq!(
+            vec![
+                (WindowId::new(1, 1), rect(0, 0, 400, 1200)),
+                (WindowId::new(1, 2), rect(400, 0, 400, 1200)),
+                (WindowId::new(1, 3), rect(800, 0, 400, 1200)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+    }
+
+    #[test]
+    fn it_rejects_size_shares_that_do_not_fit() {
+        use SizeShareOutcome::*;
+        let (mut mgr, space, screen) = setup_size_share_test(3);
+        assert_eq!(
+            set_size_share(&mut mgr, space, SizeShare::Fraction(0.5)).map(|f| f.outcome),
+            Some(Applied)
+        );
+        _ = mgr.handle_event(LayoutEvent::WindowFocused(vec![space], WindowId::new(1, 2)));
+        assert_eq!(
+            set_size_share(&mut mgr, space, SizeShare::Fraction(0.5)).map(|f| f.outcome),
+            Some(Applied)
+        );
+        let locked = mgr.layout_sorted(space, screen);
+
+        _ = mgr.handle_event(LayoutEvent::WindowFocused(vec![space], WindowId::new(1, 3)));
+        assert_eq!(
+            set_size_share(&mut mgr, space, SizeShare::Fraction(0.25)).map(|f| f.outcome),
+            Some(Rejected)
+        );
+        assert_eq!(locked, mgr.layout_sorted(space, screen));
+    }
+
+    #[test]
+    fn it_squeezes_size_shares_when_overflow_is_allowed() {
+        let mut config = Config::default();
+        config.settings.size_share.overflow = SizeShareOverflow::Squeeze;
+        let mut mgr = LayoutManager::new(Arc::new(config));
+        let space = SpaceId::new(1);
+        let pid = 1;
+        let screen = rect(0, 0, 1200, 1200);
+        _ = mgr.handle_event(LayoutEvent::SpaceExposed(space, screen.size));
+        _ = mgr.handle_event(LayoutEvent::WindowsOnScreenUpdated(
+            space,
+            pid,
+            make_windows(pid, 3),
+        ));
+        _ = mgr.handle_event(LayoutEvent::WindowFocused(vec![space], WindowId::new(pid, 1)));
+
+        assert_eq!(
+            set_size_share(&mut mgr, space, SizeShare::Fraction(0.5)).map(|f| f.outcome),
+            Some(SizeShareOutcome::Applied)
+        );
+        _ = mgr.handle_event(LayoutEvent::WindowFocused(vec![space], WindowId::new(1, 2)));
+        assert_eq!(
+            set_size_share(&mut mgr, space, SizeShare::Fraction(0.5)).map(|f| f.outcome),
+            Some(SizeShareOutcome::Applied)
+        );
+        _ = mgr.handle_event(LayoutEvent::WindowFocused(vec![space], WindowId::new(1, 3)));
+        assert_eq!(
+            set_size_share(&mut mgr, space, SizeShare::Fraction(0.25)).map(|f| f.outcome),
+            Some(SizeShareOutcome::Applied)
+        );
+
+        // Locks sum to 1.25, so they scale down together to make it fit.
+        assert_eq!(
+            vec![
+                (WindowId::new(1, 1), rect(0, 0, 480, 1200)),
+                (WindowId::new(1, 2), rect(480, 0, 480, 1200)),
+                (WindowId::new(1, 3), rect(960, 0, 240, 1200)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+    }
+
+    #[test]
+    fn it_clears_size_shares_on_clean_up_space() {
+        let (mut mgr, space, screen) = setup_size_share_test(3);
+        let before = mgr.layout_sorted(space, screen);
+
+        _ = set_size_share(&mut mgr, space, SizeShare::Fraction(0.5));
+        assert!(mgr.tree.size_lock(WindowId::new(1, 1)).is_some());
+        _ = mgr.handle_command(Some(space), &[space], LayoutCommand::CleanUpSpace);
+        assert!(mgr.tree.size_lock(WindowId::new(1, 1)).is_none());
+        assert_eq!(before, mgr.layout_sorted(space, screen));
+    }
+
+    #[test]
+    fn it_clears_size_shares_when_a_window_closes() {
+        let (mut mgr, space, screen) = setup_size_share_test(2);
+        _ = set_size_share(&mut mgr, space, SizeShare::Fraction(0.5));
+        assert!(mgr.tree.size_lock(WindowId::new(1, 1)).is_some());
+
+        _ = mgr.handle_event(LayoutEvent::WindowRemoved(WindowId::new(1, 1)));
+        assert!(mgr.tree.size_lock(WindowId::new(1, 1)).is_none());
+        assert_eq!(
+            vec![(WindowId::new(1, 2), rect(0, 0, 1200, 1200))],
+            mgr.layout_sorted(space, screen),
+        );
+    }
+
+    #[test]
+    fn it_releases_size_shares_on_user_resize() {
+        let (mut mgr, space, _screen) = setup_size_share_test(2);
+        _ = set_size_share(&mut mgr, space, SizeShare::Fraction(0.5));
+        assert!(mgr.tree.size_lock(WindowId::new(1, 1)).is_some());
+
+        assert!(mgr.release_size_share(WindowId::new(1, 1)));
+        assert!(mgr.tree.size_lock(WindowId::new(1, 1)).is_none());
+        assert!(!mgr.release_size_share(WindowId::new(1, 1)));
+    }
+
+    #[test]
+    fn invalid_size_shares_are_ignored() {
+        let (mut mgr, space, _screen) = setup_size_share_test(2);
+        assert_eq!(set_size_share(&mut mgr, space, SizeShare::Fraction(0.0)), None);
+        assert_eq!(set_size_share(&mut mgr, space, SizeShare::Fraction(1.0)), None);
+        assert_eq!(set_size_share(&mut mgr, space, SizeShare::Fraction(1.5)), None);
+        assert_eq!(
+            set_size_share(&mut mgr, space, SizeShare::Denominator { denominator: 0 }),
+            None
+        );
     }
 }

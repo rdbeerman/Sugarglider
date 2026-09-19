@@ -100,6 +100,8 @@ pub struct Settings {
     pub default_layout_kind: LayoutKind,
     #[derive_args(GroupBarsPartial)]
     pub group_bars: GroupBars,
+    #[derive_args(SizeShareConfigPartial)]
+    pub size_share: SizeShareConfig,
     #[derive_args(StatusIconPartial)]
     pub status_icon: StatusIcon,
     #[derive_args(DragDropConfigPartial)]
@@ -349,6 +351,25 @@ pub struct GroupBars {
     pub thickness: f64,
     pub horizontal_placement: HorizontalPlacement,
     pub vertical_placement: VerticalPlacement,
+}
+
+/// How to handle size share locks that would cover more than the screen.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SizeShareOverflow {
+    /// Refuse the new lock, keeping every existing lock exact.
+    #[default]
+    Reject,
+    /// Accept the new lock and scale all locks down until they fit.
+    Squeeze,
+}
+
+#[derive(PartialConfig!)]
+#[derive_args(SizeShareConfigPartial)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SizeShareConfig {
+    pub overflow: SizeShareOverflow,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
@@ -787,6 +808,61 @@ mod tests {
     #[test]
     fn default_settings_match_unspecified_setting_values() {
         assert_eq!(Config::default().settings, Config::parse("").unwrap().settings);
+    }
+
+    #[test]
+    fn size_share_bindings_parse() {
+        let config = Config::default();
+        let shares = config
+            .keys
+            .iter()
+            .filter_map(|(hk, cmd)| match cmd {
+                WmCommand::ReactorCommand(ReactorCommand::Layout(LayoutCommand::SetSizeShare(
+                    share,
+                ))) => Some((hk.to_string(), *share)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shares.len(),
+            3,
+            "expected three default size share bindings: {shares:?}"
+        );
+        assert!(
+            shares
+                .iter()
+                .any(|(hk, share)| hk == "Ctrl + Shift + Digit2" && share.fraction() == Some(0.5)),
+            "Ctrl+Shift+2 should take half the screen: {shares:?}"
+        );
+        assert!(
+            shares
+                .iter()
+                .any(|(hk, share)| hk == "Ctrl + Shift + Digit3"
+                    && share.fraction() == Some(1.0 / 3.0)),
+            "Ctrl+Shift+3 should take a third of the screen: {shares:?}"
+        );
+        assert!(
+            shares
+                .iter()
+                .any(|(hk, share)| hk == "Ctrl + Shift + Digit4" && share.fraction() == Some(0.25)),
+            "Ctrl+Shift+4 should take a quarter of the screen: {shares:?}"
+        );
+    }
+
+    #[test]
+    fn size_share_overflow_defaults_to_reject() {
+        assert_eq!(
+            Config::default().settings.size_share.overflow,
+            SizeShareOverflow::Reject
+        );
+        assert_eq!(
+            Config::parse("settings.size_share.overflow = \"squeeze\"")
+                .unwrap()
+                .settings
+                .size_share
+                .overflow,
+            SizeShareOverflow::Squeeze
+        );
     }
 
     #[test]

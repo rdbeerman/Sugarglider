@@ -47,6 +47,15 @@ drag_drop.drag_threshold = 10.0
 drag_drop.edge_zone_ratio = 0.15
 drag_drop.split_dwell_ms = 300
 
+# Size share locks freeze a window's share of the tiled area (see the
+# set_size_share key bindings below).
+#
+# overflow = "reject"  refuses a new lock that would cover more than the
+#                      screen, keeping every existing lock exact.
+# overflow = "squeeze" accepts the new lock and scales all locks down
+#                      proportionally until they fit.
+size_share.overflow = "reject"
+
 # Whether to include Glide's default key bindings.
 #
 # Note: Default keys are always included if there is no keys section of the
@@ -152,6 +161,21 @@ default_keys = false
 
 # Toggle whether the focused node takes up the whole screen.
 "Alt + F" = "toggle_fullscreen"
+
+# Freeze the focused window's share of the tiled area. The locked window
+# keeps its share while the other windows divide the rest of the screen.
+# Pressing the same binding again releases the lock.
+#
+# Ctrl + Shift + 2 takes half, 3 takes a third, and 4 takes a quarter. A lock
+# is refused by default when it would leave the other windows less than a
+# usable share of the screen; set settings.size_share.overflow = "squeeze" to
+# scale locks down and fit instead.
+"Ctrl + Shift + 2" = { set_size_share = 0.5 }
+"Ctrl + Shift + 3" = { set_size_share = { denominator = 3 } }
+"Ctrl + Shift + 4" = { set_size_share = 0.25 }
+
+# Lock the focused window at its current share. Press again to release.
+"Ctrl + Shift + L" = "toggle_size_lock"
 
 # Set glide on/off.
 # "<key>" = { "set_global_enabled" = { "enabled" = <bool> } }

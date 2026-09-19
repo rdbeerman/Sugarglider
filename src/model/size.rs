@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use core::fmt::Debug;
+use std::collections::HashMap;
 use std::mem;
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -17,6 +18,13 @@ use crate::sys::geometry::{CGRectExt, Round};
 #[derive(Default, Serialize, Deserialize)]
 pub struct Size {
     info: slotmap::SecondaryMap<NodeId, LayoutInfo>,
+    /// Size share locks by window, as a fraction of the tiled area.
+    ///
+    /// A lock freezes the share of the screen its window's estate holds,
+    /// regardless of the weights around it. Kept out of the serialized layout
+    /// so locks only last for the session.
+    #[serde(skip)]
+    locks: HashMap<WindowId, f64>,
 }
 
 #[allow(unused)]
@@ -163,6 +171,38 @@ struct LayoutInfo {
     is_fullscreen: bool,
 }
 
+/// The share of the tiled area an unlocked window is guaranteed when size
+/// share locks would otherwise squeeze it out.
+const MIN_UNLOCKED_SHARE: f64 = 0.1;
+
+/// The target share of the tiled area for every node under a layout root,
+/// derived from size share locks and the layout's weights.
+pub(super) struct Masses {
+    mass: HashMap<NodeId, f64>,
+    locked: HashMap<NodeId, f64>,
+}
+
+impl Masses {
+    /// The share of the tiled area the node's subtree holds.
+    pub(super) fn total(&self, node: NodeId) -> f64 {
+        self.mass.get(&node).copied().unwrap_or(0.0)
+    }
+
+    /// The part of [`Self::total`] that comes from locked estates.
+    pub(super) fn locked(&self, node: NodeId) -> f64 {
+        self.locked.get(&node).copied().unwrap_or(0.0)
+    }
+}
+
+/// A subtree that owns a rectangle of the layout: a window, or a group whose
+/// windows share one rectangle.
+struct EstateUnit {
+    node: NodeId,
+    /// The share of the tiled area the unit would hold without locks.
+    share: f64,
+    lock: Option<f64>,
+}
+
 impl Size {
     pub(super) fn handle_event(&mut self, map: &NodeMap, event: TreeEvent) {
         match event {
@@ -237,12 +277,147 @@ impl Size {
         }
     }
 
+    /// Swaps the weights of two nodes, so their sizes follow them when they
+    /// swap positions in the tree.
+    pub(super) fn swap_weights(&mut self, node_a: NodeId, node_b: NodeId) {
+        let weight_a = self.info[node_a].size;
+        let weight_b = self.info[node_b].size;
+        self.info[node_a].size = weight_b;
+        self.info[node_b].size = weight_a;
+        // Parent totals don't change since we're just swapping.
+    }
+
     pub(super) fn set_fullscreen(&mut self, node: NodeId, is_fullscreen: bool) {
         self.info[node].is_fullscreen = is_fullscreen;
     }
 
     pub(super) fn is_fullscreen(&mut self, node: NodeId) -> bool {
         self.info[node].is_fullscreen
+    }
+
+    pub(super) fn set_lock(&mut self, wid: WindowId, share: f64) {
+        self.locks.insert(wid, share);
+    }
+
+    pub(super) fn clear_lock(&mut self, wid: WindowId) -> bool {
+        self.locks.remove(&wid).is_some()
+    }
+
+    pub(super) fn clear_locks(&mut self) {
+        self.locks.clear();
+    }
+
+    pub(super) fn retain_locks(&mut self, mut filter: impl FnMut(WindowId) -> bool) {
+        self.locks.retain(|&wid, _| filter(wid));
+    }
+
+    pub(super) fn lock(&self, wid: WindowId) -> Option<f64> {
+        self.locks.get(&wid).copied()
+    }
+
+    /// Computes the target share of the tiled area for every node under
+    /// `root`, based on locked windows and the layout's weights.
+    ///
+    /// Returns `None` when no lock applies, in which case the stored weights
+    /// are used as they are.
+    pub(super) fn masses(
+        &self,
+        map: &NodeMap,
+        window: &super::window::Window,
+        root: NodeId,
+    ) -> Option<Masses> {
+        if self.locks.is_empty() {
+            return None;
+        }
+        let mut units = Vec::new();
+        self.estate_units(map, window, root, 1.0, &mut units);
+        let locked_count = units.iter().filter(|unit| unit.lock.is_some()).count();
+        if locked_count == 0 {
+            return None;
+        }
+
+        let unlocked_count = units.len() - locked_count;
+        let locked_total: f64 = units.iter().filter_map(|unit| unit.lock).sum();
+        // Locked windows keep their share of the screen, except when doing so
+        // would leave unlocked windows with less than a usable share of it.
+        // The shortfall comes out of the locks, proportionally.
+        let min_unlocked_share = MIN_UNLOCKED_SHARE.min(1.0 / units.len() as f64);
+        let min_unlocked_total = min_unlocked_share * unlocked_count as f64;
+        let free = (1.0 - locked_total).max(0.0);
+        let unlocked_total = if unlocked_count == 0 {
+            0.0
+        } else {
+            free.max(min_unlocked_total).min(1.0)
+        };
+        let locked_scale = if locked_total > 0.0 {
+            ((1.0 - unlocked_total) / locked_total).min(1.0)
+        } else {
+            1.0
+        };
+
+        let share_unlocked: f64 =
+            units.iter().filter(|unit| unit.lock.is_none()).map(|unit| unit.share).sum();
+        let mut masses = Masses {
+            mass: HashMap::new(),
+            locked: HashMap::new(),
+        };
+        for unit in &units {
+            let (mass, locked) = match unit.lock {
+                Some(share) => {
+                    let mass = share * locked_scale;
+                    (mass, mass)
+                }
+                None => {
+                    let mass = if share_unlocked > 0.0 {
+                        unlocked_total * unit.share / share_unlocked
+                    } else {
+                        0.0
+                    };
+                    (mass, 0.0)
+                }
+            };
+            masses.mass.insert(unit.node, mass);
+            masses.locked.insert(unit.node, locked);
+        }
+        fill_container_masses(map, root, &mut masses);
+        Some(masses)
+    }
+
+    /// Collects the leaves and groups under `node`, which are the largest
+    /// subtrees that own a rectangle of the layout.
+    fn estate_units(
+        &self,
+        map: &NodeMap,
+        window: &super::window::Window,
+        node: NodeId,
+        share: f64,
+        units: &mut Vec<EstateUnit>,
+    ) {
+        if let Some(wid) = window.at(node) {
+            units.push(EstateUnit {
+                node,
+                share,
+                lock: self.locks.get(&wid).copied(),
+            });
+            return;
+        }
+        if self.info[node].kind.is_group() {
+            // A group shows one rectangle for all its windows, so a lock on
+            // any window in it applies to the group as a whole.
+            let lock = node
+                .traverse_preorder(map)
+                .filter(|&n| n != node)
+                .filter_map(|n| window.at(n))
+                .filter_map(|wid| self.locks.get(&wid).copied())
+                .reduce(f64::max);
+            units.push(EstateUnit { node, share, lock });
+            return;
+        }
+        for child in node.children(map) {
+            let child_share =
+                self.proportion(map, child).filter(|share| share.is_finite()).unwrap_or(0.0);
+            self.estate_units(map, window, child, share * child_share, units);
+        }
     }
 
     pub(super) fn debug(&self, node: NodeId, is_container: bool) -> String {
@@ -273,6 +448,7 @@ impl Size {
         is_scroll: bool,
     ) -> Vec<(WindowId, CGRect)> {
         let mut sizes = vec![];
+        let masses = (!is_scroll).then(|| self.masses(map, window, root)).flatten();
         Visitor {
             map,
             size: self,
@@ -282,6 +458,7 @@ impl Size {
             config,
             screen,
             is_scroll,
+            masses: masses.as_ref(),
             sizes: &mut sizes,
             groups: None,
             target: None,
@@ -306,6 +483,7 @@ impl Size {
         node: NodeId,
     ) -> Option<CGRect> {
         let mut sizes = vec![];
+        let masses = (!is_scroll).then(|| self.masses(map, window, root)).flatten();
         Visitor {
             map,
             size: self,
@@ -315,6 +493,7 @@ impl Size {
             config,
             screen,
             is_scroll,
+            masses: masses.as_ref(),
             sizes: &mut sizes,
             groups: None,
             target: Some(node),
@@ -422,6 +601,7 @@ impl Size {
             .traverse_postorder(map)
             .filter(|&node| self.info.get(node).map(|i| i.is_fullscreen).unwrap_or(false))
             .collect::<Vec<_>>();
+        let masses = (!is_scroll).then(|| self.masses(map, window, root)).flatten();
         Visitor {
             map,
             size: self,
@@ -431,6 +611,7 @@ impl Size {
             config,
             screen,
             is_scroll,
+            masses: masses.as_ref(),
             sizes: &mut sizes,
             groups: Some(&mut groups),
             target: None,
@@ -439,6 +620,23 @@ impl Size {
         .visit(root, screen);
         (sizes, groups)
     }
+}
+
+/// Fills in the mass of every container under `node`, summing the masses of
+/// the estate units below it.
+fn fill_container_masses(map: &NodeMap, node: NodeId, masses: &mut Masses) {
+    if masses.mass.contains_key(&node) {
+        return;
+    }
+    let mut mass = 0.0;
+    let mut locked = 0.0;
+    for child in node.children(map) {
+        fill_container_masses(map, child, masses);
+        mass += masses.total(child);
+        locked += masses.locked(child);
+    }
+    masses.mass.insert(node, mass);
+    masses.locked.insert(node, locked);
 }
 
 struct Visitor<'a, 'out> {
@@ -450,6 +648,8 @@ struct Visitor<'a, 'out> {
     config: &'a Config,
     screen: CGRect,
     is_scroll: bool,
+    /// Target shares from size share locks. `None` when no lock applies.
+    masses: Option<&'a Masses>,
     sizes: &'out mut Vec<(WindowId, CGRect)>,
     groups: Option<&'out mut Vec<GroupBarInfo>>,
     /// If set, the rect assigned to this node is recorded in `target_rect`.
@@ -458,11 +658,34 @@ struct Visitor<'a, 'out> {
 }
 
 impl<'a, 'out> Visitor<'a, 'out> {
+    /// The weight that decides `child`'s size within its parent.
+    fn weight(&self, child: NodeId) -> f64 {
+        match self.masses {
+            Some(masses) => masses.total(child),
+            None => f64::from(self.size.info[child].size),
+        }
+    }
+
     fn visit(mut self, root: NodeId, rect: CGRect) -> Option<CGRect> {
         // Usually this should be false, except in the uncommon case where root
         // is fullscreen.
         let parent_visible = self.fullscreen_nodes.contains(&root);
         let rect = rect.inset(self.config.settings.outer_gap);
+        // Locked windows can leave part of the tiled area unused. The leftover
+        // stays empty instead of stretching the other windows into it, which
+        // would defeat the lock.
+        let rect = match self.masses {
+            Some(masses) if masses.total(root) < 1.0 => {
+                let mut rect = rect;
+                let free = masses.total(root);
+                match self.size.kind(root).orientation() {
+                    Orientation::Horizontal => rect.size.width *= free,
+                    Orientation::Vertical => rect.size.height *= free,
+                }
+                rect
+            }
+            _ => rect,
+        };
         self.visit_node(root, rect, true, parent_visible, true);
         self.target_rect
     }
@@ -563,7 +786,7 @@ impl<'a, 'out> Visitor<'a, 'out> {
                 let inputs: Vec<super::scroll_constraints::WindowInput> = children
                     .iter()
                     .map(|&child| super::scroll_constraints::WindowInput {
-                        weight: f64::from(self.size.info[child].size),
+                        weight: self.weight(child),
                         min_size: if self.is_scroll {
                             super::scroll_constraints::MIN_WINDOW_SIZE
                         } else {
@@ -619,7 +842,7 @@ impl<'a, 'out> Visitor<'a, 'out> {
                 let inputs: Vec<super::scroll_constraints::WindowInput> = children
                     .iter()
                     .map(|&child| super::scroll_constraints::WindowInput {
-                        weight: f64::from(self.size.info[child].size),
+                        weight: self.weight(child),
                         min_size: if self.is_scroll {
                             super::scroll_constraints::MIN_WINDOW_SIZE
                         } else {

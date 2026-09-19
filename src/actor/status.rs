@@ -86,11 +86,13 @@ impl Status {
         if self.config.settings.status_icon.enable {
             self.icon = icon.or_else(|| {
                 let clean_up_kb = Self::find_clean_up_keybinding(&self.config);
+                let toggle_floating_kb = Self::find_toggle_floating_keybinding(&self.config);
                 Some(StatusIcon::new(
                     &self.config.settings.experimental.status_icon,
                     self.mtm,
                     self.wm_tx.clone(),
                     clean_up_kb,
+                    toggle_floating_kb,
                 ))
             });
         }
@@ -103,6 +105,21 @@ impl Status {
             if matches!(
                 cmd,
                 WmCommand::ReactorCommand(ReactorCommand::Layout(LayoutCommand::CleanUpSpace))
+            ) {
+                return MenuKeyEquivalent::from_hotkey(hotkey);
+            }
+        }
+        None
+    }
+
+    /// Find the keybinding for ToggleWindowFloating command in the config.
+    fn find_toggle_floating_keybinding(config: &Config) -> Option<MenuKeyEquivalent> {
+        for (hotkey, cmd) in &config.keys {
+            if matches!(
+                cmd,
+                WmCommand::ReactorCommand(ReactorCommand::Layout(
+                    LayoutCommand::ToggleWindowFloating
+                ))
             ) {
                 return MenuKeyEquivalent::from_hotkey(hotkey);
             }

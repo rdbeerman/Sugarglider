@@ -777,6 +777,12 @@ impl Reactor {
                     });
                 }
                 if old_frame.size != new_frame.size {
+                    if mouse_state == Some(MouseState::Down) {
+                        // A user-driven resize is a deliberate override, so it
+                        // releases a size share lock on the window.
+                        self.resizing_window = Some(wid);
+                        self.layout.release_size_share(wid);
+                    }
                     let screens = self
                         .screens
                         .iter()
@@ -789,9 +795,6 @@ impl Reactor {
                         new_frame,
                         screens,
                     });
-                    if mouse_state == Some(MouseState::Down) {
-                        self.resizing_window = Some(wid);
-                    }
                     is_resize = true;
                 } else if mouse_state == Some(MouseState::Down) {
                     self.in_drag = true;
@@ -1420,6 +1423,7 @@ impl Reactor {
             frame_overrides,
             raise_windows,
             focus_window,
+            ..
         } = response;
         self.pending_frame_overrides.extend(frame_overrides);
         if raise_windows.is_empty() && focus_window.is_none() {
@@ -1709,7 +1713,7 @@ pub mod tests {
     use super::testing::*;
     use super::*;
     use crate::actor::app::Request;
-    use crate::actor::layout::LayoutManager;
+    use crate::actor::layout::{LayoutManager, SizeShare};
     use crate::model::Direction;
     use crate::sys::window_server::WindowServerId;
 
@@ -2474,6 +2478,7 @@ pub mod tests {
                 frame_overrides: vec![],
                 raise_windows: vec![w2],
                 focus_window: Some(w1),
+                ..Default::default()
             },
             &[WindowServerId::new(1), WindowServerId::new(2)],
         );
@@ -2493,6 +2498,7 @@ pub mod tests {
                 frame_overrides: vec![],
                 raise_windows: vec![w2],
                 focus_window: Some(w1),
+                ..Default::default()
             },
             &[WindowServerId::new(2), WindowServerId::new(1)],
         );
@@ -2956,6 +2962,7 @@ pub mod tests {
                 WindowId::new(2, 2),
             ],
             focus_window: None,
+            ..Default::default()
         });
         let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
         match msg {
@@ -2995,6 +3002,7 @@ pub mod tests {
             frame_overrides: vec![],
             raise_windows: vec![WindowId::new(1, 1)],
             focus_window: Some(WindowId::new(2, 1)),
+            ..Default::default()
         });
         let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
         match msg {
@@ -3373,6 +3381,75 @@ pub mod tests {
         assert!(
             !reactor.layout.has_active_scroll_animation(),
             "timer should be dormant when no scroll animation is active"
+        );
+    }
+
+    #[test]
+    fn it_locks_and_releases_size_shares_end_to_end() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1200., 1200.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(
+            1,
+            make_windows(3),
+            Some(WindowId::new(1, 1)),
+            true,
+        ));
+        reactor.handle_event(Event::StartupComplete);
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        apps.simulate_until_quiet(&mut reactor);
+
+        let before = reactor.layout.calculate_layout(space, screen, &reactor.config);
+        assert_eq!(before.len(), 3);
+
+        let lock = || {
+            Event::Command(Command::Layout(LayoutCommand::SetSizeShare(
+                SizeShare::Fraction(0.5),
+            )))
+        };
+        reactor.handle_event(lock());
+        assert_eq!(
+            vec![
+                (
+                    WindowId::new(1, 1),
+                    CGRect::new(CGPoint::new(0., 0.), CGSize::new(600., 1200.)),
+                ),
+                (
+                    WindowId::new(1, 2),
+                    CGRect::new(CGPoint::new(600., 0.), CGSize::new(300., 1200.)),
+                ),
+                (
+                    WindowId::new(1, 3),
+                    CGRect::new(CGPoint::new(900., 0.), CGSize::new(300., 1200.)),
+                ),
+            ],
+            reactor.layout.calculate_layout(space, screen, &reactor.config),
+        );
+        // The app threads must have been asked for the same frames.
+        let requests = apps.requests();
+        for (wid, frame) in reactor.layout.calculate_layout(space, screen, &reactor.config) {
+            assert!(
+                requests.iter().any(|request| {
+                    matches!(request, Request::SetWindowFrame(request_wid, request_frame, _)
+                        if *request_wid == wid && *request_frame == frame)
+                }),
+                "expected a frame request for {wid:?} at {frame:?}, got {requests:?}"
+            );
+        }
+
+        // The same binding releases the lock.
+        reactor.handle_event(lock());
+        assert_eq!(
+            before,
+            reactor.layout.calculate_layout(space, screen, &reactor.config)
         );
     }
 

@@ -1,6 +1,7 @@
 // Copyright The Glide Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::collections::HashSet;
 use std::{iter, mem};
 
 use objc2_core_foundation::{CGRect, CGSize};
@@ -8,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::selection::Selection;
-use super::size::{ContainerKind, Direction, Size};
+use super::size::{ContainerKind, Direction, Masses, Size};
 use super::tree::{self, Tree};
 use super::window::Window;
 use crate::actor::app::{WindowId, pid_t};
@@ -437,6 +438,204 @@ impl LayoutTree {
         fullscreen
     }
 
+    pub fn set_size_lock(&mut self, wid: WindowId, share: f64) {
+        self.tree.data.size.set_lock(wid, share);
+    }
+
+    pub fn clear_size_lock(&mut self, wid: WindowId) -> bool {
+        self.tree.data.size.clear_lock(wid)
+    }
+
+    pub fn clear_size_locks(&mut self) {
+        self.tree.data.size.clear_locks();
+    }
+
+    pub fn retain_size_locks(&mut self, filter: impl FnMut(WindowId) -> bool) {
+        self.tree.data.size.retain_locks(filter);
+    }
+
+    pub fn size_lock(&self, wid: WindowId) -> Option<f64> {
+        self.tree.data.size.lock(wid)
+    }
+
+    /// Every node mapped to `wid`, across all layouts.
+    pub fn nodes_for_window(&self, wid: WindowId) -> Vec<NodeId> {
+        self.tree.data.window.nodes_for(wid).collect()
+    }
+
+    /// The node whose rectangle holds the estate for `node`.
+    ///
+    /// This is `node` itself unless it is inside a group, in which case it is
+    /// the outermost group: groups show one rectangle for all their windows.
+    pub fn estate_node(&self, node: NodeId) -> NodeId {
+        let map = self.map();
+        let mut estate = node;
+        for ancestor in node.ancestors(map) {
+            if self.tree.data.size.kind(ancestor).is_group() {
+                estate = ancestor;
+            }
+        }
+        estate
+    }
+
+    /// The size share lock that applies to the estate containing `node`.
+    pub fn estate_size_lock(&self, node: NodeId) -> Option<f64> {
+        let estate = self.estate_node(node);
+        if let Some(wid) = self.window_at(estate) {
+            return self.size_lock(wid);
+        }
+        estate
+            .traverse_preorder(self.map())
+            .filter_map(|n| self.window_at(n))
+            .filter_map(|wid| self.size_lock(wid))
+            .reduce(f64::max)
+    }
+
+    /// Removes any size share lock that applies to the estate containing
+    /// `node`, returning whether one was removed.
+    pub fn clear_estate_size_lock(&mut self, node: NodeId) -> bool {
+        self.clear_estate_size_lock_impl(node, false)
+    }
+
+    /// Removes any size share lock, optionally baking the lock value into
+    /// the stored weights so the estate maintains its current visual share.
+    ///
+    /// Use `bake = true` when the user is manually resizing, so the window
+    /// doesn't jump back to its pre-lock size.
+    pub fn clear_estate_size_lock_and_bake(&mut self, node: NodeId) -> bool {
+        self.clear_estate_size_lock_impl(node, true)
+    }
+
+    fn clear_estate_size_lock_impl(&mut self, node: NodeId, bake: bool) -> bool {
+        let estate = self.estate_node(node);
+
+        // Get the lock value before clearing, so we can bake it into the weights.
+        if bake {
+            if let Some(lock_share) = self.estate_size_lock(node) {
+                self.bake_estate_share(estate, lock_share);
+            }
+        }
+
+        let wids = estate
+            .traverse_preorder(self.map())
+            .filter_map(|n| self.window_at(n))
+            .collect::<Vec<_>>();
+        let mut cleared = false;
+        for wid in wids {
+            cleared |= self.tree.data.size.clear_lock(wid);
+        }
+        cleared
+    }
+
+    /// Adjusts the stored weights so that `estate` has proportion `share` of
+    /// its parent, redistributing weight from/to siblings proportionally.
+    fn bake_estate_share(&mut self, estate: NodeId, share: f64) {
+        let map = self.map();
+        let Some(parent) = estate.parent(map) else {
+            return;
+        };
+
+        let parent_total = self.tree.data.size.total(parent);
+        if parent_total <= 0.0 {
+            return;
+        }
+
+        let current_weight = f64::from(self.tree.data.size.weight(estate));
+        let target_weight = share * parent_total;
+        let delta = target_weight - current_weight;
+
+        if delta.abs() < 1e-6 {
+            return;
+        }
+
+        // Collect siblings and their weights (excluding the estate itself)
+        let siblings: Vec<(NodeId, f64)> = parent
+            .children(map)
+            .filter(|&child| child != estate)
+            .map(|child| (child, f64::from(self.tree.data.size.weight(child))))
+            .collect();
+
+        if siblings.is_empty() {
+            // No siblings to redistribute from, just set the weight directly
+            self.tree.data.size.set_weight(estate, target_weight as f32, &self.tree.map);
+            return;
+        }
+
+        // Calculate total sibling weight for proportional redistribution
+        let sibling_total: f64 = siblings.iter().map(|(_, w)| w).sum();
+
+        if sibling_total <= 0.0 {
+            return;
+        }
+
+        // Redistribute delta proportionally among siblings
+        for (sibling, sibling_weight) in &siblings {
+            let sibling_proportion = sibling_weight / sibling_total;
+            let new_weight = (sibling_weight - delta * sibling_proportion).max(0.1);
+            self.tree.data.size.set_weight(*sibling, new_weight as f32, &self.tree.map);
+        }
+
+        // Set the estate's new weight
+        self.tree.data.size.set_weight(estate, target_weight as f32, &self.tree.map);
+    }
+
+    /// Removes the fullscreen flag from `node` and its ancestors, if set.
+    pub fn clear_fullscreen_for(&mut self, node: NodeId) {
+        let nodes = node.ancestors(self.map()).collect::<Vec<_>>();
+        for node in nodes {
+            if self.tree.data.size.is_fullscreen(node) {
+                self.tree.data.size.set_fullscreen(node, false);
+            }
+        }
+    }
+
+    /// Whether the estate containing `node` has a size share lock.
+    pub fn estate_is_locked(&self, node: NodeId) -> bool {
+        self.estate_size_lock(node).is_some()
+    }
+
+    /// The current share of the estate containing `node` within its parent,
+    /// as a fraction from 0 to 1.
+    pub fn estate_share(&self, _layout: LayoutId, node: NodeId) -> Option<f64> {
+        let estate = self.estate_node(node);
+        let parent = estate.parent(self.map())?;
+
+        let parent_total = self.tree.data.size.total(parent);
+        if parent_total <= 0.0 {
+            return None;
+        }
+
+        let estate_weight = f64::from(self.tree.data.size.weight(estate));
+        Some(estate_weight / parent_total)
+    }
+
+    /// The sum of the size share locks in `layout`, counting each estate once.
+    pub fn locked_share_total(&self, layout: LayoutId) -> f64 {
+        let root = self.root(layout);
+        let mut estates = HashSet::new();
+        let mut total = 0.0;
+        for node in root.traverse_preorder(self.map()) {
+            if self.window_at(node).is_none() {
+                continue;
+            }
+            let estate = self.estate_node(node);
+            if estates.insert(estate)
+                && let Some(share) = self.estate_size_lock(estate)
+            {
+                total += share;
+            }
+        }
+        total
+    }
+
+    /// The target shares for `root`, when size share locks apply to it.
+    fn layout_masses(&self, root: NodeId) -> Option<Masses> {
+        if self.is_scroll_root(root) {
+            return None;
+        }
+        self.tree.data.size.masses(&self.tree.map, &self.tree.data.window, root)
+    }
+
     pub fn calculate_layout(
         &self,
         layout: LayoutId,
@@ -789,17 +988,24 @@ impl LayoutTree {
 
     pub fn swap_windows(&mut self, node_a: NodeId, node_b: NodeId) {
         self.tree.data.window.swap_windows(node_a, node_b);
+        // Swap weights so window sizes follow the windows, not the tree positions.
+        self.tree.data.size.swap_weights(node_a, node_b);
     }
 
     /// Picks the ancestor of `node` (possibly `node` itself) to resize, along
     /// with the sibling it exchanges space with.
+    ///
+    /// A size locked estate can't give up any space, so its boundaries are
+    /// inert: there is no sibling to exchange with.
     fn resize_target(&self, node: NodeId, direction: Direction) -> Option<(NodeId, NodeId)> {
         let can_resize = |&node: &NodeId| -> bool {
             let Some(parent) = node.parent(&self.tree.map) else {
                 return false;
             };
-            !self.tree.data.size.kind(parent).is_group()
-                && self.move_over(node, direction).is_some()
+            let Some(sibling) = self.move_over(node, direction) else {
+                return false;
+            };
+            !self.tree.data.size.kind(parent).is_group() && !self.estate_is_locked(sibling)
         };
         let resizing_node = node.ancestors(&self.tree.map).filter(can_resize).next()?;
         let sibling = self.move_over(resizing_node, direction).unwrap();
@@ -857,7 +1063,27 @@ impl LayoutTree {
         if px_per_weight <= 0.0 {
             return false;
         }
-        self.apply_resize(resizing_node, sibling, parent, delta / px_per_weight);
+        let mut delta_weight = delta / px_per_weight;
+        // `pixels_per_weight` is pixels per unit of *stored* weight, while
+        // `solve_sizes` sees masses. When locks apply, a weight change is worth
+        // more or fewer pixels depending on how much of the parent is locked
+        // and on which unlocked children absorb the exchange. Scale the delta
+        // so the window tracks the pointer. The sibling is never a locked
+        // estate, since `resize_target` treats those boundaries as inert.
+        if let Some(masses) = self.layout_masses(parent.ancestors(&self.tree.map).last().unwrap()) {
+            let total = masses.total(parent);
+            let unlocked_mass = total - masses.locked(parent);
+            let stored_total = self.tree.data.size.total(parent);
+            let pool_weight: f64 = parent
+                .children(&self.tree.map)
+                .filter(|&child| masses.total(child) > masses.locked(child))
+                .map(|child| f64::from(self.tree.data.size.weight(child)))
+                .sum();
+            if unlocked_mass > 0.0 && pool_weight > 0.0 && stored_total > 0.0 {
+                delta_weight *= total * pool_weight / (unlocked_mass * stored_total);
+            }
+        }
+        self.apply_resize(resizing_node, sibling, parent, delta_weight);
         true
     }
 
@@ -1839,6 +2065,59 @@ mod tests {
     }
 
     #[test]
+    fn set_frame_from_resize_tracks_the_user_with_size_locks() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let _a = tree.add_window_under(layout, root, w(1, 1));
+        let _b = tree.add_window_under(layout, root, w(1, 2));
+        let _c = tree.add_window_under(layout, root, w(1, 3));
+        let screen = rect(0, 0, 1200, 1200);
+        let config = Config::default();
+        let node = tree.window_node(layout, w(1, 2)).unwrap();
+
+        // A is locked at half the screen while B's trailing edge is dragged
+        // into C.
+        tree.set_size_lock(w(1, 1), 0.5);
+
+        let frame_of = |tree: &LayoutTree, wid| {
+            tree.calculate_layout(layout, screen, &config)
+                .into_iter()
+                .find(|&(w, _)| w == wid)
+                .unwrap()
+                .1
+        };
+
+        let mut cur = frame_of(&tree, w(1, 2));
+        for _ in 0..5 {
+            let new = CGRect::new(
+                CGPoint::new(cur.origin.x, cur.origin.y),
+                CGSize::new(cur.size.width + 20., cur.size.height),
+            );
+            tree.set_frame_from_resize(node, cur, new, screen, &config);
+            assert_eq!(
+                frame_of(&tree, w(1, 2)),
+                new,
+                "layout disagrees with the user's frame while another window is locked"
+            );
+            cur = new;
+        }
+
+        // B's leading edge is frozen, so dragging it does nothing.
+        let frozen = frame_of(&tree, w(1, 2));
+        let dragged = CGRect::new(
+            CGPoint::new(frozen.origin.x + 40., frozen.origin.y),
+            CGSize::new(frozen.size.width - 40., frozen.size.height),
+        );
+        tree.set_frame_from_resize(node, frozen, dragged, screen, &config);
+        assert_eq!(
+            frame_of(&tree, w(1, 2)),
+            frozen,
+            "a size locked boundary should not move"
+        );
+    }
+
+    #[test]
     fn visible_windows_under_simple() {
         let mut tree = LayoutTree::new();
         let layout = tree.create_layout();
@@ -2096,5 +2375,160 @@ mod tests {
         assert!(!tree.is_visible(tab1));
         assert!(!tree.is_visible(tab2));
         assert!(tree.is_visible(outer_tab));
+    }
+
+    #[test]
+    fn size_lock_freezes_a_share_of_the_screen() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        tree.add_window_under(layout, root, w(1, 1));
+        tree.add_window_under(layout, root, w(1, 2));
+        tree.add_window_under(layout, root, w(1, 3));
+
+        let screen = rect(0, 0, 1000, 1000);
+        tree.set_size_lock(w(1, 1), 0.5);
+        assert_frames_are(
+            [
+                (w(1, 1), rect(0, 0, 500, 1000)),
+                (w(1, 2), rect(500, 0, 250, 1000)),
+                (w(1, 3), rect(750, 0, 250, 1000)),
+            ],
+            tree.calculate_layout(layout, screen, &Config::default()),
+        );
+    }
+
+    #[test]
+    fn size_lock_freezes_a_nested_window() {
+        // [A | [B / C]], with B locked at half the screen.
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        tree.add_window_under(layout, root, w(1, 1));
+        let column = tree.add_container(root, ContainerKind::Vertical);
+        tree.add_window_under(layout, column, w(1, 2));
+        tree.add_window_under(layout, column, w(1, 3));
+
+        tree.set_size_lock(w(1, 2), 0.5);
+        assert_frames_are(
+            [
+                (w(1, 1), rect(0, 0, 333, 1000)),
+                (w(1, 2), rect(333, 0, 667, 750)),
+                (w(1, 3), rect(333, 750, 667, 250)),
+            ],
+            tree.calculate_layout(layout, rect(0, 0, 1000, 1000), &Config::default()),
+        );
+    }
+
+    #[test]
+    fn size_locked_share_survives_new_windows() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        tree.add_window_under(layout, root, w(1, 1));
+        tree.add_window_under(layout, root, w(1, 2));
+        tree.set_size_lock(w(1, 1), 0.5);
+
+        tree.add_window_under(layout, root, w(1, 3));
+        assert_frames_are(
+            [
+                (w(1, 1), rect(0, 0, 500, 1000)),
+                (w(1, 2), rect(500, 0, 250, 1000)),
+                (w(1, 3), rect(750, 0, 250, 1000)),
+            ],
+            tree.calculate_layout(layout, rect(0, 0, 1000, 1000), &Config::default()),
+        );
+    }
+
+    #[test]
+    fn size_locks_squeeze_to_make_room_for_new_windows() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        tree.add_window_under(layout, root, w(1, 1));
+        tree.add_window_under(layout, root, w(1, 2));
+        tree.set_size_lock(w(1, 1), 0.5);
+        tree.set_size_lock(w(1, 2), 0.5);
+
+        // The locks cover the whole screen, so they scale down together to
+        // leave the new window a usable share.
+        tree.add_window_under(layout, root, w(1, 3));
+        assert_frames_are(
+            [
+                (w(1, 1), rect(0, 0, 450, 1000)),
+                (w(1, 2), rect(450, 0, 450, 1000)),
+                (w(1, 3), rect(900, 0, 100, 1000)),
+            ],
+            tree.calculate_layout(layout, rect(0, 0, 1000, 1000), &Config::default()),
+        );
+    }
+
+    #[test]
+    fn size_lock_on_a_group_applies_to_the_group_rect() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        tree.add_window_under(layout, root, w(1, 1));
+        let group = tree.add_container(root, ContainerKind::Tabbed);
+        tree.add_window_under(layout, group, w(1, 2));
+        tree.add_window_under(layout, group, w(1, 3));
+
+        tree.set_size_lock(w(1, 2), 0.5);
+        assert_frames_are(
+            [
+                (w(1, 1), rect(0, 0, 500, 1000)),
+                (w(1, 2), rect(500, 6, 500, 994)),
+                (w(1, 3), rect(500, 6, 500, 994)),
+            ],
+            tree.calculate_layout(layout, rect(0, 0, 1000, 1000), &Config::default()),
+        );
+    }
+
+    #[test]
+    fn a_lone_locked_window_leaves_the_rest_of_the_screen_empty() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        tree.add_window_under(layout, root, w(1, 1));
+
+        tree.set_size_lock(w(1, 1), 0.5);
+        assert_frames_are(
+            [(w(1, 1), rect(0, 0, 500, 1000))],
+            tree.calculate_layout(layout, rect(0, 0, 1000, 1000), &Config::default()),
+        );
+    }
+
+    #[test]
+    fn clearing_a_size_lock_restores_the_weights() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        tree.add_window_under(layout, root, w(1, 1));
+        tree.add_window_under(layout, root, w(1, 2));
+        let original = tree.calculate_layout(layout, rect(0, 0, 1000, 1000), &Config::default());
+
+        tree.set_size_lock(w(1, 1), 0.5);
+        assert!(tree.clear_size_lock(w(1, 1)));
+        assert!(!tree.clear_size_lock(w(1, 1)));
+        assert_frames_are(
+            original,
+            tree.calculate_layout(layout, rect(0, 0, 1000, 1000), &Config::default()),
+        );
+    }
+
+    #[test]
+    fn size_locks_do_not_apply_to_scroll_layouts() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_scroll_layout();
+        let _root = tree.root(layout);
+        tree.add_window_to_scroll_column(layout, w(1, 1), true);
+        tree.add_window_to_scroll_column(layout, w(1, 2), true);
+        let original = tree.calculate_layout(layout, rect(0, 0, 1000, 1000), &Config::default());
+
+        tree.set_size_lock(w(1, 1), 0.5);
+        assert_frames_are(
+            original,
+            tree.calculate_layout(layout, rect(0, 0, 1000, 1000), &Config::default()),
+        );
     }
 }
