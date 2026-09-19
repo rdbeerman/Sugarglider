@@ -41,7 +41,6 @@ status_icon.enable = true
 
 # Drag-to-rearrange windows settings.
 drag_drop.enable = true
-drag_drop.window_drag = false
 drag_drop.live_preview = true
 drag_drop.drag_threshold = 10.0
 drag_drop.edge_zone_ratio = 0.15

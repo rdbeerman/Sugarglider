@@ -52,7 +52,6 @@ public class PreferencesViewModel: ObservableObject {
 
     // Dragging behavior
     @Published public var dragDropEnable: Bool = true
-    @Published public var dragDropWindowDrag: Bool = true
     @Published public var dragDropLivePreview: Bool = true
 
     // Layout
@@ -143,7 +142,6 @@ public class PreferencesViewModel: ObservableObject {
         outerGap = config.outerGap
         innerGap = config.innerGap
         dragDropEnable = config.dragDropEnable
-        dragDropWindowDrag = config.dragDropWindowDrag
         dragDropLivePreview = config.dragDropLivePreview
 
         // Map layout kind: "scroll" -> .column, "tree" -> .tree
@@ -180,7 +178,6 @@ public class PreferencesViewModel: ObservableObject {
             $outerGap.map { _ in () }.eraseToAnyPublisher(),
             $innerGap.map { _ in () }.eraseToAnyPublisher(),
             $dragDropEnable.map { _ in () }.eraseToAnyPublisher(),
-            $dragDropWindowDrag.map { _ in () }.eraseToAnyPublisher(),
             $dragDropLivePreview.map { _ in () }.eraseToAnyPublisher(),
             $defaultLayout.map { _ in () }.eraseToAnyPublisher(),
             $appRules.map { _ in () }.eraseToAnyPublisher(),
@@ -222,7 +219,6 @@ public class PreferencesViewModel: ObservableObject {
             outerGap: outerGap,
             innerGap: innerGap,
             dragDropEnable: dragDropEnable,
-            dragDropWindowDrag: dragDropWindowDrag,
             dragDropLivePreview: dragDropLivePreview,
             // Map layout mode: .column -> "scroll", .tree -> "tree"
             defaultLayoutKind: defaultLayout == .column ? "scroll" : "tree",
