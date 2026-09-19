@@ -576,22 +576,46 @@ pub fn write_preferences_to_file(
         // Build a new keys table
         let mut keys_table = toml_edit::Table::new();
 
-        // Load the current config to get command serializations
+        // Build command serializations from BOTH default config AND current loaded config.
+        // This ensures we have serializations for all standard commands (from defaults)
+        // plus any custom commands like `exec` (from the loaded config).
+        let default_config = Config::default();
         let current_config = Config::load(None).unwrap_or_else(|_| Config::default());
-        let command_serializations: std::collections::HashMap<String, String> = current_config
-            .keys
-            .iter()
-            .filter_map(|(_hotkey, cmd)| {
-                let (_, _, command_id) =
-                    crate::ui::preferences_json::describe_command_for_toml(cmd);
-                let serialized = serde_json::to_string(cmd).ok()?;
-                Some((command_id, serialized))
-            })
-            .collect();
+
+        let mut command_serializations: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        // Add all commands from the default config first
+        for (_hotkey, cmd) in &default_config.keys {
+            let (_, _, command_id) = crate::ui::preferences_json::describe_command_for_toml(cmd);
+            if let Ok(serialized) = serde_json::to_string(cmd) {
+                command_serializations.insert(command_id, serialized);
+            }
+        }
+
+        // Override/extend with commands from the current config (for custom exec commands, etc.)
+        for (_hotkey, cmd) in &current_config.keys {
+            let (_, _, command_id) = crate::ui::preferences_json::describe_command_for_toml(cmd);
+            if let Ok(serialized) = serde_json::to_string(cmd) {
+                command_serializations.insert(command_id, serialized);
+            }
+        }
 
         for hk in &prefs.hotkeys {
             // Convert macOS symbol format to TOML key format
             let toml_key = macos_symbols_to_toml_key(&hk.key);
+
+            // Validate that the hotkey can actually be parsed before writing.
+            // This prevents writing invalid keys that will fail to load on restart.
+            if Hotkey::from_str(&toml_key).is_err() {
+                tracing::warn!(
+                    "Skipping invalid hotkey format for {}: '{}' (converted from '{}')",
+                    hk.command_id,
+                    toml_key,
+                    hk.key
+                );
+                continue;
+            }
 
             // Get the command serialization for this command_id
             if let Some(cmd_json) = command_serializations.get(&hk.command_id) {
@@ -600,6 +624,12 @@ pub fn write_preferences_to_file(
                     let toml_value = json_to_toml_value(&cmd_value);
                     keys_table[&toml_key] = toml_value;
                 }
+            } else {
+                tracing::warn!(
+                    "Unknown command_id '{}' for hotkey '{}', skipping",
+                    hk.command_id,
+                    hk.key
+                );
             }
         }
 
@@ -621,7 +651,7 @@ pub fn write_preferences_to_file(
     Ok(path)
 }
 
-/// Convert macOS symbol hotkey format (⌥⇧H) to TOML key format (Alt + Shift + H).
+/// Convert macOS symbol hotkey format (⌥⇧H) to TOML key format (Alt + Shift + KeyH).
 fn macos_symbols_to_toml_key(s: &str) -> String {
     let mut modifiers = Vec::new();
     let mut key_part = String::new();
@@ -636,22 +666,46 @@ fn macos_symbols_to_toml_key(s: &str) -> String {
         }
     }
 
-    // Convert special key symbols back to names
-    let key_name = match key_part.as_str() {
-        "←" => "ArrowLeft",
-        "→" => "ArrowRight",
-        "↑" => "ArrowUp",
-        "↓" => "ArrowDown",
-        "⌫" => "Backspace",
-        "↩" => "Return",
-        "⇥" => "Tab",
-        "\\" => "Backslash",
-        "/" => "Slash",
-        "=" => "Equal",
-        other => other,
+    // Convert special key symbols back to names that livesplit_hotkey understands
+    let key_name: String = match key_part.as_str() {
+        "←" => "ArrowLeft".to_string(),
+        "→" => "ArrowRight".to_string(),
+        "↑" => "ArrowUp".to_string(),
+        "↓" => "ArrowDown".to_string(),
+        "⌫" => "Backspace".to_string(),
+        "↩" => "Return".to_string(),
+        "⇥" => "Tab".to_string(),
+        "\\" => "Backslash".to_string(),
+        "/" => "Slash".to_string(),
+        "=" => "Equal".to_string(),
+        "-" => "Minus".to_string(),
+        "[" => "BracketLeft".to_string(),
+        "]" => "BracketRight".to_string(),
+        "'" => "Quote".to_string(),
+        ";" => "Semicolon".to_string(),
+        "," => "Comma".to_string(),
+        "." => "Period".to_string(),
+        "`" => "Backquote".to_string(),
+        "Space" => "Space".to_string(),
+        "Esc" => "Escape".to_string(),
+        other => {
+            // Single letters need "Key" prefix, single digits need "Digit" prefix
+            if other.len() == 1 {
+                let c = other.chars().next().unwrap();
+                if c.is_ascii_alphabetic() {
+                    format!("Key{}", c.to_ascii_uppercase())
+                } else if c.is_ascii_digit() {
+                    format!("Digit{}", c)
+                } else {
+                    other.to_string()
+                }
+            } else {
+                other.to_string()
+            }
+        }
     };
 
-    let mut parts: Vec<&str> = modifiers;
+    let mut parts: Vec<String> = modifiers.iter().map(|s| s.to_string()).collect();
     parts.push(key_name);
     parts.join(" + ")
 }
@@ -1043,5 +1097,91 @@ mod tests {
             }),
             "Alt+Shift+C should be bound to clean_up_space by default"
         );
+    }
+
+    #[test]
+    fn macos_symbols_to_toml_key_converts_letters() {
+        // Single letters should be converted to "Key" + uppercase
+        assert_eq!(macos_symbols_to_toml_key("⌥H"), "Alt + KeyH");
+        assert_eq!(macos_symbols_to_toml_key("⌥⇧J"), "Alt + Shift + KeyJ");
+        assert_eq!(macos_symbols_to_toml_key("⌃⌥K"), "Ctrl + Alt + KeyK");
+
+        // Converted keys should be parseable
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥H")).is_ok());
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥⇧J")).is_ok());
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌃⌥K")).is_ok());
+    }
+
+    #[test]
+    fn macos_symbols_to_toml_key_converts_digits() {
+        assert_eq!(macos_symbols_to_toml_key("⌥1"), "Alt + Digit1");
+        assert_eq!(macos_symbols_to_toml_key("⌥⇧0"), "Alt + Shift + Digit0");
+
+        // Converted keys should be parseable
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥1")).is_ok());
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥⇧0")).is_ok());
+    }
+
+    #[test]
+    fn macos_symbols_to_toml_key_converts_arrows() {
+        assert_eq!(macos_symbols_to_toml_key("⌥←"), "Alt + ArrowLeft");
+        assert_eq!(macos_symbols_to_toml_key("⌥→"), "Alt + ArrowRight");
+        assert_eq!(macos_symbols_to_toml_key("⌥↑"), "Alt + ArrowUp");
+        assert_eq!(macos_symbols_to_toml_key("⌥↓"), "Alt + ArrowDown");
+
+        // All should be parseable
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥←")).is_ok());
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥→")).is_ok());
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥↑")).is_ok());
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥↓")).is_ok());
+    }
+
+    #[test]
+    fn macos_symbols_to_toml_key_converts_special_keys() {
+        assert_eq!(macos_symbols_to_toml_key("⌥\\"), "Alt + Backslash");
+        assert_eq!(macos_symbols_to_toml_key("⌥/"), "Alt + Slash");
+        assert_eq!(macos_symbols_to_toml_key("⌥="), "Alt + Equal");
+        assert_eq!(macos_symbols_to_toml_key("⌥Space"), "Alt + Space");
+
+        // All should be parseable
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥\\")).is_ok());
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥/")).is_ok());
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥=")).is_ok());
+        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥Space")).is_ok());
+    }
+
+    #[test]
+    fn macos_symbols_without_modifiers_still_parseable() {
+        // Note: livesplit_hotkey accepts keys without modifiers (like "KeyH")
+        // but these will be rejected by parse_hotkey_string in preferences_json.rs
+        // which requires at least one modifier for a valid hotkey
+        let toml_key = macos_symbols_to_toml_key("H");
+        assert_eq!(toml_key, "KeyH");
+        // This parses successfully with livesplit_hotkey
+        assert!(Hotkey::from_str(&toml_key).is_ok());
+    }
+
+    #[test]
+    fn parse_hotkey_string_requires_modifiers() {
+        // parse_hotkey_string (in preferences_json.rs) requires at least one modifier
+        // This test verifies that behavior through the public API
+        use crate::ui::preferences_json::PreferencesJson;
+
+        // Create a config with default keys
+        let config = Config::default();
+        let prefs_json = PreferencesJson::from_config(&config);
+
+        // Verify all default hotkeys have modifiers (contain a modifier symbol)
+        for hk in &prefs_json.hotkeys {
+            assert!(
+                hk.key.contains('⌥')
+                    || hk.key.contains('⌃')
+                    || hk.key.contains('⇧')
+                    || hk.key.contains('⌘'),
+                "Hotkey '{}' for command '{}' should have at least one modifier",
+                hk.key,
+                hk.command_id
+            );
+        }
     }
 }

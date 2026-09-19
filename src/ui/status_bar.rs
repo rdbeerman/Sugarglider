@@ -10,7 +10,8 @@ use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSEventModifierFlags, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSVariableStatusItemLength,
 };
 use objc2_core_foundation::CGSize;
 use objc2_foundation::{NSData, NSObject, NSString, ns_string};
@@ -21,6 +22,64 @@ use crate::actor::reactor;
 use crate::actor::wm_controller::{self, WmCmd, WmCommand, WmEvent};
 use crate::config;
 use crate::ui::swift_bridge;
+
+/// Key equivalent info for a menu item (key character and modifier flags).
+#[derive(Debug, Clone)]
+pub struct MenuKeyEquivalent {
+    /// The key character (e.g., "c" for the C key).
+    pub key: String,
+    /// The modifier flags (Option, Shift, Control, Command).
+    pub modifiers: NSEventModifierFlags,
+}
+
+impl MenuKeyEquivalent {
+    /// Convert a livesplit_hotkey::Hotkey to menu key equivalent format.
+    pub fn from_hotkey(hotkey: &livesplit_hotkey::Hotkey) -> Option<Self> {
+        let s = hotkey.to_string();
+        let mut modifiers = NSEventModifierFlags::empty();
+
+        // Check for modifiers
+        if s.contains("Ctrl") {
+            modifiers |= NSEventModifierFlags::Control;
+        }
+        if s.contains("Alt") {
+            modifiers |= NSEventModifierFlags::Option;
+        }
+        if s.contains("Shift") {
+            modifiers |= NSEventModifierFlags::Shift;
+        }
+        if s.contains("Cmd") || s.contains("Super") {
+            modifiers |= NSEventModifierFlags::Command;
+        }
+
+        // Extract the key name (last part after " + ")
+        let key_part = s.rsplit(" + ").next()?;
+
+        // Convert key name to single character for NSMenuItem
+        let key = key_part
+            .strip_prefix("Key")
+            .or_else(|| key_part.strip_prefix("Digit"))
+            .map(|k| k.to_lowercase())
+            .or_else(|| match key_part {
+                "ArrowLeft" => Some("←".to_string()),
+                "ArrowRight" => Some("→".to_string()),
+                "ArrowUp" => Some("↑".to_string()),
+                "ArrowDown" => Some("↓".to_string()),
+                "Backslash" => Some("\\".to_string()),
+                "Slash" => Some("/".to_string()),
+                "Equal" => Some("=".to_string()),
+                "Minus" => Some("-".to_string()),
+                "Space" => Some(" ".to_string()),
+                "Return" | "Enter" => Some("\r".to_string()),
+                "Tab" => Some("\t".to_string()),
+                "Backspace" => Some("\u{8}".to_string()),
+                "Escape" => Some("\u{1b}".to_string()),
+                _ => None,
+            })?;
+
+        Some(Self { key, modifiers })
+    }
+}
 
 const SAVE_AND_QUIT_TAG: i64 = 1;
 const TOGGLE_GLOBAL_TAG: i64 = 2;
@@ -45,6 +104,7 @@ impl StatusIcon {
         config: &config::StatusIconExperimental,
         mtm: MainThreadMarker,
         wm_tx: wm_controller::Sender,
+        clean_up_keybinding: Option<MenuKeyEquivalent>,
     ) -> Self {
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
@@ -122,16 +182,24 @@ impl StatusIcon {
         menu.addItem(&float_window_item);
 
         // Clean up space item
+        let clean_up_key_equiv = clean_up_keybinding
+            .as_ref()
+            .map(|k| NSString::from_str(&k.key))
+            .unwrap_or_else(|| NSString::from_str(""));
         let clean_up_space_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
                 ns_string!("Clean Up Space"),
                 Some(sel!(handleAction:)),
-                ns_string!(""),
+                &clean_up_key_equiv,
             )
         };
         unsafe { clean_up_space_item.setTarget(Some(&*menu_handler)) };
         clean_up_space_item.setTag(CLEAN_UP_SPACE_TAG as isize);
+        // Set modifier mask if we have a keybinding
+        if let Some(ref kb) = clean_up_keybinding {
+            clean_up_space_item.setKeyEquivalentModifierMask(kb.modifiers);
+        }
         menu.addItem(&clean_up_space_item);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));

@@ -9,11 +9,13 @@ use std::time::Duration;
 use objc2::MainThreadMarker;
 use tracing::instrument;
 
-use crate::actor::wm_controller;
+use crate::actor::layout::LayoutCommand;
+use crate::actor::reactor::Command as ReactorCommand;
+use crate::actor::wm_controller::{self, WmCommand};
 use crate::config::Config;
 use crate::sys::screen::{SpaceId, get_active_space_number};
 use crate::sys::timer::Timer;
-use crate::ui::status_bar::StatusIcon;
+use crate::ui::status_bar::{MenuKeyEquivalent, StatusIcon};
 use crate::{actor, trace_call};
 
 /// Animation frame sequence: rest -> right -> rest -> left -> repeat
@@ -83,14 +85,29 @@ impl Status {
         let icon = self.icon.take();
         if self.config.settings.status_icon.enable {
             self.icon = icon.or_else(|| {
+                let clean_up_kb = Self::find_clean_up_keybinding(&self.config);
                 Some(StatusIcon::new(
                     &self.config.settings.experimental.status_icon,
                     self.mtm,
                     self.wm_tx.clone(),
+                    clean_up_kb,
                 ))
             });
         }
         self.update_space();
+    }
+
+    /// Find the keybinding for CleanUpSpace command in the config.
+    fn find_clean_up_keybinding(config: &Config) -> Option<MenuKeyEquivalent> {
+        for (hotkey, cmd) in &config.keys {
+            if matches!(
+                cmd,
+                WmCommand::ReactorCommand(ReactorCommand::Layout(LayoutCommand::CleanUpSpace))
+            ) {
+                return MenuKeyEquivalent::from_hotkey(hotkey);
+            }
+        }
+        None
     }
 
     pub async fn run(mut self) {

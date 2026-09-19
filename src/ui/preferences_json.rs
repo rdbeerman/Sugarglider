@@ -148,26 +148,48 @@ impl PreferencesJson {
 
     /// Build the keys vector from hotkeys JSON, using original commands from config.
     fn build_keys_from_hotkeys(&self, config: &Config) -> Vec<(Hotkey, WmCommand)> {
-        // Create a map from command_id to the original command
-        let command_map: std::collections::HashMap<String, &WmCommand> = config
-            .keys
-            .iter()
-            .map(|(_, cmd)| {
-                let (_, _, command_id) = describe_command(cmd);
-                (command_id, cmd)
-            })
-            .collect();
+        // Create a map from command_id to the original command.
+        // Include both the current config commands AND default config commands
+        // to ensure we have all standard commands available.
+        let mut command_map: std::collections::HashMap<String, WmCommand> =
+            std::collections::HashMap::new();
+
+        // Add default commands first
+        for (_, cmd) in &Config::default().keys {
+            let (_, _, command_id) = describe_command(cmd);
+            command_map.insert(command_id, cmd.clone());
+        }
+
+        // Override with current config commands (for custom exec commands, etc.)
+        for (_, cmd) in &config.keys {
+            let (_, _, command_id) = describe_command(cmd);
+            command_map.insert(command_id, cmd.clone());
+        }
 
         self.hotkeys
             .iter()
             .filter_map(|hk| {
                 // Get the original command for this command_id
-                let cmd = command_map.get(&hk.command_id)?;
+                let Some(cmd) = command_map.get(&hk.command_id) else {
+                    tracing::warn!(
+                        "Unknown command_id '{}' for hotkey '{}', dropping binding",
+                        hk.command_id,
+                        hk.key
+                    );
+                    return None;
+                };
 
                 // Parse the hotkey string back to a Hotkey
-                let hotkey = parse_hotkey_string(&hk.key)?;
+                let Some(hotkey) = parse_hotkey_string(&hk.key) else {
+                    tracing::warn!(
+                        "Invalid hotkey format '{}' for command '{}', dropping binding",
+                        hk.key,
+                        hk.command_id
+                    );
+                    return None;
+                };
 
-                Some((hotkey, (*cmd).clone()))
+                Some((hotkey, cmd.clone()))
             })
             .collect()
     }
