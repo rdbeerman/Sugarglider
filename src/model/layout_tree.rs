@@ -1,9 +1,10 @@
 // Copyright The Glide Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::{collections::HashSet, iter, mem};
+use std::collections::HashSet;
+use std::{iter, mem};
 
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CGRect, CGSize};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -375,6 +376,21 @@ impl LayoutTree {
         self.tree.data.window.at(node)
     }
 
+    /// The smallest size observed for the window, if any constraint is known.
+    pub fn window_min_size(&self, wid: WindowId) -> Option<CGSize> {
+        self.tree.data.window.min_size(wid)
+    }
+
+    /// Records a lower bound on the window's size, merging per axis.
+    pub fn note_window_min_size(&mut self, wid: WindowId, min_size: CGSize) {
+        self.tree.data.window.note_min_size(wid, min_size);
+    }
+
+    /// Lowers the recorded minimum for the window to at most `size` per axis.
+    pub fn relax_window_min_size(&mut self, wid: WindowId, size: CGSize) {
+        self.tree.data.window.relax_min_size(wid, size);
+    }
+
     #[allow(dead_code)]
     pub fn add_container(&mut self, parent: NodeId, kind: ContainerKind) -> NodeId {
         let node = self.tree.mk_node().push_back(parent);
@@ -541,10 +557,7 @@ impl LayoutTree {
 
         if siblings.is_empty() {
             // No siblings to redistribute from, just set the weight directly
-            self.tree
-                .data
-                .size
-                .set_weight(estate, target_weight as f32, &self.tree.map);
+            self.tree.data.size.set_weight(estate, target_weight as f32, &self.tree.map);
             return;
         }
 
@@ -559,17 +572,11 @@ impl LayoutTree {
         for (sibling, sibling_weight) in &siblings {
             let sibling_proportion = sibling_weight / sibling_total;
             let new_weight = (sibling_weight - delta * sibling_proportion).max(0.1);
-            self.tree
-                .data
-                .size
-                .set_weight(*sibling, new_weight as f32, &self.tree.map);
+            self.tree.data.size.set_weight(*sibling, new_weight as f32, &self.tree.map);
         }
 
         // Set the estate's new weight
-        self.tree
-            .data
-            .size
-            .set_weight(estate, target_weight as f32, &self.tree.map);
+        self.tree.data.size.set_weight(estate, target_weight as f32, &self.tree.map);
     }
 
     /// Removes the fullscreen flag from `node` and its ancestors, if set.
