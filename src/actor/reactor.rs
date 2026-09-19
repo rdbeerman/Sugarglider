@@ -251,6 +251,8 @@ pub struct Reactor {
     /// One-shot frame targets requested by layout transitions. They are merged
     /// into the next animation alongside the continuously calculated layout.
     pending_frame_overrides: HashMap<WindowId, CGRect>,
+    /// Size share command feedback to show once the layout has been updated.
+    pending_size_share: Option<layout::SizeShareFeedback>,
     windows: HashMap<WindowId, WindowState>,
     window_server_info: HashMap<WindowServerId, WindowServerInfo>,
     window_ids: HashMap<WindowServerId, WindowId>,
@@ -433,6 +435,7 @@ impl Reactor {
             apps: HashMap::default(),
             layout,
             pending_frame_overrides: HashMap::default(),
+            pending_size_share: None,
             windows: HashMap::default(),
             window_ids: HashMap::default(),
             window_server_info: HashMap::default(),
@@ -722,6 +725,12 @@ impl Reactor {
                     });
                 }
                 if old_frame.size != new_frame.size {
+                    if mouse_state == Some(MouseState::Down) {
+                        // A user-driven resize is a deliberate override, so it
+                        // releases a size share lock on the window.
+                        self.resizing_window = Some(wid);
+                        self.layout.release_size_share(wid);
+                    }
                     let screens = self
                         .screens
                         .iter()
@@ -734,9 +743,6 @@ impl Reactor {
                         new_frame,
                         screens,
                     });
-                    if mouse_state == Some(MouseState::Down) {
-                        self.resizing_window = Some(wid);
-                    }
                     is_resize = true;
                 } else if mouse_state == Some(MouseState::Down) {
                     self.in_drag = true;
@@ -1152,6 +1158,63 @@ impl Reactor {
         if !self.in_drag {
             self.update_layout(&animation_focus_wids, is_resize);
         }
+        self.show_size_share_feedback();
+    }
+
+    /// Shows the badge for the last size share command, if any.
+    fn show_size_share_feedback(&mut self) {
+        let Some(feedback) = self.pending_size_share.take() else {
+            return;
+        };
+        // Prefer the frame the layout just assigned, since the window itself
+        // may still be animating toward it.
+        let mut target: Option<(usize, CGRect)> = None;
+        for (index, screen) in self.screens.iter().enumerate() {
+            let Some(space) = screen.space else { continue };
+            let frames = self.layout.calculate_layout(space, screen.frame, &self.config);
+            if let Some((_, frame)) = frames.iter().find(|(wid, _)| *wid == feedback.wid) {
+                target = Some((index, *frame));
+                break;
+            }
+        }
+        if target.is_none()
+            && let Some(window) = self.windows.get(&feedback.wid)
+        {
+            let frame = window.frame_monotonic;
+            let center = CGPoint {
+                x: frame.origin.x + frame.size.width / 2.0,
+                y: frame.origin.y + frame.size.height / 2.0,
+            };
+            target = self
+                .screens
+                .iter()
+                .enumerate()
+                .find(|(_, screen)| {
+                    center.x >= screen.frame.origin.x
+                        && center.x < screen.frame.origin.x + screen.frame.size.width
+                        && center.y >= screen.frame.origin.y
+                        && center.y < screen.frame.origin.y + screen.frame.size.height
+                })
+                .map(|(index, _)| (index, frame));
+        }
+        let Some((index, frame)) = target else {
+            return;
+        };
+        let screen = self.screens[index];
+        let kind = match feedback.outcome {
+            layout::SizeShareOutcome::Applied => swift_bridge::SizeShareBadgeKind::Applied,
+            layout::SizeShareOutcome::Released => swift_bridge::SizeShareBadgeKind::Released,
+            layout::SizeShareOutcome::Rejected => swift_bridge::SizeShareBadgeKind::Rejected,
+        };
+        swift_bridge::show_size_share_badge(
+            &size_share_badge_text(&feedback),
+            kind,
+            (frame.origin.x - screen.frame.origin.x) as f32,
+            (frame.origin.y - screen.frame.origin.y) as f32,
+            frame.size.width as f32,
+            frame.size.height as f32,
+            index as i32,
+        );
     }
 
     fn update_complete_window_server_info(&mut self, on_screen: WindowsOnScreen) {
@@ -1365,8 +1428,10 @@ impl Reactor {
             frame_overrides,
             raise_windows,
             focus_window,
+            size_share_feedback,
         } = response;
         self.pending_frame_overrides.extend(frame_overrides);
+        self.pending_size_share = size_share_feedback.or(self.pending_size_share);
         if raise_windows.is_empty() && focus_window.is_none() {
             return;
         }
@@ -1634,6 +1699,30 @@ impl Reactor {
     }
 }
 
+/// Formats a share of the tiled area for the badge, e.g. `1/3` or `12%`.
+fn size_share_label(share: f64) -> String {
+    let denominator = (1.0 / share).round();
+    if denominator >= 1.0 && (share - 1.0 / denominator).abs() < 1e-6 {
+        if denominator == 1.0 {
+            "100%".to_owned()
+        } else {
+            format!("1/{}", denominator as u32)
+        }
+    } else {
+        format!("{:.0}%", share * 100.0)
+    }
+}
+
+/// The text shown on a size share badge.
+fn size_share_badge_text(feedback: &layout::SizeShareFeedback) -> String {
+    let label = size_share_label(feedback.share);
+    match feedback.outcome {
+        layout::SizeShareOutcome::Applied => label,
+        layout::SizeShareOutcome::Released => format!("{label} released"),
+        layout::SizeShareOutcome::Rejected => format!("{label} rejected"),
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use itertools::Itertools;
@@ -1643,7 +1732,7 @@ pub mod tests {
     use super::testing::*;
     use super::*;
     use crate::actor::app::Request;
-    use crate::actor::layout::LayoutManager;
+    use crate::actor::layout::{LayoutManager, SizeShare};
     use crate::model::Direction;
     use crate::sys::window_server::WindowServerId;
 
@@ -2408,6 +2497,7 @@ pub mod tests {
                 frame_overrides: vec![],
                 raise_windows: vec![w2],
                 focus_window: Some(w1),
+                ..Default::default()
             },
             &[WindowServerId::new(1), WindowServerId::new(2)],
         );
@@ -2427,6 +2517,7 @@ pub mod tests {
                 frame_overrides: vec![],
                 raise_windows: vec![w2],
                 focus_window: Some(w1),
+                ..Default::default()
             },
             &[WindowServerId::new(2), WindowServerId::new(1)],
         );
@@ -2890,6 +2981,7 @@ pub mod tests {
                 WindowId::new(2, 2),
             ],
             focus_window: None,
+            ..Default::default()
         });
         let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
         match msg {
@@ -2929,6 +3021,7 @@ pub mod tests {
             frame_overrides: vec![],
             raise_windows: vec![WindowId::new(1, 1)],
             focus_window: Some(WindowId::new(2, 1)),
+            ..Default::default()
         });
         let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
         match msg {
@@ -3307,6 +3400,84 @@ pub mod tests {
         assert!(
             !reactor.layout.has_active_scroll_animation(),
             "timer should be dormant when no scroll animation is active"
+        );
+    }
+
+    #[test]
+    fn size_share_badge_text_formats_shares() {
+        assert_eq!(size_share_label(0.5), "1/2");
+        assert_eq!(size_share_label(1.0), "100%");
+        assert_eq!(size_share_label(1.0 / 3.0), "1/3");
+        assert_eq!(size_share_label(0.25), "1/4");
+        assert_eq!(size_share_label(0.4), "40%");
+    }
+
+    #[test]
+    fn it_locks_and_releases_size_shares_end_to_end() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1200., 1200.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app_with_opts(
+            1,
+            make_windows(3),
+            Some(WindowId::new(1, 1)),
+            true,
+        ));
+        reactor.handle_event(Event::StartupComplete);
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        apps.simulate_until_quiet(&mut reactor);
+
+        let before = reactor.layout.calculate_layout(space, screen, &reactor.config);
+        assert_eq!(before.len(), 3);
+
+        let lock = || {
+            Event::Command(Command::Layout(LayoutCommand::SetSizeShare(
+                SizeShare::Fraction(0.5),
+            )))
+        };
+        reactor.handle_event(lock());
+        assert_eq!(
+            vec![
+                (
+                    WindowId::new(1, 1),
+                    CGRect::new(CGPoint::new(0., 0.), CGSize::new(600., 1200.)),
+                ),
+                (
+                    WindowId::new(1, 2),
+                    CGRect::new(CGPoint::new(600., 0.), CGSize::new(300., 1200.)),
+                ),
+                (
+                    WindowId::new(1, 3),
+                    CGRect::new(CGPoint::new(900., 0.), CGSize::new(300., 1200.)),
+                ),
+            ],
+            reactor.layout.calculate_layout(space, screen, &reactor.config),
+        );
+        // The app threads must have been asked for the same frames.
+        let requests = apps.requests();
+        for (wid, frame) in reactor.layout.calculate_layout(space, screen, &reactor.config) {
+            assert!(
+                requests.iter().any(|request| {
+                    matches!(request, Request::SetWindowFrame(request_wid, request_frame, _)
+                        if *request_wid == wid && *request_frame == frame)
+                }),
+                "expected a frame request for {wid:?} at {frame:?}, got {requests:?}"
+            );
+        }
+
+        // The same binding releases the lock.
+        reactor.handle_event(lock());
+        assert_eq!(
+            before,
+            reactor.layout.calculate_layout(space, screen, &reactor.config)
         );
     }
 }
