@@ -23,7 +23,7 @@ use std::{mem, thread};
 
 use animation::{Animation, AnimationManager, Message as AnimationMessage};
 use main_window::MainWindowTracker;
-use objc2_core_foundation::{CGPoint, CGRect};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use redact::Secret;
 pub use replay::{Record, replay};
 use serde::{Deserialize, Serialize};
@@ -288,11 +288,36 @@ pub struct Reactor {
 const MAX_FRAME_ATTEMPTS: u32 = 5;
 const FRAME_ATTEMPT_RESET: Duration = Duration::from_secs(2);
 
+/// The smallest size difference that counts as an app refusing to shrink a
+/// window. Anything smaller is pixel rounding.
+const MIN_SIZE_EPSILON: f64 = 1.0;
+
 #[derive(Debug)]
 struct FrameAttempt {
     target: CGRect,
     count: u32,
     last: Instant,
+}
+
+/// Keeps `frame` inside `screen`, growing it to `min_size` if the app will not
+/// shrink below that.
+///
+/// A window that doesn't fit its slot overlaps its neighbors instead of
+/// spilling past the screen edge. The remaining space is used first, so a
+/// window at the right or bottom edge grows toward the middle of the screen.
+fn fit_frame_to_screen(frame: CGRect, min_size: CGSize, screen: CGRect) -> CGRect {
+    let size = CGSize::new(
+        frame.size.width.max(min_size.width).min(screen.size.width),
+        frame.size.height.max(min_size.height).min(screen.size.height),
+    );
+    let max_origin = CGPoint::new(screen.max().x - size.width, screen.max().y - size.height);
+    CGRect::new(
+        CGPoint::new(
+            frame.origin.x.min(max_origin.x).max(screen.min().x),
+            frame.origin.y.min(max_origin.y).max(screen.min().y),
+        ),
+        size,
+    )
 }
 
 #[derive(Debug)]
@@ -607,10 +632,40 @@ impl Reactor {
                     debug!(?last_seen, ?window.last_sent_txid, "Ignoring resize");
                     return;
                 }
+                // The window is at this size now, so its minimum cannot be
+                // larger. This also corrects a stale minimum after the app
+                // becomes willing to shrink again.
+                self.layout.relax_window_min_size(wid, new_frame.size);
                 if requested.0 {
-                    // TODO: If the size is different from requested, applying a
-                    // correction to the model can result in weird feedback
-                    // loops, so we ignore these for now.
+                    // An app may refuse to shrink a window below its minimum
+                    // size, in which case the frame comes back larger than we
+                    // asked for. Remember the size so the layout can give the
+                    // window enough room instead of letting it spill off
+                    // screen. Correcting the model directly would cause
+                    // feedback loops, so only the minimum is kept.
+                    let requested_size = window.frame_monotonic.size;
+                    let min_size = CGSize::new(
+                        if new_frame.size.width > requested_size.width + MIN_SIZE_EPSILON {
+                            new_frame.size.width
+                        } else {
+                            0.0
+                        },
+                        if new_frame.size.height > requested_size.height + MIN_SIZE_EPSILON {
+                            new_frame.size.height
+                        } else {
+                            0.0
+                        },
+                    );
+                    if min_size.width > 0.0 || min_size.height > 0.0 {
+                        let before = self.layout.window_min_size(wid);
+                        self.layout.note_window_min_size(wid, min_size);
+                        if self.layout.window_min_size(wid) != before && !self.in_drag {
+                            // The layout now knows the window needs more room,
+                            // so recalculate the frames. During a drag the
+                            // correction waits for the end of the drag.
+                            self.update_layout(&[], true);
+                        }
+                    }
                     return;
                 }
                 let old_frame = mem::replace(&mut window.frame_monotonic, new_frame);
@@ -1474,8 +1529,19 @@ impl Reactor {
             self.group_indicators_tx
                 .send(group_bars::Event::GroupsUpdated { space_id: space, groups });
 
-            targets
-                .extend(result.into_iter().map(|(wid, frame)| (wid, (frame, screen.scale_factor))));
+            // Scroll layouts place windows off screen on purpose, so only
+            // tiled frames are kept inside the screen.
+            let is_scroll = self.layout.is_scroll_space(space);
+            for (wid, frame) in result {
+                let frame = if is_scroll {
+                    frame
+                } else {
+                    let min_size =
+                        self.layout.window_min_size(wid).unwrap_or(CGSize::new(0.0, 0.0));
+                    fit_frame_to_screen(frame, min_size, screen.frame)
+                };
+                targets.insert(wid, (frame, screen.scale_factor));
+            }
         }
         for (wid, frame) in mem::take(&mut self.pending_frame_overrides) {
             let scale_factor = self
@@ -3308,5 +3374,278 @@ pub mod tests {
             !reactor.layout.has_active_scroll_animation(),
             "timer should be dormant when no scroll animation is active"
         );
+    }
+
+    #[test]
+    fn fit_frame_to_screen_keeps_frames_in_view() {
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let no_min = CGSize::new(0., 0.);
+
+        // A frame that fits is unchanged.
+        assert_eq!(
+            fit_frame_to_screen(
+                CGRect::new(CGPoint::new(100., 100.), CGSize::new(200., 200.)),
+                no_min,
+                screen
+            ),
+            CGRect::new(CGPoint::new(100., 100.), CGSize::new(200., 200.))
+        );
+
+        // A screen that starts at a negative origin keeps the window inside
+        // its own bounds.
+        let left_screen = CGRect::new(CGPoint::new(-1200., -200.), CGSize::new(1200., 1000.));
+        assert_eq!(
+            fit_frame_to_screen(
+                CGRect::new(CGPoint::new(-1400., -100.), CGSize::new(400., 400.)),
+                no_min,
+                left_screen
+            ),
+            CGRect::new(CGPoint::new(-1200., -100.), CGSize::new(400., 400.))
+        );
+
+        // Frames past the right and bottom edges are pulled back.
+        assert_eq!(
+            fit_frame_to_screen(
+                CGRect::new(CGPoint::new(900., 900.), CGSize::new(200., 200.)),
+                no_min,
+                screen
+            ),
+            CGRect::new(CGPoint::new(800., 800.), CGSize::new(200., 200.))
+        );
+
+        // A minimum that doesn't fit the slot grows the window toward the
+        // middle of the screen.
+        assert_eq!(
+            fit_frame_to_screen(
+                CGRect::new(CGPoint::new(500., 0.), CGSize::new(500., 1000.)),
+                CGSize::new(700., 0.),
+                screen
+            ),
+            CGRect::new(CGPoint::new(300., 0.), CGSize::new(700., 1000.))
+        );
+
+        // A minimum larger than the screen is capped and pinned to the top
+        // left corner.
+        assert_eq!(
+            fit_frame_to_screen(
+                CGRect::new(CGPoint::new(100., 100.), CGSize::new(100., 100.)),
+                CGSize::new(1200., 2000.),
+                screen
+            ),
+            CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))
+        );
+    }
+
+    /// A window whose app refuses to shrink below a minimum gets enough room
+    /// from its neighbors instead of spilling off the screen.
+    #[test]
+    fn it_gives_a_min_size_window_room_within_the_screen() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        // The app refuses to make this window narrower than 700 points.
+        let constrained = WindowId::new(1, 2);
+        apps.windows.get_mut(&constrained).unwrap().min_size = Some(CGSize::new(700.0, 0.0));
+
+        // Nudge the window so the layout writes to it again and sees the clamp.
+        let neighbor = WindowId::new(1, 1);
+        nudge_window(&mut apps, &mut reactor, constrained);
+        apps.simulate_until_quiet(&mut reactor);
+
+        let frame = apps.windows[&constrained].frame;
+        assert!(
+            (frame.size.width - 700.0).abs() < 0.01,
+            "window should keep its minimum width: {frame:?}"
+        );
+        assert!(
+            frame.max().x <= screen.max().x + 0.01,
+            "window should stay on screen: {frame:?}"
+        );
+        let neighbor_frame = apps.windows[&neighbor].frame;
+        assert!(
+            neighbor_frame.max().x <= frame.min().x + 0.01,
+            "neighbor should give up the space: {neighbor_frame:?} {frame:?}"
+        );
+        assert_eq!(
+            reactor.layout.window_min_size(constrained),
+            Some(CGSize::new(700.0, 0.0))
+        );
+    }
+
+    /// The minimum is learned from the app's response to a frame the layout
+    /// asked for, without any other event to prompt a write.
+    #[test]
+    fn it_learns_a_min_size_from_a_rejected_frame() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        let constrained = WindowId::new(1, 2);
+        apps.windows.get_mut(&constrained).unwrap().min_size = Some(CGSize::new(700.0, 0.0));
+
+        // The user resizes the neighbor, so the layout writes both frames and
+        // the app reports the constrained size back.
+        let neighbor = WindowId::new(1, 1);
+        apps.windows.get_mut(&neighbor).unwrap().frame.size.width -= 100.0;
+        reactor.handle_event(Event::WindowFrameChanged(
+            neighbor,
+            apps.windows[&neighbor].frame,
+            apps.windows[&neighbor].last_seen_txid,
+            Requested(false),
+            None,
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+
+        assert_eq!(
+            reactor.layout.window_min_size(constrained),
+            Some(CGSize::new(700.0, 0.0)),
+            "the app's clamp should be learned"
+        );
+        let frame = apps.windows[&constrained].frame;
+        assert!(
+            frame.max().x <= screen.max().x + 0.01,
+            "window should stay on screen after the correction: {frame:?}"
+        );
+    }
+
+    /// A learned minimum is lowered again when the app later accepts a smaller
+    /// frame, so it doesn't ratchet up forever.
+    #[test]
+    fn it_relaxes_a_min_size_when_the_app_accepts_less() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        let constrained = WindowId::new(1, 2);
+        apps.windows.get_mut(&constrained).unwrap().min_size = Some(CGSize::new(700.0, 0.0));
+        let neighbor = WindowId::new(1, 1);
+        apps.windows.get_mut(&neighbor).unwrap().frame.size.width -= 100.0;
+        reactor.handle_event(Event::WindowFrameChanged(
+            neighbor,
+            apps.windows[&neighbor].frame,
+            apps.windows[&neighbor].last_seen_txid,
+            Requested(false),
+            None,
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!(
+            reactor.layout.window_min_size(constrained),
+            Some(CGSize::new(700.0, 0.0))
+        );
+
+        // The app becomes willing to shrink again, and the user drags the
+        // window smaller than the learned minimum.
+        apps.windows.get_mut(&constrained).unwrap().min_size = None;
+        apps.windows.get_mut(&constrained).unwrap().frame.size.width = 500.0;
+        reactor.handle_event(Event::WindowFrameChanged(
+            constrained,
+            apps.windows[&constrained].frame,
+            apps.windows[&constrained].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Down),
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+
+        assert_eq!(
+            reactor.layout.window_min_size(constrained),
+            Some(CGSize::new(500.0, 0.0)),
+            "the minimum should follow the app's accepted size"
+        );
+    }
+
+    /// When all windows have minimums that don't fit, they overlap but stay
+    /// within the screen instead of spilling past its edges.
+    #[test]
+    fn it_keeps_constrained_windows_on_screen_when_they_overlap() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space = SpaceId::new(1);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+
+        let w1 = WindowId::new(1, 1);
+        let w2 = WindowId::new(1, 2);
+        for wid in [w1, w2] {
+            apps.windows.get_mut(&wid).unwrap().min_size = Some(CGSize::new(700.0, 0.0));
+        }
+
+        nudge_window(&mut apps, &mut reactor, w1);
+        apps.simulate_until_quiet(&mut reactor);
+
+        let f1 = apps.windows[&w1].frame;
+        let f2 = apps.windows[&w2].frame;
+        for frame in [f1, f2] {
+            assert!(
+                (frame.size.width - 700.0).abs() < 0.01,
+                "window should keep its minimum width: {frame:?}"
+            );
+            assert!(
+                frame.max().x <= screen.max().x + 0.01,
+                "window should stay on screen: {frame:?}"
+            );
+        }
+        assert!(
+            f2.min().x < f1.max().x && f1.min().x < f2.max().x,
+            "windows should overlap instead of spilling off screen: {f1:?} {f2:?}"
+        );
+    }
+
+    /// Moves the window slightly without the mouse, as an app might, so the
+    /// next layout pass has something to correct.
+    fn nudge_window(apps: &mut Apps, reactor: &mut Reactor, wid: WindowId) {
+        let window = apps.windows.get_mut(&wid).unwrap();
+        window.frame.origin.x += 10.0;
+        let frame = window.frame;
+        let last_seen = window.last_seen_txid;
+        reactor.handle_event(Event::WindowFrameChanged(
+            wid,
+            frame,
+            last_seen,
+            Requested(false),
+            None,
+        ));
     }
 }
