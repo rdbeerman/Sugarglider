@@ -15,12 +15,13 @@ xcuserdata/
 *.swo
 
 # macOS
-.DS_Store/
 .DS_Store
 
 # Agents
 .claude/settings.local.json
 /agents.local.md
+/claude.md
+/CLAUDE.md
 
 # IDE
 .idea/

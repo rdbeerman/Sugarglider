@@ -87,8 +87,6 @@ struct GeneralPane: View {
 
             Section("Dragging Behavior") {
                 Toggle("Enable drag to rearrange", isOn: $viewModel.dragDropEnable)
-                Toggle("Drag from window content", isOn: $viewModel.dragDropWindowDrag)
-                    .disabled(!viewModel.dragDropEnable)
                 Toggle("Live preview while dragging", isOn: $viewModel.dragDropLivePreview)
                     .disabled(!viewModel.dragDropEnable)
             }

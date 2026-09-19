@@ -239,9 +239,6 @@ pub struct ScrollConfig {
 pub struct DragDropConfig {
     /// Enable drag-to-rearrange windows.
     pub enable: bool,
-    /// Enable drag-to-rearrange by clicking anywhere in a window.
-    /// When false, only normal macOS title bar dragging triggers rearrangement.
-    pub window_drag: bool,
     /// Show live preview of window positions while dragging.
     /// When true, other windows move in real-time to show where they'll land.
     /// When false, windows only move after releasing the mouse button.

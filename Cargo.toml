@@ -7,7 +7,7 @@ name = "sugarglider"
 version = "0.1.0"
 edition = "2024"
 
-license = "Apache-2.0 OR MIT"
+license = "Apache-2.0"
 description = "A tiling window manager for macOS with drag-to-rearrange and menu bar GUI"
 authors = ["Tyler Mandry", "RD Beerman"]
 readme = "README.md"

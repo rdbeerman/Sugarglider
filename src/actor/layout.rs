@@ -2058,6 +2058,11 @@ impl LayoutManager {
     }
 
     /// Begin a drag-to-rearrange operation.
+    ///
+    /// Always returns false since dragging from window content is no longer
+    /// supported. Only title bar drags work, which are handled by the reactor's
+    /// TitleBarDrag tracking.
+    #[allow(unused_variables)]
     pub fn begin_interactive_drag(
         &mut self,
         space: SpaceId,
@@ -2067,41 +2072,7 @@ impl LayoutManager {
         screen: CGRect,
         config: &Config,
     ) -> bool {
-        if self.interactive_drag.is_some()
-            || self.interactive_resize.is_some()
-            || self.interactive_move.is_some()
-        {
-            return false;
-        }
-        if !self.config.settings.drag_drop.enable {
-            return false;
-        }
-        if !self.config.settings.drag_drop.window_drag {
-            return false;
-        }
-        let layout_id = self.layout(space);
-
-        // Cache original frames for preview restoration.
-        let frames = self.tree.calculate_layout(layout_id, screen, config);
-        let original_frames: HashMap<WindowId, CGRect> = frames
-            .into_iter()
-            .filter(|(w, _)| *w != wid) // Exclude dragged window
-            .collect();
-
-        self.interactive_drag = Some(InteractiveDrag {
-            layout_id,
-            source_wid: wid,
-            source_node: node,
-            start_mouse: mouse,
-            drag_active: false,
-            hover_target: None,
-            current_action: None,
-            preview: DragPreviewState {
-                original_frames,
-                last_action: None,
-            },
-        });
-        true
+        false
     }
 
     /// Update drag state based on current mouse position.

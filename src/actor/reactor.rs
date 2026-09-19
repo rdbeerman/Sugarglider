@@ -229,7 +229,7 @@ pub enum ReactorCommand {
     SaveAndExit,
 }
 
-/// Tracks a potential title bar drag (when window_drag is disabled).
+/// Tracks a potential title bar drag for drag-to-rearrange.
 /// We track whether macOS actually moved the window to distinguish between
 /// clicks on floating windows (like preferences) and actual title bar drags.
 struct TitleBarDrag {
@@ -259,7 +259,7 @@ pub struct Reactor {
     active_screen_idx: Option<u16>,
     main_window_tracker: MainWindowTracker,
     in_drag: bool,
-    /// Window being dragged by title bar (when window_drag is disabled).
+    /// Window being dragged by title bar for drag-to-rearrange.
     /// Tracks the window ID, node, and whether we received a frame change event
     /// confirming macOS actually moved the window.
     title_bar_drag: Option<TitleBarDrag>,
@@ -936,7 +936,7 @@ impl Reactor {
                         ) {
                             self.in_drag = true;
                         } else if self.config.settings.drag_drop.enable {
-                            // window_drag is disabled but enable is on - track for title bar drag
+                            // Track for title bar drag-to-rearrange
                             // Cache original frames for live preview
                             let original_frames: HashMap<WindowId, CGRect> = self
                                 .layout
@@ -1022,9 +1022,9 @@ impl Reactor {
                         }
                     }
                 }
-                // Handle title bar drags (when window_drag is disabled)
+                // Handle title bar drags for drag-to-rearrange.
                 // Only proceed if we received WindowFrameChanged events for this window,
-                // which confirms macOS actually moved it (not just a click on a floating window)
+                // which confirms macOS actually moved it (not just a click on a floating window).
                 if let Some(drag) = self.title_bar_drag.take() {
                     if drag.frame_changed {
                         // Use the action from live preview if available, otherwise compute it.
