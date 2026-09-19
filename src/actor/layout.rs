@@ -58,6 +58,8 @@ pub enum LayoutCommand {
     CleanUpSpace,
     /// Freeze the focused window's share of the tiled area.
     SetSizeShare(SizeShare),
+    /// Toggle a size lock at the window's current share.
+    ToggleSizeLock,
 }
 
 /// A share of the tiled area requested by [`LayoutCommand::SetSizeShare`].
@@ -72,10 +74,12 @@ pub enum SizeShare {
 
 impl SizeShare {
     /// The fraction of the tiled area this share represents, if valid.
+    ///
+    /// Returns `None` for shares <= 0 or >= 1 (use fullscreen for 100%).
     pub fn fraction(self) -> Option<f64> {
         match self {
-            SizeShare::Fraction(share) if share > 0.0 && share <= 1.0 => Some(share),
-            SizeShare::Denominator { denominator } if denominator >= 1 => {
+            SizeShare::Fraction(share) if share > 0.0 && share < 1.0 => Some(share),
+            SizeShare::Denominator { denominator } if denominator >= 2 => {
                 Some(1.0 / f64::from(denominator))
             }
             _ => None,
@@ -205,7 +209,7 @@ impl LayoutCommand {
 
             NextLayout | PrevLayout | MoveFocus(_) | Ascend | Descend | Split(_)
             | ToggleFocusFloating | ToggleWindowFloating | ToggleFullscreen | ChangeLayoutKind
-            | FocusNext | FocusPrev | SetSizeShare(_) => false,
+            | FocusNext | FocusPrev | SetSizeShare(_) | ToggleSizeLock => false,
         }
     }
 }
@@ -1387,7 +1391,56 @@ impl LayoutManager {
                     })
                     .unwrap_or_default()
             }
+            LayoutCommand::ToggleSizeLock => {
+                let Some(wid) = self.focused_window else {
+                    return EventResponse::default();
+                };
+                let Some(node) = self.tree.window_node(layout, wid) else {
+                    return EventResponse::default();
+                };
+                Self::toggle_size_lock(&mut self.tree, layout, wid, node)
+                    .map(|feedback| EventResponse {
+                        size_share_feedback: Some(feedback),
+                        ..Default::default()
+                    })
+                    .unwrap_or_default()
+            }
         }
+    }
+
+    /// Toggles a size lock at the window's current share.
+    fn toggle_size_lock(
+        tree: &mut LayoutTree,
+        layout: LayoutId,
+        wid: WindowId,
+        node: NodeId,
+    ) -> Option<SizeShareFeedback> {
+        // If already locked, release the lock.
+        if let Some(current) = tree.estate_size_lock(node) {
+            tree.clear_estate_size_lock(node);
+            return Some(SizeShareFeedback {
+                wid,
+                share: current,
+                outcome: SizeShareOutcome::Released,
+            });
+        }
+
+        // Calculate the current share of the estate.
+        let share = tree.estate_share(layout, node)?;
+
+        // Don't lock if share would be invalid (>= 1.0 or <= 0.0).
+        if share <= 0.0 || share >= 1.0 {
+            return None;
+        }
+
+        // A fullscreen window can't show its locked share.
+        tree.clear_fullscreen_for(node);
+        tree.set_size_lock(wid, share);
+        Some(SizeShareFeedback {
+            wid,
+            share,
+            outcome: SizeShareOutcome::Applied,
+        })
     }
 
     /// Applies, releases, or refuses a size share for the estate containing
@@ -1400,19 +1453,6 @@ impl LayoutManager {
         share: f64,
         overflow: SizeShareOverflow,
     ) -> Option<SizeShareFeedback> {
-        // A share of the whole tiled area is the same as fullscreen.
-        if share >= 1.0 {
-            let estate = tree.estate_node(node);
-            tree.clear_estate_size_lock(estate);
-            let is_fullscreen = tree.toggle_fullscreen(estate);
-            let outcome = if is_fullscreen {
-                SizeShareOutcome::Applied
-            } else {
-                SizeShareOutcome::Released
-            };
-            return Some(SizeShareFeedback { wid, share: 1.0, outcome });
-        }
-
         let current = tree.estate_size_lock(node);
         if let Some(current) = current
             && (current - share).abs() < 1e-6
@@ -1450,11 +1490,12 @@ impl LayoutManager {
     /// Releases any size share lock on `wid`'s estate, returning whether one
     /// was released.
     ///
-    /// Used when the user resizes a locked window by hand.
+    /// Used when the user resizes a locked window by hand. The lock value is
+    /// baked into the stored weights so the window maintains its current size.
     pub fn release_size_share(&mut self, wid: WindowId) -> bool {
         let mut released = false;
         for node in self.tree.nodes_for_window(wid) {
-            released |= self.tree.clear_estate_size_lock(node);
+            released |= self.tree.clear_estate_size_lock_and_bake(node);
         }
         released
     }
@@ -4313,23 +4354,10 @@ mod tests {
     }
 
     #[test]
-    fn a_full_size_share_toggles_fullscreen() {
-        let (mut mgr, space, _screen) = setup_size_share_test(2);
-        let node = mgr.tree.window_node(mgr.layout(space), WindowId::new(1, 1)).unwrap();
-
-        let feedback = set_size_share(&mut mgr, space, SizeShare::Fraction(1.0));
-        assert_eq!(feedback.map(|f| f.outcome), Some(SizeShareOutcome::Applied));
-        assert!(mgr.tree.is_fullscreen(node));
-
-        let feedback = set_size_share(&mut mgr, space, SizeShare::Fraction(1.0));
-        assert_eq!(feedback.map(|f| f.outcome), Some(SizeShareOutcome::Released));
-        assert!(!mgr.tree.is_fullscreen(node));
-    }
-
-    #[test]
     fn invalid_size_shares_are_ignored() {
         let (mut mgr, space, _screen) = setup_size_share_test(2);
         assert_eq!(set_size_share(&mut mgr, space, SizeShare::Fraction(0.0)), None);
+        assert_eq!(set_size_share(&mut mgr, space, SizeShare::Fraction(1.0)), None);
         assert_eq!(set_size_share(&mut mgr, space, SizeShare::Fraction(1.5)), None);
         assert_eq!(
             set_size_share(&mut mgr, space, SizeShare::Denominator { denominator: 0 }),

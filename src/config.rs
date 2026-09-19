@@ -825,14 +825,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             shares.len(),
-            4,
-            "expected four default size share bindings: {shares:?}"
-        );
-        assert!(
-            shares
-                .iter()
-                .any(|(hk, share)| hk == "Ctrl + Shift + Digit1" && share.fraction() == Some(1.0)),
-            "Ctrl+Shift+1 should take the whole screen: {shares:?}"
+            3,
+            "expected three default size share bindings: {shares:?}"
         );
         assert!(
             shares

@@ -166,15 +166,16 @@ default_keys = false
 # keeps its share while the other windows divide the rest of the screen.
 # Pressing the same binding again releases the lock.
 #
-# Ctrl + Shift + 1 takes the whole tiled area (same as full screen), 2 takes
-# half, 3 takes a third, and 4 takes a quarter. A lock is refused by default
-# when it would leave the other windows less than a usable share of the
-# screen; set settings.size_share.overflow = "squeeze" to scale locks down
-# and fit instead.
-"Ctrl + Shift + 1" = { set_size_share = 1.0 }
+# Ctrl + Shift + 2 takes half, 3 takes a third, and 4 takes a quarter. A lock
+# is refused by default when it would leave the other windows less than a
+# usable share of the screen; set settings.size_share.overflow = "squeeze" to
+# scale locks down and fit instead.
 "Ctrl + Shift + 2" = { set_size_share = 0.5 }
 "Ctrl + Shift + 3" = { set_size_share = { denominator = 3 } }
 "Ctrl + Shift + 4" = { set_size_share = 0.25 }
+
+# Lock the focused window at its current share. Press again to release.
+"Ctrl + Shift + L" = "toggle_size_lock"
 
 # Set glide on/off.
 # "<key>" = { "set_global_enabled" = { "enabled" = <bool> } }

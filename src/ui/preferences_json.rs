@@ -61,6 +61,8 @@ pub struct HotkeyBindingJson {
     pub category: String,
     /// The default hotkey for this command (if any)
     pub default_key: Option<String>,
+    /// Sort order within the category (lower = earlier)
+    pub sort_order: u32,
 }
 
 /// JSON representation of a window rule.
@@ -99,20 +101,27 @@ impl PreferencesJson {
                     .keys
                     .iter()
                     .map(|(hotkey, cmd)| {
-                        let (_, _, command_id) = describe_command(cmd);
+                        let (_, _, command_id, _) = describe_command(cmd);
                         (command_id, format_hotkey(hotkey))
                     })
                     .collect();
 
-                config
+                let mut hotkeys: Vec<_> = config
                     .keys
                     .iter()
                     .map(|(hotkey, cmd)| {
-                        let (_, _, command_id) = describe_command(cmd);
+                        let (_, _, command_id, _) = describe_command(cmd);
                         let default_key = default_keys.get(&command_id).cloned();
                         HotkeyBindingJson::from_binding_with_default(hotkey, cmd, default_key)
                     })
-                    .collect()
+                    .collect();
+
+                // Sort by category, then by sort_order within each category
+                hotkeys.sort_by(|a, b| {
+                    a.category.cmp(&b.category).then_with(|| a.sort_order.cmp(&b.sort_order))
+                });
+
+                hotkeys
             },
         }
     }
@@ -156,13 +165,13 @@ impl PreferencesJson {
 
         // Add default commands first
         for (_, cmd) in &Config::default().keys {
-            let (_, _, command_id) = describe_command(cmd);
+            let (_, _, command_id, _) = describe_command(cmd);
             command_map.insert(command_id, cmd.clone());
         }
 
         // Override with current config commands (for custom exec commands, etc.)
         for (_, cmd) in &config.keys {
-            let (_, _, command_id) = describe_command(cmd);
+            let (_, _, command_id, _) = describe_command(cmd);
             command_map.insert(command_id, cmd.clone());
         }
 
@@ -310,13 +319,14 @@ impl HotkeyBindingJson {
         cmd: &WmCommand,
         default_key: Option<String>,
     ) -> Self {
-        let (description, category, command_id) = describe_command(cmd);
+        let (description, category, command_id, sort_order) = describe_command(cmd);
         Self {
             key: format_hotkey(hotkey),
             command_id,
             description,
             category,
             default_key,
+            sort_order,
         }
     }
 }
@@ -346,6 +356,7 @@ fn format_hotkey(hotkey: &Hotkey) -> String {
         let key_name = key_part
             .strip_prefix("Key")
             .or_else(|| key_part.strip_prefix("Numpad"))
+            .or_else(|| key_part.strip_prefix("Digit"))
             .unwrap_or(key_part);
 
         // Map special keys
@@ -373,32 +384,37 @@ fn format_hotkey(hotkey: &Hotkey) -> String {
 /// Get the description, category, and command ID for a WmCommand.
 /// Public wrapper for use from config.rs.
 pub fn describe_command_for_toml(cmd: &WmCommand) -> (String, String, String) {
-    describe_command(cmd)
+    let (desc, cat, id, _) = describe_command(cmd);
+    (desc, cat, id)
 }
 
-/// Get the description, category, and command ID for a WmCommand.
-fn describe_command(cmd: &WmCommand) -> (String, String, String) {
+/// Get the description, category, command ID, and sort order for a WmCommand.
+fn describe_command(cmd: &WmCommand) -> (String, String, String, u32) {
     match cmd {
         WmCommand::Wm(wm_cmd) => match wm_cmd {
             WmCmd::ToggleGlobalEnabled => (
                 "Toggle tiling globally".to_string(),
                 "System".to_string(),
                 "toggle_global_enabled".to_string(),
+                0,
             ),
             WmCmd::SetGlobalEnabled(enabled) => (
                 format!("Set tiling {}", if *enabled { "on" } else { "off" }),
                 "System".to_string(),
                 "set_global_enabled".to_string(),
+                1,
             ),
             WmCmd::ToggleSpaceActivated => (
                 "Toggle tiling on current space".to_string(),
                 "System".to_string(),
                 "toggle_space_activated".to_string(),
+                2,
             ),
             WmCmd::Exec(_) => (
                 "Execute command".to_string(),
                 "Utilities".to_string(),
                 "exec".to_string(),
+                0,
             ),
         },
         WmCommand::ReactorCommand(reactor_cmd) => match reactor_cmd {
@@ -408,6 +424,7 @@ fn describe_command(cmd: &WmCommand) -> (String, String, String) {
                     "Show performance timing".to_string(),
                     "Developer".to_string(),
                     "show_timing".to_string(),
+                    0,
                 ),
             },
             ReactorCommand::Reactor(reactor_cmd) => match reactor_cmd {
@@ -415,69 +432,81 @@ fn describe_command(cmd: &WmCommand) -> (String, String, String) {
                     "Print layout debug info".to_string(),
                     "Developer".to_string(),
                     "debug".to_string(),
+                    0,
                 ),
                 ReactorCmd::Serialize => (
                     "Serialize layout state".to_string(),
                     "Developer".to_string(),
                     "serialize".to_string(),
+                    1,
                 ),
                 ReactorCmd::SaveAndExit => (
                     "Save state and exit".to_string(),
                     "System".to_string(),
                     "save_and_exit".to_string(),
+                    10,
                 ),
             },
         },
     }
 }
 
-/// Get the description, category, and command ID for a LayoutCommand.
-fn describe_layout_command(cmd: &LayoutCommand) -> (String, String, String) {
+/// Get the description, category, command ID, and sort order for a LayoutCommand.
+fn describe_layout_command(cmd: &LayoutCommand) -> (String, String, String, u32) {
     match cmd {
         LayoutCommand::MoveFocus(dir) => (
             format!("Focus {}", direction_name(dir)),
             "Focus".to_string(),
             format!("move_focus_{}", direction_id(dir)),
+            direction_sort_order(dir),
         ),
         LayoutCommand::FocusNext => (
             "Focus next window".to_string(),
             "Focus".to_string(),
             "focus_next".to_string(),
+            10,
         ),
         LayoutCommand::FocusPrev => (
             "Focus previous window".to_string(),
             "Focus".to_string(),
             "focus_prev".to_string(),
+            11,
         ),
         LayoutCommand::Ascend => (
             "Select parent container".to_string(),
             "Focus".to_string(),
             "ascend".to_string(),
+            20,
         ),
         LayoutCommand::Descend => (
             "Select child node".to_string(),
             "Focus".to_string(),
             "descend".to_string(),
+            21,
         ),
         LayoutCommand::MoveNode(dir) => (
             format!("Move window {}", direction_name(dir)),
             "Move".to_string(),
             format!("move_node_{}", direction_id(dir)),
+            direction_sort_order(dir),
         ),
         LayoutCommand::Resize { direction, percent } => (
             format!("Resize {} by {}%", direction_name(direction), percent),
             "Resize".to_string(),
             format!("resize_{}", direction_id(direction)),
+            10 + direction_sort_order(direction), // After SetSizeShare
         ),
         LayoutCommand::Split(orientation) => (
             format!("Split {}", orientation_name(orientation)),
             "Layout".to_string(),
             format!("split_{}", orientation_id(orientation)),
+            0,
         ),
         LayoutCommand::ToggleOrientation => (
             "Toggle split orientation".to_string(),
             "Layout".to_string(),
             "toggle_orientation".to_string(),
+            1,
         ),
         LayoutCommand::Group(orientation) => (
             format!(
@@ -487,61 +516,79 @@ fn describe_layout_command(cmd: &LayoutCommand) -> (String, String, String) {
             ),
             "Layout".to_string(),
             format!("group_{}", orientation_id(orientation)),
+            10,
         ),
         LayoutCommand::Ungroup => (
             "Ungroup container".to_string(),
             "Layout".to_string(),
             "ungroup".to_string(),
+            11,
         ),
         LayoutCommand::ToggleFocusFloating => (
             "Toggle focus between tiled/floating".to_string(),
             "Floating".to_string(),
             "toggle_focus_floating".to_string(),
+            0,
         ),
         LayoutCommand::ToggleWindowFloating => (
             "Toggle window floating".to_string(),
             "Floating".to_string(),
             "toggle_window_floating".to_string(),
+            1,
         ),
         LayoutCommand::ToggleFullscreen => (
             "Toggle fullscreen".to_string(),
             "Layout".to_string(),
             "toggle_fullscreen".to_string(),
+            20,
         ),
         LayoutCommand::NextLayout => (
             "Switch to next saved layout".to_string(),
             "Layout".to_string(),
             "next_layout".to_string(),
+            30,
         ),
         LayoutCommand::PrevLayout => (
             "Switch to previous saved layout".to_string(),
             "Layout".to_string(),
             "prev_layout".to_string(),
+            31,
         ),
         LayoutCommand::CycleColumnWidth => (
             "Cycle column width preset".to_string(),
             "Scroll Layout".to_string(),
             "cycle_column_width".to_string(),
+            0,
         ),
         LayoutCommand::ChangeLayoutKind => (
             "Change layout mode (tree/scroll)".to_string(),
             "Scroll Layout".to_string(),
             "change_layout_kind".to_string(),
+            1,
         ),
         LayoutCommand::ToggleColumnTabbed => (
             "Toggle column tabbed mode".to_string(),
             "Scroll Layout".to_string(),
             "toggle_column_tabbed".to_string(),
+            2,
         ),
         LayoutCommand::CleanUpSpace => (
             "Clean up space".to_string(),
             "System".to_string(),
             "clean_up_space".to_string(),
+            5,
         ),
         LayoutCommand::SetSizeShare(share) => {
-            let name = match share.fraction() {
-                Some(fraction) => format!("{}%", (fraction * 100.0).round()),
-                None => "a share".to_string(),
+            // Use fractions for display: 1/2, 1/3, 1/4
+            // Sort order: 1/2=0, 1/3=1, 1/4=2
+            let (name, sort_order) = match share {
+                SizeShare::Fraction(f) if *f == 0.5 => ("1/2".to_string(), 0),
+                SizeShare::Fraction(f) if *f == 0.25 => ("1/4".to_string(), 2),
+                SizeShare::Fraction(f) => (format!("{}%", (f * 100.0).round()), 5),
+                SizeShare::Denominator { denominator: 3 } => ("1/3".to_string(), 1),
+                SizeShare::Denominator { denominator } => {
+                    (format!("1/{denominator}"), *denominator)
+                }
             };
             let id = match share {
                 SizeShare::Fraction(fraction) => format!("set_size_share_{fraction}"),
@@ -549,8 +596,28 @@ fn describe_layout_command(cmd: &LayoutCommand) -> (String, String, String) {
                     format!("set_size_share_1_{denominator}")
                 }
             };
-            (format!("Freeze window size at {name}"), "Layout".to_string(), id)
+            (
+                format!("Toggle window size {name}"),
+                "Resize".to_string(),
+                id,
+                sort_order,
+            )
         }
+        LayoutCommand::ToggleSizeLock => (
+            "Lock window at current size".to_string(),
+            "Resize".to_string(),
+            "toggle_size_lock".to_string(),
+            3, // After 1/4 (sort_order=2)
+        ),
+    }
+}
+
+fn direction_sort_order(dir: &Direction) -> u32 {
+    match dir {
+        Direction::Left => 0,
+        Direction::Down => 1,
+        Direction::Up => 2,
+        Direction::Right => 3,
     }
 }
 
@@ -621,6 +688,7 @@ mod tests {
                 description: "Focus left".to_string(),
                 category: "Focus".to_string(),
                 default_key: Some("⌥H".to_string()),
+                sort_order: 0,
             }],
         };
 

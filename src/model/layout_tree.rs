@@ -478,7 +478,28 @@ impl LayoutTree {
     /// Removes any size share lock that applies to the estate containing
     /// `node`, returning whether one was removed.
     pub fn clear_estate_size_lock(&mut self, node: NodeId) -> bool {
+        self.clear_estate_size_lock_impl(node, false)
+    }
+
+    /// Removes any size share lock, optionally baking the lock value into
+    /// the stored weights so the estate maintains its current visual share.
+    ///
+    /// Use `bake = true` when the user is manually resizing, so the window
+    /// doesn't jump back to its pre-lock size.
+    pub fn clear_estate_size_lock_and_bake(&mut self, node: NodeId) -> bool {
+        self.clear_estate_size_lock_impl(node, true)
+    }
+
+    fn clear_estate_size_lock_impl(&mut self, node: NodeId, bake: bool) -> bool {
         let estate = self.estate_node(node);
+
+        // Get the lock value before clearing, so we can bake it into the weights.
+        if bake {
+            if let Some(lock_share) = self.estate_size_lock(node) {
+                self.bake_estate_share(estate, lock_share);
+            }
+        }
+
         let wids = estate
             .traverse_preorder(self.map())
             .filter_map(|n| self.window_at(n))
@@ -488,6 +509,67 @@ impl LayoutTree {
             cleared |= self.tree.data.size.clear_lock(wid);
         }
         cleared
+    }
+
+    /// Adjusts the stored weights so that `estate` has proportion `share` of
+    /// its parent, redistributing weight from/to siblings proportionally.
+    fn bake_estate_share(&mut self, estate: NodeId, share: f64) {
+        let map = self.map();
+        let Some(parent) = estate.parent(map) else {
+            return;
+        };
+
+        let parent_total = self.tree.data.size.total(parent);
+        if parent_total <= 0.0 {
+            return;
+        }
+
+        let current_weight = f64::from(self.tree.data.size.weight(estate));
+        let target_weight = share * parent_total;
+        let delta = target_weight - current_weight;
+
+        if delta.abs() < 1e-6 {
+            return;
+        }
+
+        // Collect siblings and their weights (excluding the estate itself)
+        let siblings: Vec<(NodeId, f64)> = parent
+            .children(map)
+            .filter(|&child| child != estate)
+            .map(|child| (child, f64::from(self.tree.data.size.weight(child))))
+            .collect();
+
+        if siblings.is_empty() {
+            // No siblings to redistribute from, just set the weight directly
+            self.tree
+                .data
+                .size
+                .set_weight(estate, target_weight as f32, &self.tree.map);
+            return;
+        }
+
+        // Calculate total sibling weight for proportional redistribution
+        let sibling_total: f64 = siblings.iter().map(|(_, w)| w).sum();
+
+        if sibling_total <= 0.0 {
+            return;
+        }
+
+        // Redistribute delta proportionally among siblings
+        for (sibling, sibling_weight) in &siblings {
+            let sibling_proportion = sibling_weight / sibling_total;
+            let new_weight = (sibling_weight - delta * sibling_proportion).max(0.1);
+            self.tree
+                .data
+                .size
+                .set_weight(*sibling, new_weight as f32, &self.tree.map);
+        }
+
+        // Set the estate's new weight
+        self.tree
+            .data
+            .size
+            .set_weight(estate, target_weight as f32, &self.tree.map);
     }
 
     /// Removes the fullscreen flag from `node` and its ancestors, if set.
@@ -503,6 +585,21 @@ impl LayoutTree {
     /// Whether the estate containing `node` has a size share lock.
     pub fn estate_is_locked(&self, node: NodeId) -> bool {
         self.estate_size_lock(node).is_some()
+    }
+
+    /// The current share of the estate containing `node` within its parent,
+    /// as a fraction from 0 to 1.
+    pub fn estate_share(&self, _layout: LayoutId, node: NodeId) -> Option<f64> {
+        let estate = self.estate_node(node);
+        let parent = estate.parent(self.map())?;
+
+        let parent_total = self.tree.data.size.total(parent);
+        if parent_total <= 0.0 {
+            return None;
+        }
+
+        let estate_weight = f64::from(self.tree.data.size.weight(estate));
+        Some(estate_weight / parent_total)
     }
 
     /// The sum of the size share locks in `layout`, counting each estate once.
@@ -884,6 +981,8 @@ impl LayoutTree {
 
     pub fn swap_windows(&mut self, node_a: NodeId, node_b: NodeId) {
         self.tree.data.window.swap_windows(node_a, node_b);
+        // Swap weights so window sizes follow the windows, not the tree positions.
+        self.tree.data.size.swap_weights(node_a, node_b);
     }
 
     /// Picks the ancestor of `node` (possibly `node` itself) to resize, along

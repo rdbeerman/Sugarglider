@@ -251,8 +251,6 @@ pub struct Reactor {
     /// One-shot frame targets requested by layout transitions. They are merged
     /// into the next animation alongside the continuously calculated layout.
     pending_frame_overrides: HashMap<WindowId, CGRect>,
-    /// Size share command feedback to show once the layout has been updated.
-    pending_size_share: Option<layout::SizeShareFeedback>,
     windows: HashMap<WindowId, WindowState>,
     window_server_info: HashMap<WindowServerId, WindowServerInfo>,
     window_ids: HashMap<WindowServerId, WindowId>,
@@ -435,7 +433,6 @@ impl Reactor {
             apps: HashMap::default(),
             layout,
             pending_frame_overrides: HashMap::default(),
-            pending_size_share: None,
             windows: HashMap::default(),
             window_ids: HashMap::default(),
             window_server_info: HashMap::default(),
@@ -1158,63 +1155,6 @@ impl Reactor {
         if !self.in_drag {
             self.update_layout(&animation_focus_wids, is_resize);
         }
-        self.show_size_share_feedback();
-    }
-
-    /// Shows the badge for the last size share command, if any.
-    fn show_size_share_feedback(&mut self) {
-        let Some(feedback) = self.pending_size_share.take() else {
-            return;
-        };
-        // Prefer the frame the layout just assigned, since the window itself
-        // may still be animating toward it.
-        let mut target: Option<(usize, CGRect)> = None;
-        for (index, screen) in self.screens.iter().enumerate() {
-            let Some(space) = screen.space else { continue };
-            let frames = self.layout.calculate_layout(space, screen.frame, &self.config);
-            if let Some((_, frame)) = frames.iter().find(|(wid, _)| *wid == feedback.wid) {
-                target = Some((index, *frame));
-                break;
-            }
-        }
-        if target.is_none()
-            && let Some(window) = self.windows.get(&feedback.wid)
-        {
-            let frame = window.frame_monotonic;
-            let center = CGPoint {
-                x: frame.origin.x + frame.size.width / 2.0,
-                y: frame.origin.y + frame.size.height / 2.0,
-            };
-            target = self
-                .screens
-                .iter()
-                .enumerate()
-                .find(|(_, screen)| {
-                    center.x >= screen.frame.origin.x
-                        && center.x < screen.frame.origin.x + screen.frame.size.width
-                        && center.y >= screen.frame.origin.y
-                        && center.y < screen.frame.origin.y + screen.frame.size.height
-                })
-                .map(|(index, _)| (index, frame));
-        }
-        let Some((index, frame)) = target else {
-            return;
-        };
-        let screen = self.screens[index];
-        let kind = match feedback.outcome {
-            layout::SizeShareOutcome::Applied => swift_bridge::SizeShareBadgeKind::Applied,
-            layout::SizeShareOutcome::Released => swift_bridge::SizeShareBadgeKind::Released,
-            layout::SizeShareOutcome::Rejected => swift_bridge::SizeShareBadgeKind::Rejected,
-        };
-        swift_bridge::show_size_share_badge(
-            &size_share_badge_text(&feedback),
-            kind,
-            (frame.origin.x - screen.frame.origin.x) as f32,
-            (frame.origin.y - screen.frame.origin.y) as f32,
-            frame.size.width as f32,
-            frame.size.height as f32,
-            index as i32,
-        );
     }
 
     fn update_complete_window_server_info(&mut self, on_screen: WindowsOnScreen) {
@@ -1428,10 +1368,9 @@ impl Reactor {
             frame_overrides,
             raise_windows,
             focus_window,
-            size_share_feedback,
+            ..
         } = response;
         self.pending_frame_overrides.extend(frame_overrides);
-        self.pending_size_share = size_share_feedback.or(self.pending_size_share);
         if raise_windows.is_empty() && focus_window.is_none() {
             return;
         }
@@ -1696,30 +1635,6 @@ impl Reactor {
         }
         debug!("Debug zones: total {} zones", all_zones.len());
         swift_bridge::show_drop_zones(&all_zones);
-    }
-}
-
-/// Formats a share of the tiled area for the badge, e.g. `1/3` or `12%`.
-fn size_share_label(share: f64) -> String {
-    let denominator = (1.0 / share).round();
-    if denominator >= 1.0 && (share - 1.0 / denominator).abs() < 1e-6 {
-        if denominator == 1.0 {
-            "100%".to_owned()
-        } else {
-            format!("1/{}", denominator as u32)
-        }
-    } else {
-        format!("{:.0}%", share * 100.0)
-    }
-}
-
-/// The text shown on a size share badge.
-fn size_share_badge_text(feedback: &layout::SizeShareFeedback) -> String {
-    let label = size_share_label(feedback.share);
-    match feedback.outcome {
-        layout::SizeShareOutcome::Applied => label,
-        layout::SizeShareOutcome::Released => format!("{label} released"),
-        layout::SizeShareOutcome::Rejected => format!("{label} rejected"),
     }
 }
 
@@ -3401,15 +3316,6 @@ pub mod tests {
             !reactor.layout.has_active_scroll_animation(),
             "timer should be dormant when no scroll animation is active"
         );
-    }
-
-    #[test]
-    fn size_share_badge_text_formats_shares() {
-        assert_eq!(size_share_label(0.5), "1/2");
-        assert_eq!(size_share_label(1.0), "100%");
-        assert_eq!(size_share_label(1.0 / 3.0), "1/3");
-        assert_eq!(size_share_label(0.25), "1/4");
-        assert_eq!(size_share_label(0.4), "40%");
     }
 
     #[test]

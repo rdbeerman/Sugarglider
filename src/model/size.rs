@@ -277,6 +277,16 @@ impl Size {
         }
     }
 
+    /// Swaps the weights of two nodes, so their sizes follow them when they
+    /// swap positions in the tree.
+    pub(super) fn swap_weights(&mut self, node_a: NodeId, node_b: NodeId) {
+        let weight_a = self.info[node_a].size;
+        let weight_b = self.info[node_b].size;
+        self.info[node_a].size = weight_b;
+        self.info[node_b].size = weight_a;
+        // Parent totals don't change since we're just swapping.
+    }
+
     pub(super) fn set_fullscreen(&mut self, node: NodeId, is_fullscreen: bool) {
         self.info[node].is_fullscreen = is_fullscreen;
     }
