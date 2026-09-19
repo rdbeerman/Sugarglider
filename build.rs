@@ -54,4 +54,18 @@ fn build_swift_ui() {
 
     // Set rpath so the dylib can be found at runtime
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", swift_build_dir.display());
+
+    // SugargliderUI.dylib calls back into these Rust functions and resolves them
+    // with a flat namespace lookup when it loads. The linker drops them from
+    // binaries that never call into the Swift UI, and dyld then aborts the
+    // process with "symbol not found in flat namespace". -u forces the linker
+    // to keep each definition in every target.
+    for symbol in [
+        "_sugarglider_free_string",
+        "_sugarglider_get_config",
+        "_sugarglider_save_config_to_file",
+        "_sugarglider_update_config",
+    ] {
+        println!("cargo:rustc-link-arg=-Wl,-u,{symbol}");
+    }
 }
