@@ -352,6 +352,60 @@ impl Size {
         usable / total
     }
 
+    /// The smallest extent `node` can take along `orientation`, accounting for
+    /// the minimum sizes observed for the windows inside it.
+    ///
+    /// A node with no known minima returns zero. Group children share a frame,
+    /// so they contribute their maximum extent rather than their sum.
+    fn min_extent(
+        &self,
+        map: &NodeMap,
+        window: &super::window::Window,
+        config: &Config,
+        node: NodeId,
+        orientation: Orientation,
+    ) -> f64 {
+        if self.info[node].is_fullscreen {
+            // A fullscreen node takes the whole screen regardless of its slot.
+            return 0.0;
+        }
+        if let Some(wid) = window.at(node) {
+            return window.min_size(wid).map_or(0.0, |min_size| match orientation {
+                Orientation::Horizontal => min_size.width,
+                Orientation::Vertical => min_size.height,
+            });
+        }
+
+        let children: Vec<NodeId> = node.children(map).collect();
+        if children.is_empty() {
+            return 0.0;
+        }
+        let extents: Vec<f64> = children
+            .iter()
+            .map(|&child| self.min_extent(map, window, config, child, orientation))
+            .collect();
+        let child_max = extents.iter().copied().fold(0.0, f64::max);
+
+        use ContainerKind::*;
+        let info = &self.info[node];
+        match info.kind {
+            // The indicator bar takes space perpendicular to the container's
+            // orientation; along it, the children share the same extent.
+            Tabbed | Stacked if info.kind.orientation() != orientation => {
+                if config.settings.group_bars.enable {
+                    child_max + config.settings.group_bars.thickness
+                } else {
+                    child_max
+                }
+            }
+            Horizontal | Vertical if info.kind.orientation() == orientation => {
+                let gaps = config.settings.inner_gap * (children.len() as f64 - 1.0);
+                extents.iter().sum::<f64>() + gaps
+            }
+            _ => child_max,
+        }
+    }
+
     pub(super) fn get_sizes_and_groups(
         &self,
         map: &NodeMap,
@@ -513,7 +567,15 @@ impl<'a, 'out> Visitor<'a, 'out> {
                         min_size: if self.is_scroll {
                             super::scroll_constraints::MIN_WINDOW_SIZE
                         } else {
-                            1.0
+                            self.size
+                                .min_extent(
+                                    self.map,
+                                    self.window,
+                                    self.config,
+                                    child,
+                                    Orientation::Horizontal,
+                                )
+                                .max(1.0)
                         },
                         max_size: aspect_max_width,
                         fixed_size: None,
@@ -561,7 +623,15 @@ impl<'a, 'out> Visitor<'a, 'out> {
                         min_size: if self.is_scroll {
                             super::scroll_constraints::MIN_WINDOW_SIZE
                         } else {
-                            1.0
+                            self.size
+                                .min_extent(
+                                    self.map,
+                                    self.window,
+                                    self.config,
+                                    child,
+                                    Orientation::Vertical,
+                                )
+                                .max(1.0)
                         },
                         max_size: None,
                         fixed_size: None,
@@ -999,5 +1069,148 @@ mod tests {
             rect(10, 10, 980, 980),
             "window1 fullscreen with outer_gap"
         );
+    }
+
+    #[test]
+    fn it_gives_a_constrained_window_its_minimum_size() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let w1 = WindowId::new(1, 1);
+        let w2 = WindowId::new(1, 2);
+        let w3 = WindowId::new(1, 3);
+        tree.add_window_under(layout, root, w1);
+        tree.add_window_under(layout, root, w2);
+        tree.add_window_under(layout, root, w3);
+        tree.note_window_min_size(w2, CGSize::new(700.0, 0.0));
+
+        let screen = rect(0, 0, 1450, 1000);
+        let (mut frames, _) = tree.calculate_layout_and_groups(layout, screen, &Config::default());
+        frames.sort_by_key(|&(wid, _)| wid);
+        assert_eq!(
+            frames,
+            vec![
+                (w1, rect(0, 0, 375, 1000)),
+                (w2, rect(375, 0, 700, 1000)),
+                (w3, rect(1075, 0, 375, 1000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn it_propagates_minimums_out_of_nested_containers() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let w1 = WindowId::new(1, 1);
+        let w2 = WindowId::new(1, 2);
+        let w3 = WindowId::new(1, 3);
+        let nested = tree.add_container(root, ContainerKind::Horizontal);
+        tree.add_window_under(layout, nested, w1);
+        tree.add_window_under(layout, nested, w2);
+        tree.add_window_under(layout, root, w3);
+        tree.note_window_min_size(w1, CGSize::new(200.0, 0.0));
+        tree.note_window_min_size(w2, CGSize::new(300.0, 0.0));
+
+        let screen = rect(0, 0, 600, 1000);
+        let (mut frames, _) = tree.calculate_layout_and_groups(layout, screen, &Config::default());
+        frames.sort_by_key(|&(wid, _)| wid);
+        assert_eq!(
+            frames,
+            vec![
+                (w1, rect(0, 0, 200, 1000)),
+                (w2, rect(200, 0, 300, 1000)),
+                (w3, rect(500, 0, 100, 1000)),
+            ]
+        );
+    }
+
+    /// When even the minimums don't fit, the frames overlap instead of every
+    /// window being squeezed below its minimum. Keeping the frames on screen
+    /// is the caller's job.
+    #[test]
+    fn it_overlaps_constrained_windows_when_space_runs_out() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let w1 = WindowId::new(1, 1);
+        let w2 = WindowId::new(1, 2);
+        tree.add_window_under(layout, root, w1);
+        tree.add_window_under(layout, root, w2);
+        tree.note_window_min_size(w1, CGSize::new(700.0, 0.0));
+        tree.note_window_min_size(w2, CGSize::new(700.0, 0.0));
+
+        let screen = rect(0, 0, 1000, 1000);
+        let (mut frames, _) = tree.calculate_layout_and_groups(layout, screen, &Config::default());
+        frames.sort_by_key(|&(wid, _)| wid);
+        assert_eq!(
+            frames,
+            vec![(w1, rect(0, 0, 700, 1000)), (w2, rect(700, 0, 700, 1000)),]
+        );
+    }
+
+    /// A window without a constraint keeps its proportional share even when a
+    /// neighbor's minimum doesn't fit.
+    #[test]
+    fn it_keeps_a_share_for_unconstrained_windows_when_space_runs_out() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let w1 = WindowId::new(1, 1);
+        let w2 = WindowId::new(1, 2);
+        let w3 = WindowId::new(1, 3);
+        tree.add_window_under(layout, root, w1);
+        tree.add_window_under(layout, root, w2);
+        tree.add_window_under(layout, root, w3);
+        tree.note_window_min_size(w1, CGSize::new(700.0, 0.0));
+        tree.note_window_min_size(w2, CGSize::new(700.0, 0.0));
+
+        let screen = rect(0, 0, 1000, 1000);
+        let (mut frames, _) = tree.calculate_layout_and_groups(layout, screen, &Config::default());
+        frames.sort_by_key(|&(wid, _)| wid);
+        assert_eq!(
+            frames,
+            vec![
+                (w1, rect(0, 0, 700, 1000)),
+                (w2, rect(700, 0, 700, 1000)),
+                (w3, rect(1400, 0, 333, 1000)),
+            ]
+        );
+    }
+
+    /// A grouped window's minimum includes the indicator bar's thickness, and
+    /// the minimum of a nested container reaches its parent.
+    #[test]
+    fn it_includes_group_bars_in_a_grouped_windows_minimum() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let root = tree.root(layout);
+        let w1 = WindowId::new(1, 1);
+        let w2 = WindowId::new(1, 2);
+        // A vertical root so the tabbed group's height is constrained by its
+        // own minimum rather than the screen.
+        tree.set_container_kind(root, ContainerKind::Vertical);
+        let group = tree.add_container(root, ContainerKind::Tabbed);
+        tree.add_window_under(layout, group, w1);
+        tree.add_window_under(layout, group, w2);
+        tree.note_window_min_size(w1, CGSize::new(0.0, 300.0));
+        tree.note_window_min_size(w2, CGSize::new(0.0, 250.0));
+
+        let mut config = Config::default();
+        config.settings.group_bars.enable = true;
+        config.settings.group_bars.thickness = 20.0;
+
+        // The group needs 300 for its tallest child plus 20 for the bar, so a
+        // 300 point screen can't fit it.
+        let screen = rect(0, 0, 1000, 300);
+        let (frames, _) = tree.calculate_layout_and_groups(layout, screen, &config);
+        let group_frame = frames.iter().find(|(wid, _)| *wid == w1).unwrap().1;
+        assert_eq!(group_frame, rect(0, 20, 1000, 300));
+
+        // With room to spare the group keeps its weight-based share.
+        let screen = rect(0, 0, 1000, 800);
+        let (frames, _) = tree.calculate_layout_and_groups(layout, screen, &config);
+        let group_frame = frames.iter().find(|(wid, _)| *wid == w1).unwrap().1;
+        assert_eq!(group_frame, rect(0, 20, 1000, 780));
     }
 }
