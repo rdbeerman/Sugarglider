@@ -26,18 +26,22 @@ pub(crate) fn solve_sizes(windows: &[WindowInput], available: f64, gap: f64) -> 
 
     let total_min: f64 = windows.iter().map(|w| w.min_size).sum();
     if usable <= 0.0 || usable < total_min {
+        // There isn't enough room for every window's minimum. Windows that
+        // need more than their share keep their minimum, and the rest keep
+        // their proportional share, so no window is squeezed below what its
+        // app accepts. The caller places the frames and keeps them on screen,
+        // letting them overlap.
         let weights: Vec<f64> = windows.iter().map(|w| w.weight.max(0.1)).collect();
         let total_weight: f64 = weights.iter().sum();
         return windows
             .iter()
             .enumerate()
-            .map(|(i, _w)| {
-                let size = if total_weight > 0.0 {
-                    (usable.max(0.0) * weights[i] / total_weight).max(1.0)
-                } else {
-                    1.0
-                };
-                WindowOutput { size, was_constrained: true }
+            .map(|(i, w)| {
+                let share = usable.max(0.0) * weights[i] / total_weight;
+                WindowOutput {
+                    size: share.max(w.min_size).max(1.0),
+                    was_constrained: true,
+                }
             })
             .collect();
     }
@@ -95,6 +99,9 @@ pub(crate) fn solve_sizes(windows: &[WindowInput], available: f64, gap: f64) -> 
     let mut max_fixed = vec![false; count];
     for (i, w) in windows.iter().enumerate() {
         if let Some(max) = w.max_size {
+            // A max below the window's minimum can't be met; the minimum wins
+            // since the app would refuse the smaller size anyway.
+            let max = max.max(w.min_size);
             if sizes[i] > max {
                 excess += sizes[i] - max;
                 sizes[i] = max;
@@ -183,6 +190,38 @@ mod tests {
         let inputs = vec![input(1.0), input(100.0)];
         let result = solve_sizes(&inputs, 160.0, 10.0);
         assert!(result[0].size >= MIN_WINDOW_SIZE);
+    }
+
+    /// The window with a large minimum takes its space from the others
+    /// instead of being shrunk below what the app will accept.
+    #[test]
+    fn minimum_constraint_redistributes_to_other_windows() {
+        let inputs = vec![
+            input(1.0),
+            WindowInput {
+                weight: 1.0,
+                min_size: 700.0,
+                max_size: None,
+                fixed_size: None,
+            },
+            input(1.0),
+        ];
+        let result = solve_sizes(&inputs, 1450.0, 0.0);
+        assert!((result[1].size - 700.0).abs() < 0.01);
+        assert!((result[0].size - 375.0).abs() < 0.01);
+        assert!((result[2].size - 375.0).abs() < 0.01);
+    }
+
+    /// When even the minimums don't fit, keep them and let the frames overlap
+    /// rather than shrinking every window below its minimum.
+    #[test]
+    fn minimums_are_kept_when_space_runs_out() {
+        let inputs = vec![input(1.0), input(1.0), input(1.0)];
+        let result = solve_sizes(&inputs, 100.0, 10.0);
+        for r in &result {
+            assert!((r.size - MIN_WINDOW_SIZE).abs() < 0.01);
+            assert!(r.was_constrained);
+        }
     }
 
     #[test]

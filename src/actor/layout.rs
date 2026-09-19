@@ -1646,6 +1646,28 @@ impl LayoutManager {
         }
         (sizes, groups)
     }
+
+    /// The smallest size observed for the window, if any constraint is known.
+    pub fn window_min_size(&self, wid: WindowId) -> Option<CGSize> {
+        self.tree.window_min_size(wid)
+    }
+
+    /// Records a lower bound on the window's size, merging per axis.
+    pub fn note_window_min_size(&mut self, wid: WindowId, min_size: CGSize) {
+        self.tree.note_window_min_size(wid, min_size);
+    }
+
+    /// Lowers the recorded minimum for the window to at most `size` per axis.
+    pub fn relax_window_min_size(&mut self, wid: WindowId, size: CGSize) {
+        self.tree.relax_window_min_size(wid, size);
+    }
+
+    /// Whether the space's active layout places windows by scrolling, in which
+    /// case some windows are intentionally off screen.
+    pub fn is_scroll_space(&self, space: SpaceId) -> bool {
+        self.scroll_enabled
+            && self.try_layout(space).is_some_and(|layout| self.tree.is_scroll_layout(layout))
+    }
 }
 
 impl LayoutManager {

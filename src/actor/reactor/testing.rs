@@ -97,11 +97,22 @@ pub struct Apps {
     pub windows: BTreeMap<WindowId, WindowState>,
 }
 
+/// Sizes the window as the simulated app would accept it.
+fn clamp_to_min_size(mut frame: CGRect, min_size: Option<CGSize>) -> CGRect {
+    if let Some(min_size) = min_size {
+        frame.size.width = frame.size.width.max(min_size.width);
+        frame.size.height = frame.size.height.max(min_size.height);
+    }
+    frame
+}
+
 #[derive(Default, PartialEq, Debug, Clone)]
 pub struct WindowState {
     pub last_seen_txid: TransactionId,
     pub animating: bool,
     pub frame: CGRect,
+    /// Smallest size this simulated app will accept, if constrained.
+    pub min_size: Option<CGSize>,
 }
 
 impl Apps {
@@ -242,6 +253,7 @@ impl Apps {
                     let window = self.windows.entry(wid).or_default();
                     window.last_seen_txid = txid;
                     let old_frame = window.frame;
+                    let frame = clamp_to_min_size(frame, window.min_size);
                     window.frame = frame;
                     if !window.animating && !old_frame.same_as(frame) {
                         events.push(Event::WindowFrameChanged(
@@ -258,7 +270,7 @@ impl Apps {
                     window.last_seen_txid = txid;
                     let old_frame = window.frame;
                     if set_size {
-                        window.frame = frame;
+                        window.frame = clamp_to_min_size(frame, window.min_size);
                     } else {
                         window.frame.origin = frame.origin;
                     }

@@ -3,7 +3,7 @@
 
 use std::{collections::HashSet, iter, mem};
 
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CGRect, CGSize};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -373,6 +373,21 @@ impl LayoutTree {
 
     pub fn window_at(&self, node: NodeId) -> Option<WindowId> {
         self.tree.data.window.at(node)
+    }
+
+    /// The smallest size observed for the window, if any constraint is known.
+    pub fn window_min_size(&self, wid: WindowId) -> Option<CGSize> {
+        self.tree.data.window.min_size(wid)
+    }
+
+    /// Records a lower bound on the window's size, merging per axis.
+    pub fn note_window_min_size(&mut self, wid: WindowId, min_size: CGSize) {
+        self.tree.data.window.note_min_size(wid, min_size);
+    }
+
+    /// Lowers the recorded minimum for the window to at most `size` per axis.
+    pub fn relax_window_min_size(&mut self, wid: WindowId, size: CGSize) {
+        self.tree.data.window.relax_min_size(wid, size);
     }
 
     #[allow(dead_code)]
