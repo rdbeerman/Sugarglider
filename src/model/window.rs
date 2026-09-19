@@ -5,11 +5,12 @@ use std::collections::BTreeMap;
 
 use accessibility_sys::pid_t;
 use itertools::Itertools;
+use objc2_core_foundation::CGSize;
 use serde::{Deserialize, Serialize};
 
 use super::tree::{NodeId, NodeMap};
 use crate::actor::app::WindowId;
-use crate::collections::BTreeExt;
+use crate::collections::{BTreeExt, HashMap};
 use crate::model::layout_tree::{LayoutId, TreeEvent};
 
 /// Maintains a two-way mapping between leaf nodes and window ids.
@@ -23,11 +24,39 @@ pub struct Window {
     windows: slotmap::SecondaryMap<NodeId, WindowId>,
     #[serde(deserialize_with = "deserialize_window_nodes")]
     window_nodes: BTreeMap<WindowId, Vec<NodeId>>,
+    /// Lower bound on each window's size, learned from frames the app
+    /// refused to shrink below. An axis with no observation is zero.
+    #[serde(skip)]
+    min_sizes: HashMap<WindowId, CGSize>,
 }
 
 impl Window {
     pub fn at(&self, node: NodeId) -> Option<WindowId> {
         self.windows.get(node).copied()
+    }
+
+    /// The smallest size observed for `wid`, if it has ever been constrained.
+    pub fn min_size(&self, wid: WindowId) -> Option<CGSize> {
+        self.min_sizes.get(&wid).copied()
+    }
+
+    /// Records a lower bound on the window's size, merging per axis.
+    pub fn note_min_size(&mut self, wid: WindowId, min_size: CGSize) {
+        let entry = self.min_sizes.entry(wid).or_insert(CGSize::new(0.0, 0.0));
+        entry.width = entry.width.max(min_size.width);
+        entry.height = entry.height.max(min_size.height);
+    }
+
+    /// Lowers the recorded minimum for `wid` to at most `size` on each axis.
+    ///
+    /// The app accepted a frame this size, so its minimum cannot be larger.
+    /// Only a previously recorded value is affected.
+    pub fn relax_min_size(&mut self, wid: WindowId, size: CGSize) {
+        let Some(entry) = self.min_sizes.get_mut(&wid) else {
+            return;
+        };
+        entry.width = entry.width.min(size.width);
+        entry.height = entry.height.min(size.height);
     }
 
     /// Returns every node mapped to `wid`, across all layouts.
@@ -80,6 +109,7 @@ impl Window {
     }
 
     pub(super) fn take_nodes_for(&mut self, wid: WindowId) -> impl Iterator<Item = NodeId> + use<> {
+        self.min_sizes.remove(&wid);
         self.window_nodes.remove(&wid).unwrap_or_default().into_iter()
     }
 
@@ -88,6 +118,9 @@ impl Window {
         pid: pid_t,
     ) -> impl Iterator<Item = (WindowId, NodeId)> + use<> {
         let removed = self.window_nodes.remove_all_for_pid(pid);
+        for wid in removed.keys() {
+            self.min_sizes.remove(wid);
+        }
         removed
             .into_iter()
             .flat_map(|(wid, nodes)| nodes.into_iter().map(move |node| (wid, node)))
@@ -115,6 +148,7 @@ impl Window {
                         nodes.retain(|&n| n != node);
                         if nodes.is_empty() {
                             self.window_nodes.remove(&wid);
+                            self.min_sizes.remove(&wid);
                         }
                     }
                 }
