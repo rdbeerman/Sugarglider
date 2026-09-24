@@ -281,6 +281,11 @@ pub struct Reactor {
     debug_drop_zones_visible: bool,
     /// Whether all apps have been registered at startup.
     startup_complete: bool,
+    /// Windows that accessibility reported as closed but the window server might
+    /// still show as visible. These are excluded from the layout even if the
+    /// window server reports them. This handles Cmd+W closing where the window
+    /// is hidden rather than destroyed.
+    hidden_windows: HashSet<WindowServerId>,
 }
 
 /// How many times in a row we write the same frame to a window before giving
@@ -477,6 +482,7 @@ impl Reactor {
             group_indicators_tx: group_indicators_tx,
             debug_drop_zones_visible: false,
             startup_complete: false,
+            hidden_windows: HashSet::default(),
         }
     }
 
@@ -499,6 +505,13 @@ impl Reactor {
         let tick_interval = Duration::from_secs_f64(1.0 / 120.0);
         let mut tick_timer = Timer::manual();
 
+        // Periodic timer to refresh visible windows. This catches windows that
+        // are closed without sending proper notifications (e.g., Cmd+W in some
+        // apps). We poll every 2 seconds as a fallback.
+        let visibility_refresh_interval = Duration::from_secs(2);
+        let mut visibility_timer = Timer::manual();
+        visibility_timer.set_next_fire(visibility_refresh_interval);
+
         loop {
             let animating = self.layout.has_active_scroll_animation();
             tokio::select! {
@@ -517,6 +530,11 @@ impl Reactor {
                     if self.layout.has_active_scroll_animation() {
                         tick_timer.set_next_fire(tick_interval);
                     }
+                }
+                _ = visibility_timer.next() => {
+                    // Periodically refresh visible windows to detect closed windows.
+                    self.update_visible_windows();
+                    visibility_timer.set_next_fire(visibility_refresh_interval);
                 }
             }
         }
@@ -572,9 +590,16 @@ impl Reactor {
             Event::ApplicationActivated(..)
             | Event::ApplicationDeactivated(..)
             | Event::ApplicationGloballyActivated(..)
-            | Event::ApplicationGloballyDeactivated(..)
-            | Event::ApplicationMainWindowChanged(..) => {
+            | Event::ApplicationGloballyDeactivated(..) => {
                 // Handled by MainWindowTracker.
+            }
+            Event::ApplicationMainWindowChanged(pid, ..) => {
+                // Handled by MainWindowTracker.
+                // Also refresh visible windows for this app, as the main window
+                // change may have happened because the previous window was closed.
+                if let Some(app) = self.apps.get(&pid) {
+                    _ = app.handle.send(Request::GetVisibleWindows);
+                }
             }
             Event::WindowsDiscovered { pid, new, known_visible } => {
                 self.on_windows_discovered(pid, new, known_visible);
@@ -594,7 +619,12 @@ impl Reactor {
                 }
             }
             Event::WindowsOnScreenUpdated { pid, on_screen } => match pid {
-                Some(_) => self.update_partial_window_server_info(on_screen),
+                Some(pid) => {
+                    self.update_partial_window_server_info(on_screen);
+                    // Notify the layout manager about visibility changes (e.g.,
+                    // when a window is minimized or unminimized).
+                    self.send_visible_windows_to_layout(pid);
+                }
                 None => self.update_complete_window_server_info(on_screen),
             },
             Event::WindowBecameVisible(wid) => {
@@ -611,6 +641,15 @@ impl Reactor {
                 self.layout.cancel_interactive_state();
                 self.in_drag = false;
                 self.resizing_window = None;
+                // Clean up hidden_windows tracking for this window.
+                if let Some(wsid) = self
+                    .window_ids
+                    .iter()
+                    .find(|(_, w)| **w == wid)
+                    .map(|(wsid, _)| *wsid)
+                {
+                    self.hidden_windows.remove(&wsid);
+                }
                 if self.windows.remove(&wid).is_none() {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
@@ -1238,7 +1277,15 @@ impl Reactor {
         // windows, even for partial (per-app) updates. Replace rather than
         // extend to avoid accumulating stale entries.
         self.visible_windows.clear();
-        self.visible_windows.extend(on_screen.visible);
+        // Filter out windows that accessibility has reported as hidden (closed
+        // with Cmd+W). The window server might still show them as visible, but
+        // we should not include them in the layout.
+        self.visible_windows.extend(
+            on_screen
+                .visible
+                .into_iter()
+                .filter(|wsid| !self.hidden_windows.contains(wsid)),
+        );
         self.window_server_info
             .extend(on_screen.info.into_iter().map(|info| (info.id, info)));
     }
@@ -1272,7 +1319,7 @@ impl Reactor {
         &mut self,
         pid: pid_t,
         new: Vec<(WindowId, WindowInfo)>,
-        _known_visible: Vec<WindowId>,
+        known_visible: Vec<WindowId>,
     ) {
         // Note that we rely on the window server info, not accessibility, to
         // tell us which windows are visible.
@@ -1288,11 +1335,47 @@ impl Reactor {
         // known to accesibility before adding them to the layout, but that is
         // not generally problematic.
         //
+        // HOWEVER, if accessibility reports at least one window for an app
+        // (ruling out the login screen case), we can trust it to tell us which
+        // windows are closed. This handles Cmd+W window closing where the
+        // window server might still report the window briefly.
+        //
         // TODO: Notice when returning from the login screen and ask again for
         // undiscovered windows.
         self.window_ids
             .extend(new.iter().flat_map(|(wid, info)| info.sys_id.map(|wsid| (wsid, *wid))));
         self.windows.extend(new.into_iter().map(|(wid, info)| (wid, info.into())));
+
+        // If accessibility reports at least one window, use it to detect closed
+        // windows. Mark them as hidden so they stay out of the layout even if
+        // the window server reports them as visible later (e.g., on space change).
+        if !known_visible.is_empty() {
+            let known_set: HashSet<WindowId> = known_visible.into_iter().collect();
+            // Find window server IDs for this app's windows that are no longer
+            // in the accessibility list - these are "hidden" (closed with Cmd+W).
+            for (wsid, wid) in self.window_ids.iter() {
+                if wid.pid == pid {
+                    if known_set.contains(wid) {
+                        // Window is visible in accessibility - remove from hidden set
+                        // in case it was previously hidden and has now reappeared.
+                        self.hidden_windows.remove(wsid);
+                    } else {
+                        // Window is not visible in accessibility - mark as hidden.
+                        self.hidden_windows.insert(*wsid);
+                    }
+                }
+            }
+            // Remove hidden windows from visible_windows.
+            self.visible_windows.retain(|wsid| !self.hidden_windows.contains(wsid));
+        }
+
+        self.send_visible_windows_to_layout(pid);
+    }
+
+    /// Sends the current list of visible windows for the given app to the
+    /// layout manager. Called when windows are discovered or when visibility
+    /// changes (e.g., a window is minimized or unminimized).
+    fn send_visible_windows_to_layout(&mut self, pid: pid_t) {
         let mut app_windows: BTreeMap<SpaceId, Vec<(WindowId, LayoutWindowInfo)>> = BTreeMap::new();
         for wid in self
             .visible_windows

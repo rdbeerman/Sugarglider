@@ -391,6 +391,13 @@ impl LayoutTree {
         self.tree.data.window.relax_min_size(wid, size);
     }
 
+    /// Clears the recorded minimum size for the window.
+    ///
+    /// Called when a window is rearranged so it can adapt to its new layout.
+    pub fn clear_window_min_size(&mut self, wid: WindowId) {
+        self.tree.data.window.clear_min_size(wid);
+    }
+
     #[allow(dead_code)]
     pub fn add_container(&mut self, parent: NodeId, kind: ContainerKind) -> NodeId {
         let node = self.tree.mk_node().push_back(parent);

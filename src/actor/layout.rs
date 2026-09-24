@@ -2334,8 +2334,18 @@ impl LayoutManager {
         }
 
         let layout = self.layout(space);
+
+        // Clear min_sizes for rearranged windows so they can adapt to their
+        // new layout context without being constrained by stale size limits.
+        if let Some(source_wid) = self.tree.window_at(source_node) {
+            self.tree.clear_window_min_size(source_wid);
+        }
+
         match action {
             DropAction::Swap { target_node } => {
+                if let Some(target_wid) = self.tree.window_at(target_node) {
+                    self.tree.clear_window_min_size(target_wid);
+                }
                 self.tree.swap_windows(source_node, target_node);
             }
             DropAction::Insert { target_node, before } => {
@@ -2346,6 +2356,11 @@ impl LayoutManager {
                 }
             }
             DropAction::Split { target_node, orientation } => {
+                // Clear the target window's min_size too since both windows
+                // are now in a new container and should adapt.
+                if let Some(target_wid) = self.tree.window_at(target_node) {
+                    self.tree.clear_window_min_size(target_wid);
+                }
                 // Create container around target, then insert source
                 self.tree.nest_in_container(layout, target_node, orientation);
                 self.tree.move_node_after(target_node, source_node);
