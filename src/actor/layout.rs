@@ -173,6 +173,8 @@ pub struct EventResponse {
     pub focus_window: Option<WindowId>,
     /// One-shot UI feedback for a size share command, if any.
     pub size_share_feedback: Option<SizeShareFeedback>,
+    /// Whether the focused window is floating. Used to update the status bar menu.
+    pub focused_window_floating: Option<bool>,
 }
 
 impl EventResponse {
@@ -180,6 +182,7 @@ impl EventResponse {
         self.frame_overrides.extend(other.frame_overrides);
         self.raise_windows.extend(other.raise_windows);
         self.size_share_feedback = self.size_share_feedback.or(other.size_share_feedback);
+        self.focused_window_floating = other.focused_window_floating.or(self.focused_window_floating);
         match (self.focus_window, other.focus_window) {
             (Some(focus_window), Some(other_focus)) => {
                 self.focus_window = Some(focus_window);
@@ -936,7 +939,8 @@ impl LayoutManager {
             }
             LayoutEvent::WindowFocused(spaces, wid) => {
                 self.focused_window = Some(wid);
-                if self.floating_windows.contains(&wid) {
+                let is_floating = self.floating_windows.contains(&wid);
+                if is_floating {
                     self.last_floating_focus = Some(wid);
                 } else {
                     for space in &spaces {
@@ -949,6 +953,10 @@ impl LayoutManager {
                         }
                     }
                 }
+                return EventResponse {
+                    focused_window_floating: Some(is_floating),
+                    ..Default::default()
+                };
             }
             LayoutEvent::WindowResized {
                 wid,
@@ -1062,6 +1070,10 @@ impl LayoutManager {
             if is_floating {
                 self.remove_floating_window(wid, space);
                 self.last_floating_focus = None;
+                return EventResponse {
+                    focused_window_floating: Some(false),
+                    ..Default::default()
+                };
             } else {
                 self.add_floating_window(wid, space);
                 self.tree.remove_window(wid);
@@ -1072,10 +1084,10 @@ impl LayoutManager {
                         .get(&wid)
                         .map(|restore| vec![(wid, restore.frame)])
                         .unwrap_or_default(),
+                    focused_window_floating: Some(true),
                     ..Default::default()
                 };
             }
-            return EventResponse::default();
         }
 
         let Some(space) = space else {
@@ -1103,6 +1115,8 @@ impl LayoutManager {
                     frame_overrides: vec![],
                     raise_windows,
                     focus_window,
+                    // Focusing a tiled window means the focused window is no longer floating.
+                    focused_window_floating: Some(false),
                     ..Default::default()
                 };
             } else {
@@ -1118,6 +1132,8 @@ impl LayoutManager {
                     frame_overrides: vec![],
                     raise_windows,
                     focus_window,
+                    // Focusing a floating window means the focused window is now floating.
+                    focused_window_floating: Some(true),
                     ..Default::default()
                 };
             }

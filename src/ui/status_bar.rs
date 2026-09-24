@@ -94,6 +94,7 @@ pub struct StatusIcon {
     _menu_handler: Retained<MenuHandler>,
     toggle_item: Retained<NSMenuItem>,
     space_toggle_item: Retained<NSMenuItem>,
+    float_window_item: Retained<NSMenuItem>,
     /// Animation frames for the tail swing animation (frame 0 = rest, 1 = right, 2 = left).
     animation_frames: Vec<Retained<NSImage>>,
 }
@@ -250,6 +251,7 @@ impl StatusIcon {
             _menu_handler: menu_handler,
             toggle_item,
             space_toggle_item,
+            float_window_item,
             animation_frames,
         }
     }
@@ -279,6 +281,16 @@ impl StatusIcon {
     /// Sets whether the space toggle menu item is enabled.
     pub fn set_space_toggle_enabled(&mut self, enabled: bool) {
         self.space_toggle_item.setEnabled(enabled);
+    }
+
+    /// Sets the float window menu item title based on whether the focused window is floating.
+    pub fn set_float_window_title(&mut self, is_floating: bool) {
+        let ns_title = NSString::from_str(if is_floating {
+            "Unfloat Window"
+        } else {
+            "Float Window"
+        });
+        self.float_window_item.setTitle(&ns_title);
     }
 
     /// Sets the icon to the specified animation frame.

@@ -1423,9 +1423,16 @@ impl Reactor {
             frame_overrides,
             raise_windows,
             focus_window,
+            focused_window_floating,
             ..
         } = response;
         self.pending_frame_overrides.extend(frame_overrides);
+
+        if let Some(is_floating) = focused_window_floating {
+            if let Some(status_tx) = &self.status_tx {
+                status_tx.send(status::Event::FocusedWindowFloatingChanged(is_floating));
+            }
+        }
         if raise_windows.is_empty() && focus_window.is_none() {
             return;
         }

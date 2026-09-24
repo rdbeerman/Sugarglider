@@ -33,6 +33,8 @@ pub enum Event {
     FocusedScreenChanged,
     GlobalEnabledChanged(bool),
     SpaceEnabledChanged(bool),
+    /// The focused window's floating state changed.
+    FocusedWindowFloatingChanged(bool),
     ConfigUpdated(Arc<Config>),
     /// Trigger the tail swing animation (e.g., after clean up space).
     Animate,
@@ -164,6 +166,9 @@ impl Status {
             Event::SpaceChanged(_) | Event::FocusedScreenChanged => self.update_space(),
             Event::GlobalEnabledChanged(enabled) => self.update_toggle_title(enabled),
             Event::SpaceEnabledChanged(enabled) => self.update_space_toggle_title(enabled),
+            Event::FocusedWindowFloatingChanged(is_floating) => {
+                self.update_float_window_title(is_floating)
+            }
             Event::ConfigUpdated(config) => {
                 if self.config.settings.experimental.status_icon
                     != config.settings.experimental.status_icon
@@ -209,6 +214,11 @@ impl Status {
     fn update_space_toggle_title(&mut self, enabled: bool) {
         let Some(icon) = &mut self.icon else { return };
         icon.set_space_toggle_title(if enabled { "Stop Space" } else { "Start Space" });
+    }
+
+    fn update_float_window_title(&mut self, is_floating: bool) {
+        let Some(icon) = &mut self.icon else { return };
+        icon.set_float_window_title(is_floating);
     }
 
     /// Starts the tail swing animation.
