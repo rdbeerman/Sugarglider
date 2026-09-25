@@ -19,16 +19,18 @@ use livesplit_hotkey::{ConsumePreference, Modifiers};
 use objc2_app_kit::{
     NSRunningApplication, NSScreen, NSWindow, NSWindowNumberListOptions, NSWorkspace,
 };
-use objc2_core_foundation::CFRetained;
+use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGDisplayBounds, CGMainDisplayID, CGWindowID, CGWindowListCopyWindowInfo, CGWindowListOption,
     kCGNullWindowID,
 };
 use objc2_foundation::{MainThreadMarker, NSString};
 use sugarglider::actor::{self, reactor};
+use sugarglider::model::parking_origin;
 use sugarglider::sys::app::{AXUIElementExt, AppInfo, NSRunningApplicationExt, WindowInfo};
 use sugarglider::sys::event::{self, get_mouse_pos};
 use sugarglider::sys::executor::Executor;
+use sugarglider::sys::geometry::{CGRectExt, SameAs};
 use sugarglider::sys::screen::{self, ScreenCache};
 use sugarglider::sys::window_server::{
     self, SkylightConnection, WindowServerId, get_window, kCGSWindowCreated,
@@ -71,6 +73,26 @@ enum Command {
         /// Sampling interval in milliseconds.
         #[arg(long, default_value_t = 200)]
         interval_ms: u64,
+    },
+    /// Park a window in a corner of its screen with 1 point left on screen.
+    /// Prints a set-frame command that puts it back.
+    #[command()]
+    Park {
+        pid: pid_t,
+        window_server_id: CGWindowID,
+    },
+    /// Write a frame to a window, in the top-left coordinates that `list ax`
+    /// prints.
+    #[command()]
+    SetFrame {
+        pid: pid_t,
+        window_server_id: CGWindowID,
+        #[arg(allow_negative_numbers = true)]
+        x: f64,
+        #[arg(allow_negative_numbers = true)]
+        y: f64,
+        width: f64,
+        height: f64,
     },
 }
 
@@ -229,16 +251,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Spaces: {:?}", sc.get_screen_spaces());
         }
         Command::App(App::SetMainWindow { pid, window_server_id, wait }) => {
-            let app = AXUIElement::application(pid);
-            let windows = app.windows()?;
-            let window = windows
-                .iter()
-                .filter(|w| {
-                    let id: Result<window_server::WindowServerId, _> = (&**w).try_into();
-                    id.is_ok_and(|id| id.as_u32() == window_server_id)
-                })
-                .next()
-                .context("Could not find matching window")?;
+            let window = find_window(pid, window_server_id)?;
             if wait {
                 println!("Press enter to complete action");
                 std::io::stdin().read_line(&mut String::new())?;
@@ -347,8 +360,104 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Inspect => inspect(MainThreadMarker::new().unwrap()),
         Command::Focus { interval_ms } => watch_focus(Duration::from_millis(interval_ms)),
+        Command::Park { pid, window_server_id } => {
+            park(pid, window_server_id, MainThreadMarker::new().unwrap())?
+        }
+        Command::SetFrame {
+            pid,
+            window_server_id,
+            x,
+            y,
+            width,
+            height,
+        } => {
+            let window = find_window(pid, window_server_id)?;
+            let frame = CGRect::new(CGPoint::new(x, y), CGSize::new(width, height));
+            write_frame(pid, &window, frame)?;
+        }
     }
     Ok(())
+}
+
+fn find_window(
+    pid: pid_t,
+    window_server_id: CGWindowID,
+) -> anyhow::Result<CFRetained<AXUIElement>> {
+    let app = AXUIElement::application(pid);
+    let windows = app.windows()?;
+    let window = windows
+        .iter()
+        .filter(|w| {
+            let id: Result<window_server::WindowServerId, _> = (&**w).try_into();
+            id.is_ok_and(|id| id.as_u32() == window_server_id)
+        })
+        .next()
+        .context("Could not find matching window")?;
+    Ok(window.clone())
+}
+
+fn park(pid: pid_t, window_server_id: CGWindowID, mtm: MainThreadMarker) -> anyhow::Result<()> {
+    let window = find_window(pid, window_server_id)?;
+    let frame = window.frame()?;
+    println!("Current frame is {frame:?}. To put the window back, run:");
+    let devtool = std::env::args().next().unwrap_or_else(|| "devtool".to_string());
+    println!(
+        "  {devtool} set-frame {pid} {window_server_id} {} {} {} {}",
+        frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+    );
+
+    let (screens, _) = ScreenCache::new()
+        .update_screen_config(screen::get_ns_screens(mtm))
+        .context("Could not read the screen configuration")?;
+    let screens: Vec<CGRect> = screens.iter().map(|screen| screen.visible_frame).collect();
+    let screen = best_screen_for_window(&screens, &frame).context("Window is on no screen")?;
+    let origin = parking_origin(frame.size, &screens, screen);
+    let parked = CGRect { origin, size: frame.size };
+    println!("Parking on screen {screen} {:?} at {parked:?}", screens[screen]);
+    write_frame(pid, &window, parked)
+}
+
+/// The screen the window overlaps the most, the way the reactor picks it.
+fn best_screen_for_window(screens: &[CGRect], frame: &CGRect) -> Option<usize> {
+    screens
+        .iter()
+        .enumerate()
+        .map(|(idx, screen)| (idx, screen.intersection(frame).area()))
+        .filter(|&(_, area)| area > 0.0)
+        .max_by_key(|&(_, area)| area as i64)
+        .map(|(idx, _)| idx)
+        .or_else(|| screens.iter().position(|screen| screen.contains(frame.mid())))
+}
+
+/// Writes a frame the way the app actor handles `SetWindowFrame`: with enhanced
+/// UI off, size then position, reading the frame back after each attempt.
+fn write_frame(pid: pid_t, window: &AXUIElement, frame: CGRect) -> anyhow::Result<()> {
+    const ATTEMPTS: usize = 3;
+    let app = AXUIElement::application(pid);
+    let enhanced = app.enhanced_user_interface().unwrap_or(false);
+    if enhanced {
+        _ = app.set_enhanced_user_interface(false);
+    }
+    let result = (|| -> anyhow::Result<()> {
+        for attempt in 1..=ATTEMPTS {
+            window.set_size(frame.size)?;
+            window.set_position(frame.origin)?;
+            let observed = window.frame()?;
+            println!("Attempt {attempt}: requested {frame:?}, observed {observed:?}");
+            if observed.same_as(frame) {
+                return Ok(());
+            }
+            if attempt < ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        println!("The window did not take the requested frame");
+        Ok(())
+    })();
+    if enhanced {
+        _ = app.set_enhanced_user_interface(true);
+    }
+    result
 }
 
 /// Subscribes to every window server notification event in a range and prints
@@ -809,4 +918,41 @@ async fn time<O, F: Future<Output = O>>(desc: &str, f: impl FnOnce() -> F) -> O 
     let end = Instant::now();
     println!("{desc} took {:?}", end - start);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Command, Opt};
+
+    #[test]
+    fn set_frame_accepts_negative_coordinates() {
+        let opt = Opt::try_parse_from([
+            "devtool",
+            "set-frame",
+            "123",
+            "456",
+            "-2999",
+            "-1.5",
+            "400",
+            "300",
+        ])
+        .unwrap();
+        let Command::SetFrame {
+            pid,
+            window_server_id,
+            x,
+            y,
+            width,
+            height,
+        } = opt.command
+        else {
+            panic!("parsed the wrong command");
+        };
+        assert_eq!(
+            (123, 456, -2999., -1.5, 400., 300.),
+            (pid, window_server_id, x, y, width, height)
+        );
+    }
 }
