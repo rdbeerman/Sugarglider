@@ -793,6 +793,119 @@ impl Contexts {
     }
 }
 
+/// The windows of a visible screen, for planning a switch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwitchScreen {
+    /// The screen's active context after the switch.
+    pub active: ContextKey,
+    /// The windows on the screen's Space, with the windows the user can't
+    /// see listed with `unseen_space` set or left out.
+    pub windows: Vec<SwitchWindow>,
+}
+
+/// A window on a visible screen, for planning a switch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwitchWindow {
+    pub wid: WindowId,
+    /// The named contexts that hold the window.
+    pub contexts: Vec<ContextId>,
+    pub pinned: bool,
+    pub minimized: bool,
+    /// The layout manager doesn't track the window.
+    pub untracked: bool,
+    /// The user hid the window's app.
+    pub app_hidden: bool,
+    /// The window is only on Spaces nobody can see.
+    pub unseen_space: bool,
+    pub parked: bool,
+    /// The window belongs to Sugarglider.
+    pub own: bool,
+    /// When the window last took focus, as a sequence number.
+    pub last_focus: Option<u64>,
+}
+
+impl SwitchWindow {
+    fn shows_under(&self, key: ContextKey) -> bool {
+        match key {
+            ContextKey::Everything => true,
+            _ if self.pinned => true,
+            ContextKey::Unsorted => self.contexts.is_empty(),
+            ContextKey::Named(id) => self.contexts.contains(&id),
+        }
+    }
+
+    /// Whether the user can see and use the window, and Sugarglider may move it.
+    fn in_play(&self) -> bool {
+        !(self.own || self.untracked || self.minimized || self.app_hidden || self.unseen_space)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwitchInput {
+    pub screens: Vec<SwitchScreen>,
+}
+
+/// What a switch does to windows. Windows keep the screen they're on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SwitchPlan {
+    /// Windows to park, which must be written to the journal first.
+    pub park: Vec<WindowId>,
+    /// Parked windows to put back.
+    pub unpark: Vec<WindowId>,
+    /// The window to focus with a quiet raise.
+    pub focus: Option<WindowId>,
+}
+
+/// Plans a switch: which windows to park, which to put back, and which to
+/// focus.
+///
+/// A window must show when it is a member of its screen's active context;
+/// under Everything every window must show. Windows that must show and are
+/// parked are put back. The others are parked, except Sugarglider's own
+/// windows, untracked and minimized windows, windows of hidden apps, and
+/// windows on Spaces nobody can see. Windows that are parked already stay
+/// parked. The focus goes to the most recently focused window that shows
+/// and that the user can see.
+pub fn plan_switch(input: &SwitchInput) -> SwitchPlan {
+    let mut plan = SwitchPlan::default();
+    let mut focus: Option<&SwitchWindow> = None;
+    for screen in &input.screens {
+        for window in &screen.windows {
+            if window.shows_under(screen.active) {
+                if window.parked {
+                    plan.unpark.push(window.wid);
+                }
+                if window.in_play() && focus.is_none_or(|f| window.last_focus > f.last_focus) {
+                    focus = Some(window);
+                }
+            } else if !window.parked && window.in_play() {
+                plan.park.push(window.wid);
+            }
+        }
+    }
+    plan.focus = focus.map(|w| w.wid);
+    plan
+}
+
+impl Contexts {
+    /// Describes a window's membership for [`plan_switch`]. The other fields
+    /// are left false for the caller to fill in.
+    pub fn switch_window(&self, wid: WindowId) -> SwitchWindow {
+        SwitchWindow {
+            wid,
+            contexts: self.contexts_of(wid),
+            pinned: self.is_pinned(wid),
+            minimized: false,
+            untracked: false,
+            app_hidden: false,
+            unseen_space: false,
+            parked: false,
+            own: false,
+            last_focus: self.last_focus(wid),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1576,5 +1689,311 @@ mod tests {
         );
         assert_eq!(members[1].link, RecordLink::Pending(other_app.wid));
         assert!(cx.pinned().is_empty());
+    }
+
+    fn member_of(wid: WindowId, contexts: &[ContextId]) -> SwitchWindow {
+        SwitchWindow {
+            wid,
+            contexts: contexts.to_vec(),
+            pinned: false,
+            minimized: false,
+            untracked: false,
+            app_hidden: false,
+            unseen_space: false,
+            parked: false,
+            own: false,
+            last_focus: None,
+        }
+    }
+
+    fn one_screen(active: ContextKey, windows: Vec<SwitchWindow>) -> SwitchInput {
+        SwitchInput {
+            screens: vec![SwitchScreen { active, windows }],
+        }
+    }
+
+    const A: ContextId = ContextId(1);
+    const B: ContextId = ContextId(2);
+
+    #[test]
+    fn r12_r15_switch_parks_exactly_the_windows_that_must_not_show() {
+        // One app has a window inside and a window outside the target.
+        let plan = plan_switch(&one_screen(
+            ContextKey::Named(A),
+            vec![
+                member_of(wid(1, 1), &[A]),
+                member_of(wid(1, 2), &[B]),
+                member_of(wid(2, 1), &[A, B]),
+                member_of(wid(3, 1), &[]),
+            ],
+        ));
+        assert_eq!(plan.park, vec![wid(1, 2), wid(3, 1)]);
+        assert_eq!(plan.unpark, vec![]);
+    }
+
+    #[test]
+    fn r12_parked_members_are_put_back() {
+        let plan = plan_switch(&one_screen(
+            ContextKey::Named(B),
+            vec![
+                SwitchWindow {
+                    parked: true,
+                    ..member_of(wid(1, 1), &[B])
+                },
+                SwitchWindow {
+                    parked: true,
+                    ..member_of(wid(1, 2), &[A])
+                },
+                member_of(wid(1, 3), &[A]),
+            ],
+        ));
+        assert_eq!(plan.unpark, vec![wid(1, 1)]);
+        assert_eq!(plan.park, vec![wid(1, 3)]);
+    }
+
+    #[test]
+    fn r12_focuses_the_most_recently_focused_member() {
+        let plan = plan_switch(&one_screen(
+            ContextKey::Named(A),
+            vec![
+                SwitchWindow {
+                    last_focus: Some(3),
+                    ..member_of(wid(1, 1), &[A])
+                },
+                SwitchWindow {
+                    last_focus: Some(9),
+                    ..member_of(wid(1, 2), &[B])
+                },
+                SwitchWindow {
+                    last_focus: Some(5),
+                    parked: true,
+                    ..member_of(wid(1, 3), &[A])
+                },
+                member_of(wid(1, 4), &[A]),
+            ],
+        ));
+        assert_eq!(plan.focus, Some(wid(1, 3)));
+    }
+
+    #[test]
+    fn r12_focus_never_lands_on_windows_the_user_cant_use() {
+        let windows = vec![
+            SwitchWindow {
+                last_focus: Some(1),
+                ..member_of(wid(1, 1), &[A])
+            },
+            SwitchWindow {
+                last_focus: Some(2),
+                own: true,
+                ..member_of(wid(1, 2), &[A])
+            },
+            SwitchWindow {
+                last_focus: Some(3),
+                untracked: true,
+                ..member_of(wid(1, 3), &[A])
+            },
+            SwitchWindow {
+                last_focus: Some(4),
+                minimized: true,
+                ..member_of(wid(1, 4), &[A])
+            },
+            SwitchWindow {
+                last_focus: Some(5),
+                app_hidden: true,
+                ..member_of(wid(1, 5), &[A])
+            },
+            SwitchWindow {
+                last_focus: Some(6),
+                unseen_space: true,
+                ..member_of(wid(1, 6), &[A])
+            },
+        ];
+        let plan = plan_switch(&one_screen(ContextKey::Named(A), windows));
+        assert_eq!(plan.focus, Some(wid(1, 1)));
+        let plan = plan_switch(&one_screen(
+            ContextKey::Named(A),
+            vec![member_of(wid(1, 2), &[B])],
+        ));
+        assert_eq!(plan.focus, None);
+    }
+
+    #[test]
+    fn r13_pinned_windows_show_under_every_context() {
+        let pinned = SwitchWindow {
+            pinned: true,
+            parked: true,
+            ..member_of(wid(1, 1), &[])
+        };
+        for active in [
+            ContextKey::Named(A),
+            ContextKey::Unsorted,
+            ContextKey::Everything,
+        ] {
+            let plan = plan_switch(&one_screen(active, vec![pinned.clone()]));
+            assert_eq!(plan.unpark, vec![wid(1, 1)]);
+            assert_eq!(plan.park, vec![]);
+        }
+    }
+
+    #[test]
+    fn r13_unsorted_shows_windows_in_no_context() {
+        let plan = plan_switch(&one_screen(
+            ContextKey::Unsorted,
+            vec![member_of(wid(1, 1), &[]), member_of(wid(1, 2), &[A])],
+        ));
+        assert_eq!(plan.park, vec![wid(1, 2)]);
+    }
+
+    #[test]
+    fn r14_never_parks_own_untracked_minimized_hidden_or_unseen_windows() {
+        let windows = vec![
+            SwitchWindow {
+                own: true,
+                ..member_of(wid(1, 1), &[])
+            },
+            SwitchWindow {
+                untracked: true,
+                ..member_of(wid(1, 2), &[])
+            },
+            SwitchWindow {
+                minimized: true,
+                ..member_of(wid(1, 3), &[])
+            },
+            SwitchWindow {
+                app_hidden: true,
+                ..member_of(wid(1, 4), &[])
+            },
+            SwitchWindow {
+                unseen_space: true,
+                ..member_of(wid(1, 5), &[])
+            },
+            member_of(wid(1, 6), &[]),
+        ];
+        let plan = plan_switch(&one_screen(ContextKey::Named(A), windows));
+        assert_eq!(plan.park, vec![wid(1, 6)]);
+    }
+
+    #[test]
+    fn r16_reapplying_the_active_context_parks_windows_that_drifted_in() {
+        let plan = plan_switch(&one_screen(
+            ContextKey::Named(A),
+            vec![
+                member_of(wid(1, 1), &[A]),
+                SwitchWindow {
+                    parked: true,
+                    ..member_of(wid(1, 2), &[B])
+                },
+                member_of(wid(1, 3), &[B]),
+            ],
+        ));
+        assert_eq!(plan.park, vec![wid(1, 3)]);
+        assert_eq!(plan.unpark, vec![]);
+    }
+
+    #[test]
+    fn r7_a_global_switch_changes_every_screen() {
+        let input = SwitchInput {
+            screens: vec![
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![member_of(wid(1, 1), &[A]), member_of(wid(1, 2), &[B])],
+                },
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![
+                        member_of(wid(2, 1), &[B]),
+                        SwitchWindow {
+                            parked: true,
+                            ..member_of(wid(2, 2), &[A])
+                        },
+                    ],
+                },
+            ],
+        };
+        let plan = plan_switch(&input);
+        assert_eq!(plan.park, vec![wid(1, 2), wid(2, 1)]);
+        assert_eq!(plan.unpark, vec![wid(2, 2)]);
+    }
+
+    #[test]
+    fn r10_the_active_context_applies_to_a_newly_visible_space() {
+        // The screen changed Space; the new Space's windows are planned
+        // against the same active context.
+        let plan = plan_switch(&one_screen(
+            ContextKey::Named(A),
+            vec![member_of(wid(4, 1), &[A]), member_of(wid(4, 2), &[])],
+        ));
+        assert_eq!(plan.park, vec![wid(4, 2)]);
+    }
+
+    #[test]
+    fn r27_everything_parks_nothing_and_puts_back_every_parked_window() {
+        let windows = vec![
+            member_of(wid(1, 1), &[A]),
+            SwitchWindow {
+                parked: true,
+                ..member_of(wid(1, 2), &[B])
+            },
+            SwitchWindow {
+                parked: true,
+                ..member_of(wid(1, 3), &[])
+            },
+            SwitchWindow {
+                parked: true,
+                minimized: true,
+                ..member_of(wid(1, 4), &[])
+            },
+            SwitchWindow {
+                parked: true,
+                untracked: true,
+                ..member_of(wid(1, 5), &[])
+            },
+        ];
+        let plan = plan_switch(&one_screen(ContextKey::Everything, windows));
+        assert_eq!(plan.park, vec![]);
+        assert_eq!(plan.unpark, vec![wid(1, 2), wid(1, 3), wid(1, 4), wid(1, 5)]);
+    }
+
+    #[test]
+    fn r20_an_unmatched_new_window_is_never_parked() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        cx.switch_to(named(a)).unwrap();
+        let w = window(1, 1, "App", "New");
+        cx.window_appeared(&w, cx.active());
+        let plan = plan_switch(&one_screen(cx.active(), vec![cx.switch_window(w.wid)]));
+        assert_eq!(plan.park, vec![]);
+    }
+
+    #[test]
+    fn r21_a_rejoined_window_outside_the_active_context_is_parked() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let w = window(1, 1, "App", "Title");
+        cx.add_window(a, &w).unwrap();
+        cx.app_terminated(1);
+        cx.switch_to(named(b)).unwrap();
+        let relaunched = window(2, 1, "App", "Title");
+        assert!(matches!(
+            cx.window_appeared(&relaunched, cx.active()),
+            Arrival::Rejoined(_)
+        ));
+        let plan = plan_switch(&one_screen(cx.active(), vec![cx.switch_window(relaunched.wid)]));
+        assert_eq!(plan.park, vec![relaunched.wid]);
+    }
+
+    #[test]
+    fn switch_window_describes_membership_and_focus() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let w = window(1, 1, "App", "Title");
+        cx.add_window(a, &w).unwrap();
+        cx.pin(&w);
+        cx.window_focused(w.wid);
+        let described = cx.switch_window(w.wid);
+        assert_eq!(described.contexts, vec![a]);
+        assert!(described.pinned);
+        assert_eq!(described.last_focus, Some(1));
     }
 }
