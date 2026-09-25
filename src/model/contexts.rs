@@ -407,6 +407,147 @@ impl Contexts {
     }
 }
 
+/// Lowercases text and removes accents, for comparing names and titles.
+///
+/// Folds the Latin-1 Supplement and Latin Extended-A blocks to ASCII and
+/// drops combining diacritical marks.
+pub fn fold(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if ('\u{0300}'..='\u{036F}').contains(&c) {
+            continue;
+        }
+        match fold_char(c) {
+            Some(folded) => out.push_str(folded),
+            None => out.extend(c.to_lowercase()),
+        }
+    }
+    out
+}
+
+fn fold_char(c: char) -> Option<&'static str> {
+    Some(match c {
+        'À'..='Å' | 'à'..='å' | '\u{0100}'..='\u{0105}' => "a",
+        'Æ' | 'æ' => "ae",
+        'Ç' | 'ç' | '\u{0106}'..='\u{010D}' => "c",
+        'Ð' | 'ð' | '\u{010E}'..='\u{0111}' => "d",
+        'È'..='Ë' | 'è'..='ë' | '\u{0112}'..='\u{011B}' => "e",
+        '\u{011C}'..='\u{0123}' => "g",
+        '\u{0124}'..='\u{0127}' => "h",
+        'Ì'..='Ï' | 'ì'..='ï' | '\u{0128}'..='\u{0131}' => "i",
+        '\u{0132}' | '\u{0133}' => "ij",
+        '\u{0134}' | '\u{0135}' => "j",
+        '\u{0136}'..='\u{0138}' => "k",
+        '\u{0139}'..='\u{0142}' => "l",
+        'Ñ' | 'ñ' | '\u{0143}'..='\u{014B}' => "n",
+        'Ò'..='Ö' | 'Ø' | 'ò'..='ö' | 'ø' | '\u{014C}'..='\u{0151}' => "o",
+        '\u{0152}' | '\u{0153}' => "oe",
+        '\u{0154}'..='\u{0159}' => "r",
+        'ß' => "ss",
+        '\u{015A}'..='\u{0161}' | '\u{017F}' => "s",
+        '\u{0162}'..='\u{0167}' => "t",
+        'Þ' | 'þ' => "th",
+        'Ù'..='Ü' | 'ù'..='ü' | '\u{0168}'..='\u{0173}' => "u",
+        '\u{0174}' | '\u{0175}' => "w",
+        'Ý' | 'ý' | 'ÿ' | '\u{0176}'..='\u{0178}' => "y",
+        '\u{0179}'..='\u{017E}' => "z",
+        _ => return None,
+    })
+}
+
+/// How well a query matches a context name, from weakest to strongest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NameMatch {
+    /// The query is empty, so every entry is listed.
+    EmptyQuery,
+    /// The query's letters appear in the name in order.
+    LettersInOrder,
+    /// Each word of the query starts a word of the name, in order.
+    AllWordPrefixes,
+    /// The query starts the name's initials.
+    Initials,
+    /// The query starts a word of the name.
+    WordPrefix,
+    /// The query starts the name.
+    NamePrefix,
+    Exact,
+}
+
+/// Ranks the switcher's entries for a query, best first.
+///
+/// The entries are the named contexts, Unsorted when it has windows, and
+/// Everything. Entries that don't match are left out. Ties go to the most
+/// recently used entry.
+pub fn rank(
+    query: &str,
+    contexts: &Contexts,
+    unsorted_has_windows: bool,
+) -> Vec<(ContextKey, NameMatch)> {
+    let query = fold(query.trim());
+    let mut entries: Vec<(ContextKey, &str)> = contexts
+        .contexts
+        .iter()
+        .map(|c| (ContextKey::Named(c.id), c.name.as_str()))
+        .collect();
+    if unsorted_has_windows {
+        entries.push((ContextKey::Unsorted, UNSORTED_NAME));
+    }
+    entries.push((ContextKey::Everything, EVERYTHING_NAME));
+    let mut ranked: Vec<(ContextKey, NameMatch)> = entries
+        .into_iter()
+        .filter_map(|(key, name)| match_name(&query, &fold(name)).map(|m| (key, m)))
+        .collect();
+    ranked.sort_by(|(a_key, a), (b_key, b)| {
+        b.cmp(a)
+            .then_with(|| contexts.last_used(*b_key).cmp(&contexts.last_used(*a_key)))
+    });
+    ranked
+}
+
+/// Matches a folded query against a folded name.
+fn match_name(query: &str, name: &str) -> Option<NameMatch> {
+    if query.is_empty() {
+        return Some(NameMatch::EmptyQuery);
+    }
+    if name == query {
+        return Some(NameMatch::Exact);
+    }
+    if name.starts_with(query) {
+        return Some(NameMatch::NamePrefix);
+    }
+    if word_starts(name).any(|start| name[start..].starts_with(query)) {
+        return Some(NameMatch::WordPrefix);
+    }
+    let name_words: Vec<&str> = words(name).collect();
+    let initials: String = name_words.iter().filter_map(|w| w.chars().next()).collect();
+    if !query.contains(char::is_whitespace) && initials.starts_with(query) {
+        return Some(NameMatch::Initials);
+    }
+    let mut remaining = name_words.iter();
+    if words(query).all(|q| remaining.any(|w| w.starts_with(q))) {
+        return Some(NameMatch::AllWordPrefixes);
+    }
+    let mut name_chars = name.chars();
+    if query.chars().filter(|c| !c.is_whitespace()).all(|q| name_chars.any(|c| c == q)) {
+        return Some(NameMatch::LettersInOrder);
+    }
+    None
+}
+
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty())
+}
+
+/// Byte offsets at which a word starts.
+fn word_starts(text: &str) -> impl Iterator<Item = usize> {
+    let mut previous_alphanumeric = false;
+    text.char_indices().filter_map(move |(i, c)| {
+        let starts = c.is_alphanumeric() && !previous_alphanumeric;
+        previous_alphanumeric = c.is_alphanumeric();
+        starts.then_some(i)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,5 +860,132 @@ mod tests {
         assert!(cx.remove_window(a, w.wid).unwrap());
         assert!(!cx.remove_window(a, w.wid).unwrap());
         assert_eq!(cx.contexts_of(w.wid), vec![b]);
+    }
+
+    fn ranked_names(query: &str, cx: &Contexts, unsorted: bool) -> Vec<String> {
+        rank(query, cx, unsorted)
+            .into_iter()
+            .map(|(key, _)| match key {
+                ContextKey::Everything => EVERYTHING_NAME.to_string(),
+                ContextKey::Unsorted => UNSORTED_NAME.to_string(),
+                ContextKey::Named(id) => cx.get(id).unwrap().name.clone(),
+            })
+            .collect()
+    }
+
+    fn match_of(query: &str, name: &str) -> Option<NameMatch> {
+        match_name(&fold(query), &fold(name))
+    }
+
+    #[test]
+    fn rank_prefix_finds_client_work() {
+        let mut cx = Contexts::new();
+        cx.create("Comms").unwrap();
+        cx.create("Client work").unwrap();
+        assert_eq!(ranked_names("cli", &cx, false), vec!["Client work"]);
+        assert_eq!(match_of("cli", "Client work"), Some(NameMatch::NamePrefix));
+    }
+
+    #[test]
+    fn rank_initials_find_client_work() {
+        let mut cx = Contexts::new();
+        cx.create("Comms").unwrap();
+        cx.create("Client work").unwrap();
+        assert_eq!(ranked_names("cw", &cx, false), vec!["Client work"]);
+        assert_eq!(match_of("cw", "Client work"), Some(NameMatch::Initials));
+    }
+
+    #[test]
+    fn rank_exact_name_beats_prefix() {
+        let mut cx = Contexts::new();
+        let longer = cx.create("Client work 2").unwrap();
+        cx.create("Client work").unwrap();
+        cx.switch_to(ContextKey::Named(longer)).unwrap();
+        assert_eq!(
+            ranked_names("client work", &cx, false),
+            vec!["Client work", "Client work 2"]
+        );
+    }
+
+    #[test]
+    fn rank_ignores_accents_and_case() {
+        let mut cx = Contexts::new();
+        cx.create("Café").unwrap();
+        cx.create("Straße").unwrap();
+        assert_eq!(ranked_names("cafe", &cx, false), vec!["Café"]);
+        assert_eq!(ranked_names("CAFÉ", &cx, false), vec!["Café"]);
+        assert_eq!(ranked_names("strasse", &cx, false), vec!["Straße"]);
+        // Decomposed accents, as in some file names.
+        assert_eq!(ranked_names("Cafe\u{301}", &cx, false), vec!["Café"]);
+    }
+
+    #[test]
+    fn rank_ties_go_to_most_recently_used() {
+        let mut cx = Contexts::new();
+        let client = cx.create("Client").unwrap();
+        let comms = cx.create("Comms").unwrap();
+        cx.switch_to(ContextKey::Named(client)).unwrap();
+        cx.switch_to(ContextKey::Named(comms)).unwrap();
+        assert_eq!(ranked_names("c", &cx, false), vec!["Comms", "Client"]);
+        cx.switch_to(ContextKey::Named(client)).unwrap();
+        assert_eq!(ranked_names("c", &cx, false), vec!["Client", "Comms"]);
+    }
+
+    #[test]
+    fn rank_orders_match_kinds() {
+        assert_eq!(match_of("client work", "Client work"), Some(NameMatch::Exact));
+        assert_eq!(match_of("client", "Client work"), Some(NameMatch::NamePrefix));
+        assert_eq!(match_of("wor", "Client work"), Some(NameMatch::WordPrefix));
+        assert_eq!(match_of("cwp", "Client work party"), Some(NameMatch::Initials));
+        assert_eq!(
+            match_of("cl wo", "Client work"),
+            Some(NameMatch::AllWordPrefixes)
+        );
+        assert_eq!(match_of("clwk", "Client work"), Some(NameMatch::LettersInOrder));
+        assert_eq!(match_of("wc", "Client work"), None);
+        assert_eq!(match_of("wo cl", "Client work"), None);
+        let mut kinds = vec![
+            NameMatch::LettersInOrder,
+            NameMatch::Exact,
+            NameMatch::Initials,
+            NameMatch::NamePrefix,
+            NameMatch::AllWordPrefixes,
+            NameMatch::WordPrefix,
+        ];
+        kinds.sort();
+        kinds.reverse();
+        assert_eq!(
+            kinds,
+            vec![
+                NameMatch::Exact,
+                NameMatch::NamePrefix,
+                NameMatch::WordPrefix,
+                NameMatch::Initials,
+                NameMatch::AllWordPrefixes,
+                NameMatch::LettersInOrder,
+            ]
+        );
+    }
+
+    #[test]
+    fn r29_rank_lists_unsorted_only_when_it_has_windows() {
+        let mut cx = Contexts::new();
+        cx.create("Comms").unwrap();
+        assert_eq!(ranked_names("", &cx, false), vec!["Comms", "Everything"]);
+        assert_eq!(
+            ranked_names("", &cx, true),
+            vec!["Comms", "Unsorted", "Everything"]
+        );
+        assert_eq!(ranked_names("uns", &cx, true), vec!["Unsorted"]);
+        assert_eq!(ranked_names("uns", &cx, false), Vec::<String>::new());
+        assert_eq!(ranked_names("ev", &cx, true), vec!["Everything"]);
+    }
+
+    #[test]
+    fn fold_covers_latin_1_and_extended_a() {
+        assert_eq!(fold("ÀÉÎÕÜ àéîõü Çç Ññ Ýÿ"), "aeiou aeiou cc nn yy");
+        assert_eq!(fold("Æ Œ ß Þ Ð Ø Ĳ"), "ae oe ss th d o ij");
+        assert_eq!(fold("Łódź Škoda İstanbul ıi Ħ ſ"), "lodz skoda istanbul ii h s");
+        assert_eq!(fold("×÷ 日本"), "×÷ 日本");
     }
 }
