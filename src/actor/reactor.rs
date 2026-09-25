@@ -554,7 +554,7 @@ impl Reactor {
     fn handle_event(&mut self, event: Event) {
         self.record.on_event(&event);
         self.log_event(&event);
-        let mut animation_focus_wids: Vec<WindowId> = Vec::new();
+        let animation_focus_wids: Vec<WindowId> = Vec::new();
         let mut is_resize = false;
         let raised_window = self.main_window_tracker.handle_event(&event);
         match event {
@@ -633,8 +633,22 @@ impl Reactor {
                     && let Some(space) = self.best_space_for_window(&window.frame_monotonic)
                     && let Some(info) = self.layout_window_info(wid)
                 {
-                    animation_focus_wids.push(wid);
-                    self.send_layout_event(LayoutEvent::WindowAdded(space, wid, info));
+                    // Check if there's already a visible window from the same app
+                    // with the same frame (indicating this is a tab). If so, don't
+                    // add - let the existing window represent this position.
+                    let frame_key = Self::frame_key(&window.frame_monotonic);
+                    let dominated_by_existing = self.visible_windows.iter().any(|wsid| {
+                        self.window_ids.get(wsid).is_some_and(|other_wid| {
+                            *other_wid != wid
+                                && other_wid.pid == wid.pid
+                                && self.windows.get(other_wid).is_some_and(|other_window| {
+                                    Self::frame_key(&other_window.frame_monotonic) == frame_key
+                                })
+                        })
+                    });
+                    if !dominated_by_existing {
+                        self.send_layout_event(LayoutEvent::WindowAdded(space, wid, info));
+                    }
                 }
             }
             Event::WindowDestroyed(wid) => {
@@ -650,12 +664,29 @@ impl Reactor {
                 {
                     self.hidden_windows.remove(&wsid);
                 }
+                // Check if another window will take this window's place (tab sibling)
+                // before removing it from self.windows.
+                let dominated_by_sibling = self
+                    .windows
+                    .get(&wid)
+                    .map(|w| {
+                        let frame_key = Self::frame_key(&w.frame_monotonic);
+                        self.windows.iter().any(|(other_wid, other_window)| {
+                            *other_wid != wid
+                                && other_wid.pid == wid.pid
+                                && Self::frame_key(&other_window.frame_monotonic) == frame_key
+                        })
+                    })
+                    .unwrap_or(false);
                 if self.windows.remove(&wid).is_none() {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
                 self.frame_attempts.remove(&wid);
-                //animation_focus_wid = self.window_order.last().cloned();
-                self.send_layout_event(LayoutEvent::WindowRemoved(wid));
+                // Only send WindowRemoved if no sibling will take its place.
+                // For tabs, the sibling window already represents this position.
+                if !dominated_by_sibling {
+                    self.send_layout_event(LayoutEvent::WindowRemoved(wid));
+                }
             }
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
                 if mouse_state == Some(MouseState::Up) {
@@ -1377,6 +1408,12 @@ impl Reactor {
     /// changes (e.g., a window is minimized or unminimized).
     fn send_visible_windows_to_layout(&mut self, pid: pid_t) {
         let mut app_windows: BTreeMap<SpaceId, Vec<(WindowId, LayoutWindowInfo)>> = BTreeMap::new();
+        // Track frames we've already seen to detect overlapping windows (tabs).
+        // Windows with nearly identical frames are likely tabs in a tab group,
+        // and we should only include one of them in the layout.
+        let mut seen_frames: HashSet<(i32, i32, i32, i32)> = HashSet::default();
+        let main_window = self.main_window();
+
         for wid in self
             .visible_windows
             .iter()
@@ -1391,6 +1428,21 @@ impl Reactor {
             let Some(layout_info) = self.layout_window_info(wid) else {
                 continue;
             };
+            // Tabs in the same window group will have the same visual frame.
+            let frame_key = Self::frame_key(&window.frame_monotonic);
+            // If we've already seen a window with this frame, skip this one
+            // unless it's the main window (active tab).
+            if seen_frames.contains(&frame_key) {
+                if main_window != Some(wid) {
+                    continue;
+                }
+                // This is the main window, remove the previous entry with this frame
+                // and add this one instead.
+                if let Some(windows) = app_windows.get_mut(&space) {
+                    windows.retain(|(_, info)| Self::frame_key(&info.frame) != frame_key);
+                }
+            }
+            seen_frames.insert(frame_key);
             app_windows.entry(space).or_default().push((wid, layout_info));
         }
         let screens = self.screens.clone();
@@ -1472,6 +1524,17 @@ impl Reactor {
         // For now we track all windows in the reactor and let the LayoutManager
         // decide what to keep.
         true
+    }
+
+    /// Returns the frame key (rounded to integers) for a window frame.
+    /// Used to detect windows that share the same visual position (tabs).
+    fn frame_key(frame: &CGRect) -> (i32, i32, i32, i32) {
+        (
+            frame.origin.x.round() as i32,
+            frame.origin.y.round() as i32,
+            frame.size.width.round() as i32,
+            frame.size.height.round() as i32,
+        )
     }
 
     fn send_layout_event(&mut self, event: LayoutEvent) {
