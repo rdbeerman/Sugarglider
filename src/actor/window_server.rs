@@ -155,6 +155,10 @@ impl WindowServer {
                 self.send_reactor_event(reactor::Event::ApplicationMainWindowChanged(
                     pid, wid, quiet,
                 ));
+                // The main window may have changed because the previous window was
+                // closed (but not destroyed). Check for visibility changes to catch
+                // windows that were closed without triggering a destroy notification.
+                self.send_windows_on_screen_if_changed(Some(pid));
             }
             Event::WindowVisibilityChanged(window_id) => {
                 self.send_windows_on_screen_if_changed(Some(window_id.pid));

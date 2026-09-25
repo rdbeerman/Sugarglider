@@ -59,6 +59,15 @@ impl Window {
         entry.height = entry.height.min(size.height);
     }
 
+    /// Clears the recorded minimum size for `wid`.
+    ///
+    /// Called when a window is rearranged (e.g., via drag-and-drop) so it can
+    /// adapt to its new layout context without being constrained by stale
+    /// minimum sizes from its previous position.
+    pub fn clear_min_size(&mut self, wid: WindowId) {
+        self.min_sizes.remove(&wid);
+    }
+
     /// Returns every node mapped to `wid`, across all layouts.
     pub(super) fn nodes_for(&self, wid: WindowId) -> impl Iterator<Item = NodeId> + use<'_> {
         self.window_nodes.get(&wid).into_iter().flatten().copied()
