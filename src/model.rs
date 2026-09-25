@@ -4,6 +4,7 @@
 //! This module defines the [`LayoutTree`][layout_tree::LayoutTree] data
 //! structure, on which all layout logic is defined.
 
+pub mod contexts;
 mod layout_mapping;
 mod layout_tree;
 mod parking;
