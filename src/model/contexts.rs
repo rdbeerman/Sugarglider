@@ -8,12 +8,16 @@
 //! sequence number that increments on each switch or focus, not a timestamp.
 //! The design is in `docs/specs/contexts.md`.
 
+use serde::de::IgnoredAny;
+use serde::{Deserialize, Serialize};
+
 use crate::actor::app::{WindowId, pid_t};
 use crate::collections::HashMap;
 use crate::sys::window_server::WindowServerId;
 
 /// Identifies a named context. Ids are never reused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ContextId(u32);
 
 impl ContextId {
@@ -46,12 +50,17 @@ pub enum RecordLink {
 }
 
 /// The stored description of a member window.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberRecord {
+    #[serde(default)]
     pub bundle_id: Option<String>,
+    #[serde(default)]
     pub app_name: Option<String>,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub window_server_id: Option<WindowServerId>,
+    #[serde(skip)]
     pub link: RecordLink,
 }
 
@@ -85,13 +94,16 @@ pub struct WindowDesc {
     pub window_server_id: Option<WindowServerId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Context {
     pub id: ContextId,
     pub name: String,
+    #[serde(default)]
     pub number: Option<u8>,
+    #[serde(default)]
     pub members: Vec<MemberRecord>,
     /// The value of the use sequence at the last switch to this context.
+    #[serde(default)]
     pub last_used: u64,
 }
 
@@ -121,7 +133,11 @@ pub const UNSORTED_NAME: &str = "Unsorted";
 /// The user's contexts, their members, and the active context.
 ///
 /// Scope is global: one active context covers every screen.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Serializes to the shape of `contexts.json`. Live windows, pending
+/// states, the previous context, and focus order are not saved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "ContextsFile", try_from = "ContextsFile")]
 pub struct Contexts {
     contexts: Vec<Context>,
     /// Windows that are members of every context, including later ones.
@@ -903,6 +919,111 @@ impl Contexts {
             own: false,
             last_focus: self.last_focus(wid),
         }
+    }
+}
+
+/// The version of `contexts.json` that this code reads and writes.
+pub const CONTEXTS_FILE_VERSION: u32 = 1;
+
+/// The shape of `contexts.json`.
+#[derive(Serialize, Deserialize)]
+struct ContextsFile {
+    version: u32,
+    next_id: u32,
+    use_seq: u64,
+    #[serde(default)]
+    contexts: Vec<Context>,
+    #[serde(default)]
+    pinned: Vec<MemberRecord>,
+    #[serde(default)]
+    active: Option<SavedActive>,
+}
+
+/// `{ "global": <key> }`. Anything else loads as Everything.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum SavedActive {
+    Global {
+        global: SavedKey,
+    },
+    #[serde(skip_serializing)]
+    Unknown(IgnoredAny),
+}
+
+/// A context id, or `"everything"` or `"unsorted"`.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum SavedKey {
+    Named(ContextId),
+    Builtin(BuiltinKey),
+    #[serde(skip_serializing)]
+    Unknown(IgnoredAny),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BuiltinKey {
+    Everything,
+    Unsorted,
+}
+
+impl From<Contexts> for ContextsFile {
+    fn from(contexts: Contexts) -> Self {
+        let global = match contexts.active {
+            ContextKey::Everything => SavedKey::Builtin(BuiltinKey::Everything),
+            ContextKey::Unsorted => SavedKey::Builtin(BuiltinKey::Unsorted),
+            ContextKey::Named(id) => SavedKey::Named(id),
+        };
+        ContextsFile {
+            version: CONTEXTS_FILE_VERSION,
+            next_id: contexts.next_id,
+            use_seq: contexts.use_seq,
+            contexts: contexts.contexts,
+            pinned: contexts.pinned,
+            active: Some(SavedActive::Global { global }),
+        }
+    }
+}
+
+impl TryFrom<ContextsFile> for Contexts {
+    type Error = String;
+
+    fn try_from(file: ContextsFile) -> Result<Self, String> {
+        if file.version != CONTEXTS_FILE_VERSION {
+            return Err(format!("unsupported contexts.json version {}", file.version));
+        }
+        let mut contexts = Contexts {
+            next_id: file.next_id,
+            use_seq: file.use_seq,
+            pinned: file.pinned,
+            ..Contexts::default()
+        };
+        for mut context in file.contexts {
+            if contexts.get(context.id).is_some() {
+                continue;
+            }
+            if context
+                .number
+                .is_some_and(|n| !(1..=9).contains(&n) || contexts.by_number(n).is_some())
+            {
+                context.number = None;
+            }
+            contexts.next_id = contexts.next_id.max(context.id.0 + 1);
+            contexts.use_seq = contexts.use_seq.max(context.last_used);
+            contexts.contexts.push(context);
+        }
+        contexts.active = match file.active {
+            Some(SavedActive::Global {
+                global: SavedKey::Builtin(BuiltinKey::Unsorted),
+            }) => ContextKey::Unsorted,
+            Some(SavedActive::Global { global: SavedKey::Named(id) })
+                if contexts.get(id).is_some() =>
+            {
+                ContextKey::Named(id)
+            }
+            _ => ContextKey::Everything,
+        };
+        Ok(contexts)
     }
 }
 
@@ -1995,5 +2116,138 @@ mod tests {
         assert_eq!(described.contexts, vec![a]);
         assert!(described.pinned);
         assert_eq!(described.last_focus, Some(1));
+    }
+
+    const SPEC_EXAMPLE: &str = r#"{
+  "version": 1,
+  "next_id": 3,
+  "use_seq": 42,
+  "contexts": [
+    { "id": 1, "name": "Comms", "number": 1, "last_used": 42,
+      "members": [
+        { "bundle_id": "net.whatsapp.WhatsApp", "app_name": "WhatsApp", "title": "WhatsApp", "window_server_id": 81234 }
+      ] }
+  ],
+  "pinned": [],
+  "active": { "global": 1 }
+}"#;
+
+    fn round_trip(cx: &Contexts) -> Contexts {
+        serde_json::from_str(&serde_json::to_string(cx).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn contexts_json_round_trips_the_spec_example() {
+        let cx: Contexts = serde_json::from_str(SPEC_EXAMPLE).unwrap();
+        let comms = cx.by_name("Comms").unwrap();
+        assert_eq!(comms.id, ContextId(1));
+        assert_eq!(comms.number, Some(1));
+        assert_eq!(
+            comms.members,
+            vec![MemberRecord {
+                bundle_id: Some("net.whatsapp.WhatsApp".into()),
+                app_name: Some("WhatsApp".into()),
+                title: "WhatsApp".into(),
+                window_server_id: Some(WindowServerId(81234)),
+                link: RecordLink::Empty,
+            }]
+        );
+        assert_eq!(cx.active(), ContextKey::Named(ContextId(1)));
+        assert_eq!(cx.next_id, 3);
+        assert_eq!(cx.use_seq, 42);
+        let written = serde_json::to_value(&cx).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(SPEC_EXAMPLE).unwrap();
+        assert_eq!(written, expected);
+    }
+
+    #[test]
+    fn contexts_json_writes_built_in_active_contexts_as_strings() {
+        let mut cx = Contexts::new();
+        assert_eq!(
+            serde_json::to_value(&cx).unwrap()["active"],
+            serde_json::json!({ "global": "everything" })
+        );
+        cx.switch_to(ContextKey::Unsorted).unwrap();
+        assert_eq!(
+            serde_json::to_value(&cx).unwrap()["active"],
+            serde_json::json!({ "global": "unsorted" })
+        );
+        assert_eq!(round_trip(&cx).active(), ContextKey::Unsorted);
+    }
+
+    #[test]
+    fn r28_contexts_json_without_a_known_active_context_loads_as_everything() {
+        let mut doc: serde_json::Value = serde_json::from_str(SPEC_EXAMPLE).unwrap();
+        for active in [
+            serde_json::Value::Null,
+            serde_json::json!({ "global": 7 }),
+            serde_json::json!({ "global": "somewhere" }),
+            serde_json::json!({ "per_screen": { "1": 1 } }),
+        ] {
+            doc["active"] = active;
+            let cx: Contexts = serde_json::from_value(doc.clone()).unwrap();
+            assert_eq!(cx.active(), ContextKey::Everything);
+        }
+        doc.as_object_mut().unwrap().remove("active");
+        let cx: Contexts = serde_json::from_value(doc).unwrap();
+        assert_eq!(cx.active(), ContextKey::Everything);
+    }
+
+    #[test]
+    fn contexts_json_rejects_other_versions() {
+        let mut doc: serde_json::Value = serde_json::from_str(SPEC_EXAMPLE).unwrap();
+        doc["version"] = serde_json::json!(2);
+        assert!(serde_json::from_value::<Contexts>(doc).is_err());
+    }
+
+    #[test]
+    fn contexts_json_repairs_ids_and_numbers() {
+        let doc = serde_json::json!({
+            "version": 1,
+            "next_id": 1,
+            "use_seq": 0,
+            "contexts": [
+                { "id": 4, "name": "A", "number": 2, "last_used": 9, "members": [] },
+                { "id": 5, "name": "B", "number": 2, "last_used": 0, "members": [] },
+                { "id": 6, "name": "C", "number": 12, "last_used": 0, "members": [] },
+                { "id": 6, "name": "Duplicate", "number": null, "last_used": 0, "members": [] }
+            ],
+            "pinned": []
+        });
+        let mut cx: Contexts = serde_json::from_value(doc).unwrap();
+        let numbers: Vec<_> = cx.contexts().iter().map(|c| c.number).collect();
+        assert_eq!(numbers, vec![Some(2), None, None]);
+        assert_eq!(cx.create("D").unwrap(), ContextId(7));
+        cx.switch_to(ContextKey::Named(ContextId(5))).unwrap();
+        assert!(
+            cx.last_used(ContextKey::Named(ContextId(5)))
+                > cx.last_used(ContextKey::Named(ContextId(4)))
+        );
+    }
+
+    #[test]
+    fn r23_records_stay_across_a_restart_without_their_live_windows() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let open = window(1, 1, "App", "Open");
+        let closed = window(1, 2, "App", "Closed");
+        cx.add_window(a, &open).unwrap();
+        cx.add_window(a, &closed).unwrap();
+        cx.pin(&open);
+        cx.window_closed(closed.wid);
+        let written = serde_json::to_value(&cx).unwrap();
+        assert_eq!(
+            written["contexts"][0]["members"][0].as_object().unwrap().len(),
+            4
+        );
+        let restored = round_trip(&cx);
+        let members = &restored.get(a).unwrap().members;
+        assert_eq!(
+            members.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(),
+            vec!["Open", "Closed"]
+        );
+        assert!(members.iter().all(|m| m.link == RecordLink::Empty));
+        assert_eq!(restored.pinned()[0].link, RecordLink::Empty);
+        assert!(restored.contexts_of(open.wid).is_empty());
     }
 }
