@@ -8,7 +8,7 @@
 //! sequence number that increments on each switch or focus, not a timestamp.
 //! The design is in `docs/specs/contexts.md`.
 
-use crate::actor::app::WindowId;
+use crate::actor::app::{WindowId, pid_t};
 use crate::collections::HashMap;
 use crate::sys::window_server::WindowServerId;
 
@@ -548,6 +548,251 @@ fn word_starts(text: &str) -> impl Iterator<Item = usize> {
     })
 }
 
+/// When window matching runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchPass {
+    /// A window appeared. Steps 1 to 3 run.
+    Arrival,
+    /// A switch is in progress. Steps 1 to 4 run.
+    Switch,
+}
+
+/// The step at which a window matched a member record, in the order the
+/// steps run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MatchStep {
+    /// Same window server id.
+    WindowServerId,
+    /// Same app and exactly the same title.
+    ExactTitle,
+    /// Same app and a similar title.
+    SimilarTitle,
+    /// Same app.
+    SameApp,
+}
+
+/// Where a member record lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Slot {
+    Context(ContextId),
+    Pinned,
+}
+
+/// A member record that a window matched. `index` points into the slot's
+/// records and is valid until the next change to the contexts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordMatch {
+    pub slot: Slot,
+    pub index: usize,
+    pub step: MatchStep,
+}
+
+/// Finds the empty member records that a window matches.
+///
+/// The steps run in order. Each context, and the pinned list, gives at most
+/// one record, from the earliest step that matches in it. Steps 3 and 4 run
+/// only when steps 1 and 2 match nothing and the window belongs to no
+/// context, so they never take a window that belongs to another context.
+/// Step 4 runs only during a switch. Pending records match nothing.
+pub fn match_window(window: &WindowDesc, contexts: &Contexts, pass: MatchPass) -> Vec<RecordMatch> {
+    let slots = contexts
+        .contexts
+        .iter()
+        .map(|c| (Slot::Context(c.id), &c.members))
+        .chain(std::iter::once((Slot::Pinned, &contexts.pinned)));
+    let candidates: Vec<(Slot, &Vec<MemberRecord>)> = slots
+        .filter(|(_, records)| !records.iter().any(|m| m.window() == Some(window.wid)))
+        .collect();
+    let is_member = contexts.is_pinned(window.wid) || !contexts.contexts_of(window.wid).is_empty();
+
+    let mut matches = Vec::new();
+    for step in [MatchStep::WindowServerId, MatchStep::ExactTitle] {
+        match_step(window, &candidates, step, &mut matches);
+    }
+    if !matches.is_empty() || is_member {
+        return matches;
+    }
+    match_step(window, &candidates, MatchStep::SimilarTitle, &mut matches);
+    if matches.is_empty() && pass == MatchPass::Switch {
+        match_step(window, &candidates, MatchStep::SameApp, &mut matches);
+    }
+    matches
+}
+
+fn match_step(
+    window: &WindowDesc,
+    candidates: &[(Slot, &Vec<MemberRecord>)],
+    step: MatchStep,
+    matches: &mut Vec<RecordMatch>,
+) {
+    for (slot, records) in candidates {
+        if matches.iter().any(|m| m.slot == *slot) {
+            continue;
+        }
+        let found = records.iter().position(|record| {
+            record.link == RecordLink::Empty
+                && match step {
+                    MatchStep::WindowServerId => {
+                        window.window_server_id.is_some()
+                            && record.window_server_id == window.window_server_id
+                    }
+                    MatchStep::ExactTitle => {
+                        same_app(record, window) && record.title == window.title
+                    }
+                    MatchStep::SimilarTitle => {
+                        same_app(record, window) && similar_titles(&record.title, &window.title)
+                    }
+                    MatchStep::SameApp => same_app(record, window),
+                }
+        });
+        if let Some(index) = found {
+            matches.push(RecordMatch { slot: *slot, index, step });
+        }
+    }
+}
+
+/// Compares bundle ids when both are known, and app names otherwise.
+fn same_app(record: &MemberRecord, window: &WindowDesc) -> bool {
+    match (&record.bundle_id, &window.bundle_id) {
+        (Some(a), Some(b)) => a == b,
+        _ => matches!((&record.app_name, &window.app_name), (Some(a), Some(b)) if a == b),
+    }
+}
+
+/// Whether two window titles are similar: after folding, both have at least
+/// 4 characters, and one contains the other or they share a prefix of at
+/// least min(12, two-thirds of the shorter title).
+pub fn similar_titles(a: &str, b: &str) -> bool {
+    let a = fold(a);
+    let b = fold(b);
+    let a_len = a.chars().count();
+    let b_len = b.chars().count();
+    if a_len < 4 || b_len < 4 {
+        return false;
+    }
+    if a.contains(&b) || b.contains(&a) {
+        return true;
+    }
+    let shorter = a_len.min(b_len);
+    let prefix = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+    prefix >= 12 || prefix * 3 >= shorter * 2
+}
+
+/// What happened to a window that appeared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Arrival {
+    /// It matched member records and rejoined the contexts that hold them.
+    Rejoined(Vec<RecordMatch>),
+    /// It matched nothing and joined the active context of its screen.
+    Joined(ContextId),
+    /// It matched nothing, and its screen shows Everything or Unsorted.
+    Unsorted,
+    /// It is already a member of a context or pinned, so nothing changed.
+    AlreadyMember,
+}
+
+impl Contexts {
+    fn slot_records_mut(&mut self, slot: Slot) -> &mut Vec<MemberRecord> {
+        match slot {
+            Slot::Pinned => &mut self.pinned,
+            Slot::Context(id) => {
+                &mut self
+                    .contexts
+                    .iter_mut()
+                    .find(|c| c.id == id)
+                    .expect("matched context exists")
+                    .members
+            }
+        }
+    }
+
+    fn records_mut(&mut self) -> impl Iterator<Item = &mut MemberRecord> {
+        self.contexts
+            .iter_mut()
+            .flat_map(|c| c.members.iter_mut())
+            .chain(self.pinned.iter_mut())
+    }
+
+    /// Matches a window against the member records and binds it to the
+    /// records it matches. The records take the window's current details.
+    pub fn rejoin(&mut self, window: &WindowDesc, pass: MatchPass) -> Vec<RecordMatch> {
+        let matches = match_window(window, self, pass);
+        for m in &matches {
+            self.slot_records_mut(m.slot)[m.index] = MemberRecord::for_window(window);
+        }
+        matches
+    }
+
+    /// Decides the membership of a window that just appeared on a screen
+    /// that shows `screen_active`.
+    ///
+    /// A window that matches member records rejoins their contexts and does
+    /// not join the active context. Otherwise it joins the active context,
+    /// or stays unsorted under Everything and Unsorted. Call this once per
+    /// window, when it first appears; a repeated call can't tell an unsorted
+    /// window from a new one.
+    pub fn window_appeared(&mut self, window: &WindowDesc, screen_active: ContextKey) -> Arrival {
+        if !self.is_unsorted(window.wid) {
+            return Arrival::AlreadyMember;
+        }
+        let matches = self.rejoin(window, MatchPass::Arrival);
+        if !matches.is_empty() {
+            return Arrival::Rejoined(matches);
+        }
+        if let ContextKey::Named(id) = screen_active
+            && let Ok(context) = self.get_mut(id)
+        {
+            context.members.push(MemberRecord::for_window(window));
+            return Arrival::Joined(id);
+        }
+        Arrival::Unsorted
+    }
+
+    /// Updates the records of an open window with its new title.
+    pub fn title_changed(&mut self, wid: WindowId, title: &str) {
+        for record in self.records_mut() {
+            if record.window() == Some(wid) {
+                record.title = title.to_string();
+            }
+        }
+    }
+
+    /// Marks the records of a closed window as pending until its app shows
+    /// whether it quit.
+    pub fn window_closed(&mut self, wid: WindowId) {
+        self.last_focus.remove(&wid);
+        for record in self.records_mut() {
+            if record.link == RecordLink::Live(wid) {
+                record.link = RecordLink::Pending(wid);
+            }
+        }
+    }
+
+    /// The app quit. All of its records stay, open or pending, and wait for
+    /// its windows to appear again.
+    pub fn app_terminated(&mut self, pid: pid_t) {
+        self.last_focus.retain(|wid, _| wid.pid != pid);
+        for record in self.records_mut() {
+            if let RecordLink::Live(wid) | RecordLink::Pending(wid) = record.link
+                && wid.pid == pid
+            {
+                record.link = RecordLink::Empty;
+            }
+        }
+    }
+
+    /// The app is still running, so its closed windows were closed for good.
+    /// Deletes their pending records.
+    pub fn app_still_running(&mut self, pid: pid_t) {
+        let still_running =
+            |m: &MemberRecord| !matches!(m.link, RecordLink::Pending(wid) if wid.pid == pid);
+        for context in &mut self.contexts {
+            context.members.retain(still_running);
+        }
+        self.pinned.retain(still_running);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -987,5 +1232,349 @@ mod tests {
         assert_eq!(fold("Æ Œ ß Þ Ð Ø Ĳ"), "ae oe ss th d o ij");
         assert_eq!(fold("Łódź Škoda İstanbul ıi Ħ ſ"), "lodz skoda istanbul ii h s");
         assert_eq!(fold("×÷ 日本"), "×÷ 日本");
+    }
+
+    fn empty_record(app: &str, title: &str, wsid: Option<u32>) -> MemberRecord {
+        MemberRecord {
+            bundle_id: Some(format!("com.example.{app}")),
+            app_name: Some(app.to_string()),
+            title: title.to_string(),
+            window_server_id: wsid.map(WindowServerId),
+            link: RecordLink::Empty,
+        }
+    }
+
+    fn with_records(names_and_records: &[(&str, Vec<MemberRecord>)]) -> (Contexts, Vec<ContextId>) {
+        let mut cx = Contexts::new();
+        let ids = names_and_records
+            .iter()
+            .map(|(name, records)| {
+                let id = cx.create(name).unwrap();
+                cx.get_mut(id).unwrap().members = records.clone();
+                id
+            })
+            .collect();
+        (cx, ids)
+    }
+
+    fn steps(matches: &[RecordMatch]) -> Vec<(Slot, MatchStep)> {
+        matches.iter().map(|m| (m.slot, m.step)).collect()
+    }
+
+    #[test]
+    fn r22_similar_titles_follow_the_rooms_definition() {
+        assert!(similar_titles("Inbox – Mail", "inbox"));
+        assert!(similar_titles("Café Notes", "cafe notes (edited)"));
+        assert!(!similar_titles("abc", "abc"), "shorter than 4 characters");
+        assert!(!similar_titles("Mail", "abc"));
+        // Shorter title has 9 characters; two-thirds is 6.
+        assert!(similar_titles("Project A", "Projec-99999"));
+        assert!(!similar_titles("Project A", "Proje-999999"));
+        // A shared prefix of 12 is always enough.
+        assert!(similar_titles(
+            "Quarterly report draft 1",
+            "Quarterly re-something else entirely"
+        ));
+        assert!(!similar_titles(
+            "Quarterly report draft 1",
+            "Quarterly r-something else entirely"
+        ));
+    }
+
+    #[test]
+    fn r22_step_1_matches_window_server_id() {
+        let (cx, ids) =
+            with_records(&[("A", vec![empty_record("Other", "Unrelated", Some(1001))])]);
+        let w = window(1, 1, "App", "Title");
+        assert_eq!(
+            steps(&match_window(&w, &cx, MatchPass::Arrival)),
+            vec![(Slot::Context(ids[0]), MatchStep::WindowServerId)]
+        );
+    }
+
+    #[test]
+    fn r22_step_2_matches_same_app_and_exact_title() {
+        let (cx, ids) = with_records(&[
+            ("A", vec![empty_record("App", "Title", None)]),
+            ("B", vec![empty_record("Other", "Title", None)]),
+        ]);
+        let w = window(1, 1, "App", "Title");
+        assert_eq!(
+            steps(&match_window(&w, &cx, MatchPass::Arrival)),
+            vec![(Slot::Context(ids[0]), MatchStep::ExactTitle)]
+        );
+    }
+
+    #[test]
+    fn r22_step_3_matches_same_app_and_similar_title() {
+        let (cx, ids) = with_records(&[("A", vec![empty_record("App", "Inbox – Mail", None)])]);
+        let w = window(1, 1, "App", "Inbox");
+        assert_eq!(
+            steps(&match_window(&w, &cx, MatchPass::Arrival)),
+            vec![(Slot::Context(ids[0]), MatchStep::SimilarTitle)]
+        );
+        let unrelated = window(1, 2, "App", "Drafts");
+        assert!(match_window(&unrelated, &cx, MatchPass::Arrival).is_empty());
+    }
+
+    #[test]
+    fn r22_step_4_only_runs_during_a_switch() {
+        let (cx, ids) = with_records(&[("A", vec![empty_record("App", "Something", None)])]);
+        let w = window(1, 1, "App", "Different");
+        assert!(match_window(&w, &cx, MatchPass::Arrival).is_empty());
+        assert_eq!(
+            steps(&match_window(&w, &cx, MatchPass::Switch)),
+            vec![(Slot::Context(ids[0]), MatchStep::SameApp)]
+        );
+    }
+
+    #[test]
+    fn r22_earlier_steps_win() {
+        let (cx, ids) = with_records(&[
+            (
+                "A",
+                vec![
+                    empty_record("App", "Inbox – Mail", None),
+                    empty_record("App", "Inbox", None),
+                ],
+            ),
+            ("B", vec![empty_record("App", "Inbox – Mail", None)]),
+        ]);
+        let w = window(1, 1, "App", "Inbox");
+        let matches = match_window(&w, &cx, MatchPass::Switch);
+        // A's exact record wins; B's similar record isn't taken because the
+        // window now belongs to A.
+        assert_eq!(
+            steps(&matches),
+            vec![(Slot::Context(ids[0]), MatchStep::ExactTitle)]
+        );
+        assert_eq!(matches[0].index, 1);
+    }
+
+    #[test]
+    fn r22_rejoins_every_context_that_holds_a_matching_record() {
+        let (mut cx, ids) = with_records(&[
+            ("Comms", vec![empty_record("WhatsApp", "WhatsApp", None)]),
+            ("Relax", vec![empty_record("WhatsApp", "WhatsApp", None)]),
+            ("Work", vec![]),
+        ]);
+        let w = window(1, 1, "WhatsApp", "WhatsApp");
+        assert_eq!(
+            cx.window_appeared(&w, named(ids[2])),
+            Arrival::Rejoined(vec![
+                RecordMatch {
+                    slot: Slot::Context(ids[0]),
+                    index: 0,
+                    step: MatchStep::ExactTitle
+                },
+                RecordMatch {
+                    slot: Slot::Context(ids[1]),
+                    index: 0,
+                    step: MatchStep::ExactTitle
+                },
+            ])
+        );
+        assert_eq!(cx.contexts_of(w.wid), vec![ids[0], ids[1]]);
+        assert_eq!(
+            cx.get(ids[0]).unwrap().members[0].window_server_id,
+            w.window_server_id
+        );
+    }
+
+    #[test]
+    fn r22_steps_3_and_4_never_take_a_window_of_another_context() {
+        let (mut cx, ids) = with_records(&[
+            ("A", vec![]),
+            (
+                "B",
+                vec![
+                    empty_record("App", "Inbox – Mail", None),
+                    empty_record("App", "Other", None),
+                ],
+            ),
+        ]);
+        let w = window(1, 1, "App", "Inbox");
+        cx.add_window(ids[0], &w).unwrap();
+        assert!(match_window(&w, &cx, MatchPass::Arrival).is_empty());
+        assert!(match_window(&w, &cx, MatchPass::Switch).is_empty());
+        // A pinned window belongs to every context.
+        cx.remove_window(ids[0], w.wid).unwrap();
+        cx.pin(&w);
+        assert!(match_window(&w, &cx, MatchPass::Switch).is_empty());
+        cx.unpin(w.wid);
+        assert_eq!(match_window(&w, &cx, MatchPass::Switch).len(), 1);
+    }
+
+    #[test]
+    fn r22_a_record_binds_one_window() {
+        let (mut cx, ids) = with_records(&[("A", vec![empty_record("App", "Title", None)])]);
+        let first = window(1, 1, "App", "Title");
+        let second = window(1, 2, "App", "Title");
+        assert_eq!(cx.rejoin(&first, MatchPass::Switch).len(), 1);
+        assert!(cx.rejoin(&second, MatchPass::Switch).is_empty());
+        assert!(cx.rejoin(&first, MatchPass::Switch).is_empty());
+        assert_eq!(cx.contexts_of(first.wid), vec![ids[0]]);
+        assert_eq!(cx.get(ids[0]).unwrap().members.len(), 1);
+    }
+
+    #[test]
+    fn r22_pinned_record_rejoins_as_pinned() {
+        let mut cx = Contexts::new();
+        cx.pinned.push(empty_record("Music", "Music", None));
+        let w = window(1, 1, "Music", "Music");
+        let matches = cx.rejoin(&w, MatchPass::Arrival);
+        assert_eq!(steps(&matches), vec![(Slot::Pinned, MatchStep::ExactTitle)]);
+        assert!(cx.is_pinned(w.wid));
+    }
+
+    #[test]
+    fn r22_record_title_follows_its_window() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let w = window(1, 1, "Chrome", "New Tab");
+        cx.add_window(a, &w).unwrap();
+        cx.pin(&w);
+        cx.title_changed(w.wid, "Docs – Q3 plan");
+        assert_eq!(cx.get(a).unwrap().members[0].title, "Docs – Q3 plan");
+        assert_eq!(cx.pinned()[0].title, "Docs – Q3 plan");
+    }
+
+    #[test]
+    fn r22_relaunched_window_with_the_last_title_rejoins_at_step_2() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let w = window(1, 1, "Chrome", "New Tab");
+        cx.add_window(a, &w).unwrap();
+        cx.title_changed(w.wid, "Docs – Q3 plan");
+        cx.app_terminated(1);
+        // After a relaunch the window has a new pid and window server id.
+        let relaunched = WindowDesc {
+            window_server_id: Some(WindowServerId(5555)),
+            ..window(2, 7, "Chrome", "Docs – Q3 plan")
+        };
+        assert_eq!(
+            steps(&cx.rejoin(&relaunched, MatchPass::Arrival)),
+            vec![(Slot::Context(a), MatchStep::ExactTitle)]
+        );
+        assert_eq!(cx.contexts_of(relaunched.wid), vec![a]);
+    }
+
+    #[test]
+    fn r20_unmatched_new_window_joins_the_active_context() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let w = window(1, 1, "App", "New");
+        assert_eq!(cx.window_appeared(&w, named(a)), Arrival::Joined(a));
+        assert_eq!(cx.contexts_of(w.wid), vec![a]);
+    }
+
+    #[test]
+    fn r20_unmatched_new_window_under_everything_or_unsorted_is_unsorted() {
+        let mut cx = Contexts::new();
+        cx.create("A").unwrap();
+        let w1 = window(1, 1, "App", "One");
+        let w2 = window(1, 2, "App", "Two");
+        assert_eq!(
+            cx.window_appeared(&w1, ContextKey::Everything),
+            Arrival::Unsorted
+        );
+        assert_eq!(cx.window_appeared(&w2, ContextKey::Unsorted), Arrival::Unsorted);
+        assert!(cx.is_unsorted(w1.wid));
+        assert!(cx.is_unsorted(w2.wid));
+    }
+
+    #[test]
+    fn r21_matched_window_does_not_join_the_active_context() {
+        let (mut cx, ids) = with_records(&[
+            ("A", vec![empty_record("App", "Title", None)]),
+            ("B", vec![]),
+        ]);
+        let w = window(1, 1, "App", "Title");
+        assert!(matches!(
+            cx.window_appeared(&w, named(ids[1])),
+            Arrival::Rejoined(_)
+        ));
+        assert_eq!(cx.contexts_of(w.wid), vec![ids[0]]);
+    }
+
+    #[test]
+    fn r20_a_repeated_arrival_changes_nothing() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let w = window(1, 1, "App", "Title");
+        assert_eq!(cx.window_appeared(&w, named(a)), Arrival::Joined(a));
+        assert_eq!(cx.window_appeared(&w, named(a)), Arrival::AlreadyMember);
+        assert_eq!(cx.window_appeared(&w, named(b)), Arrival::AlreadyMember);
+        assert_eq!(cx.contexts_of(w.wid), vec![a]);
+        assert_eq!(cx.get(a).unwrap().members.len(), 1);
+    }
+
+    #[test]
+    fn r23_pending_records_match_nothing() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let w = window(1, 1, "App", "Title");
+        cx.add_window(a, &w).unwrap();
+        cx.window_closed(w.wid);
+        assert_eq!(cx.get(a).unwrap().members[0].link, RecordLink::Pending(w.wid));
+        assert!(cx.is_unsorted(w.wid));
+        let same = window(1, 1, "App", "Title");
+        assert!(match_window(&same, &cx, MatchPass::Switch).is_empty());
+        let other = window(1, 2, "App", "Title");
+        assert!(match_window(&other, &cx, MatchPass::Switch).is_empty());
+    }
+
+    #[test]
+    fn r23_pending_records_stay_when_the_app_terminates() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let w = window(1, 1, "App", "Title");
+        cx.add_window(a, &w).unwrap();
+        cx.pin(&w);
+        cx.window_closed(w.wid);
+        cx.app_terminated(1);
+        assert_eq!(cx.get(a).unwrap().members[0].link, RecordLink::Empty);
+        assert_eq!(cx.pinned()[0].link, RecordLink::Empty);
+        let relaunched = window(2, 1, "App", "Title");
+        assert_eq!(cx.rejoin(&relaunched, MatchPass::Arrival).len(), 2);
+    }
+
+    #[test]
+    fn r23_open_windows_records_stay_when_the_app_terminates() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let w = window(1, 1, "App", "Title");
+        let other_app = window(2, 1, "Other", "Title");
+        cx.add_window(a, &w).unwrap();
+        cx.add_window(a, &other_app).unwrap();
+        cx.app_terminated(1);
+        let members = &cx.get(a).unwrap().members;
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].link, RecordLink::Empty);
+        assert_eq!(members[1].link, RecordLink::Live(other_app.wid));
+    }
+
+    #[test]
+    fn r23_pending_records_go_when_the_app_is_still_running() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let closed = window(1, 1, "App", "Closed");
+        let open = window(1, 2, "App", "Open");
+        let other_app = window(2, 1, "Other", "Closed");
+        for w in [&closed, &open, &other_app] {
+            cx.add_window(a, w).unwrap();
+        }
+        cx.pin(&closed);
+        cx.window_closed(closed.wid);
+        cx.window_closed(other_app.wid);
+        cx.app_still_running(1);
+        let members = &cx.get(a).unwrap().members;
+        assert_eq!(
+            members.iter().map(|m| m.title.as_str()).collect::<Vec<_>>(),
+            vec!["Open", "Closed"]
+        );
+        assert_eq!(members[1].link, RecordLink::Pending(other_app.wid));
+        assert!(cx.pinned().is_empty());
     }
 }
