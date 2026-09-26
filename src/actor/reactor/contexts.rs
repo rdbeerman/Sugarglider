@@ -589,7 +589,7 @@ mod tests {
     use crate::actor::raise;
     use crate::config::Config;
     use crate::model::Direction;
-    use crate::model::contexts::{ContextId, ContextKey, WindowDesc};
+    use crate::model::contexts::{ContextId, ContextKey, RecordLink, WindowDesc};
     use crate::sys::app::WindowInfo;
     use crate::sys::event::MouseState;
     use crate::sys::screen::{CoordinateConverter, SpaceId};
@@ -1666,6 +1666,21 @@ mod tests {
     fn save_and_exit(s: &mut Setup) {
         s.reactor
             .handle_event(Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)));
+    }
+
+    /// R32, R34. A journal entry of an app that hasn't registered, left by an
+    /// earlier run, doesn't hold up a quit, and it stays for the next launch.
+    #[test]
+    fn r32_a_journal_entry_of_an_app_that_hasnt_registered_doesnt_hold_up_a_quit() {
+        let mut s = Setup::new(2);
+        let leftover = journal_entry(7, 70, 1, rect(0., 0., 300., 300.));
+        s.reactor.journal.record(vec![leftover.clone()]).unwrap();
+        let exits = catch_exits(&mut s);
+
+        save_and_exit(&mut s);
+
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert_eq!(vec![leftover], s.journal_on_disk());
     }
 
     /// R32.
@@ -4657,6 +4672,55 @@ mod tests {
         );
         assert_eq!(vec![wid(4)], reactor.parked.keys().copied().collect::<Vec<_>>());
         assert_eq!(corner(CGSize::new(300., 1000.)), apps.windows[&wid(4)].frame);
+    }
+
+    /// An empty record of C that app 2's window titled "Window1" matches.
+    fn record_of_app_2(s: &mut Setup, c: ContextKey) {
+        let gone = WindowId::new(2, 9);
+        let desc = WindowDesc {
+            wid: gone,
+            bundle_id: Some("com.testapp2".into()),
+            app_name: Some("TestApp2".into()),
+            title: "Window1".into(),
+            window_server_id: None,
+        };
+        s.reactor.contexts.add_window(id_of(c), &desc).unwrap();
+        s.reactor.contexts.window_closed(gone);
+        s.reactor.contexts.app_terminated(2);
+    }
+
+    /// R28. After contexts are turned on and off again, an app that registers
+    /// binds no record and has nothing applied to it.
+    #[test]
+    fn r28_an_app_that_registers_after_contexts_are_turned_off_rejoins_nothing() {
+        let mut s = Setup::new(1);
+        let c = s.create("C", &[wid(1)]);
+        record_of_app_2(&mut s, c);
+        s.switch(c);
+        s.reactor.handle_event(Event::ConfigChanged(config(false)));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        let window = WindowInfo {
+            sys_id: Some(WindowServerId::new(21)),
+            frame: rect(700., 100., 50., 50.),
+            ..make_window(1)
+        };
+        s.reactor.handle_events(s.apps.make_app(2, vec![window]));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        let arrived = WindowId::new(2, 1);
+        assert!(!s.reactor.contexts.is_member(c, arrived));
+        let members = &s.reactor.contexts.get(id_of(c)).unwrap().members;
+        let links: Vec<RecordLink> = members.iter().map(|m| m.link).collect();
+        assert_eq!(vec![RecordLink::Live(wid(1)), RecordLink::Empty], links);
+        assert!(s.parked().is_empty());
+        assert_eq!(
+            vec![
+                (wid(1), rect(0., 0., 600., 1000.)),
+                (arrived, rect(600., 0., 600., 1000.)),
+            ],
+            s.frames(&[wid(1), arrived])
+        );
     }
 
     /// Two screens that show Spaces 1 and 2. App 1 has windows 1 and 2 on
