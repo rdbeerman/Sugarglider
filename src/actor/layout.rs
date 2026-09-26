@@ -2719,12 +2719,14 @@ impl LayoutManager {
 
     /// Deletes every layout of each named context for which `keep` returns
     /// false. Unsorted's layouts stay. A Space whose active context is deleted
-    /// shows Everything until the next `SpaceExposed`.
+    /// shows Everything until the next `SpaceExposed`. A mouse move, resize,
+    /// or drag on a deleted layout ends.
     pub fn retain_context_layouts(&mut self, mut keep: impl FnMut(ContextId) -> bool) {
         let mut deleted = |key: ContextKey| matches!(key, ContextKey::Named(id) if !keep(id));
         self.active_contexts.retain(|_, key| !deleted(*key));
         let removed: Vec<_> =
             self.context_layouts.keys().copied().filter(|&(_, key)| deleted(key)).collect();
+        let mut layouts = Vec::new();
         for key in removed {
             let Some(mapping) = self.context_layouts.remove(&key) else {
                 continue;
@@ -2732,8 +2734,15 @@ impl LayoutManager {
             for layout in mapping.layouts() {
                 self.tree.remove_layout(layout);
                 self.viewports.remove(&layout);
+                layouts.push(layout);
             }
         }
+        self.interactive_move.take_if(|state| layouts.contains(&state.layout_id));
+        self.interactive_drag.take_if(|state| layouts.contains(&state.layout_id));
+        // A resize holds nodes, which are gone once their layout is removed.
+        self.interactive_resize.take_if(|state| {
+            !self.tree.node_exists(state.column_node) || !self.tree.node_exists(state.window_node)
+        });
     }
 
     fn try_layout(&self, space: SpaceId) -> Option<LayoutId> {
@@ -5896,6 +5905,68 @@ mod tests {
             ],
             shown_frames(&mut mgr, space, screen, ContextKey::Everything),
         );
+    }
+
+    /// R6. Deleting a context ends a mouse move, resize, or drag on one of its
+    /// layouts, so the next mouse event doesn't use a removed layout. One on
+    /// another context's layout goes on.
+    #[test]
+    fn deleting_a_context_cancels_interactive_state_on_its_layouts() {
+        let mut mgr = LayoutManager::new_for_test();
+        let config = config_with_scroll(true, LayoutKind::Scroll);
+        mgr.set_config(&config);
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let screen = rect(0, 0, 900, 600);
+        let w = |idx| WindowId::new(1, idx);
+        let on1 = [w(1), w(2), w(3)];
+        let on2 = [w(4), w(5)];
+        let [c, d] = named_contexts(["C", "D"]);
+        let start = CGPoint::new(10.0, 10.0);
+        let dragged = CGPoint::new(500.0, 300.0);
+
+        switch(&mut mgr, space1, screen.size, ContextKey::Everything, &on1);
+        switch(&mut mgr, space2, screen.size, ContextKey::Everything, &on2);
+        switch(&mut mgr, space1, screen.size, c, &on1);
+        switch(&mut mgr, space2, screen.size, d, &on2);
+
+        // A move and a drag on C's layout, and a resize on D's.
+        let c_layout = mgr.layout(space1);
+        let c_node = mgr.tree.window_node(c_layout, w(1)).unwrap();
+        assert!(mgr.begin_interactive_move(space1, w(1), c_node, start));
+        mgr.interactive_drag = Some(InteractiveDrag {
+            layout_id: c_layout,
+            source_wid: w(1),
+            source_node: c_node,
+            start_mouse: start,
+            drag_active: false,
+            hover_target: None,
+            current_action: None,
+            preview: DragPreviewState {
+                original_frames: HashMap::default(),
+                last_action: None,
+            },
+        });
+        let d_layout = mgr.layout(space2);
+        let d_window = mgr.tree.window_node(d_layout, w(4)).unwrap();
+        let d_column = mgr.tree.column_of(d_layout, d_window).unwrap();
+        let right = ResizeEdge(ResizeEdge::RIGHT);
+        assert!(mgr.begin_interactive_resize(d_column, d_window, right, start));
+
+        mgr.remove_context_layouts(context_id(c));
+        assert!(mgr.interactive_move.is_none());
+        assert!(mgr.interactive_drag.is_none());
+        assert!(mgr.interactive_resize.is_some());
+        assert!(!mgr.update_interactive_move(dragged, screen, &config));
+        assert!(matches!(
+            mgr.update_interactive_drag(dragged, screen, &config),
+            DragUpdate::NoChange
+        ));
+        _ = mgr.update_interactive_resize(dragged, screen);
+
+        mgr.remove_context_layouts(context_id(d));
+        assert!(!mgr.has_interactive_state());
+        assert!(!mgr.update_interactive_resize(start, screen));
     }
 
     /// L2. A `layout.ron` saved with context layouts restores them. Dropping
