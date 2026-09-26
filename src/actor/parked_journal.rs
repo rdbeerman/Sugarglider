@@ -144,6 +144,16 @@ impl ParkedJournal {
         }
     }
 
+    /// A journal that is never written to disk, starting with `entries` as
+    /// if it had read them at startup.
+    pub fn in_memory_with(entries: Vec<JournalEntry>) -> Self {
+        ParkedJournal {
+            unrestored: entries.iter().map(JournalEntry::key).collect(),
+            entries,
+            ..ParkedJournal::in_memory()
+        }
+    }
+
     pub fn entries(&self) -> &[JournalEntry] {
         &self.entries
     }

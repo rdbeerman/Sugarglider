@@ -33,6 +33,7 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use parking::{Parked, ProcessLookup};
 use quit::PendingExit;
 use redact::Secret;
+use replay::LaunchState;
 pub use replay::{Record, replay};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -569,6 +570,7 @@ impl Reactor {
                     contexts_store::boot_id(),
                     SystemTime::now(),
                 );
+                reactor.record_launch_state();
                 reactor.layout_file = Some(crate::config::restore_file());
                 reactor.exit = Box::new(|code| std::process::exit(code));
                 reactor.mouse_tx.replace(mouse_tx.clone());
@@ -648,6 +650,16 @@ impl Reactor {
             layout_file: None,
             exit: Box::new(|code| info!(code, "Not quitting a reactor that has no exit")),
         }
+    }
+
+    /// Records the journal and the contexts read at launch, so that a replay
+    /// of the recording starts from them.
+    fn record_launch_state(&mut self) {
+        let state = LaunchState {
+            journal: self.journal.entries().to_vec(),
+            contexts: (!self.contexts_unread).then(|| self.contexts.clone()),
+        };
+        self.record.launch_state(&state);
     }
 
     pub async fn run(mut self, events: Receiver, events_tx: Sender) {
@@ -2663,6 +2675,96 @@ pub mod tests {
         std::fs::write(&path, old_recording).unwrap();
 
         replay(&path, |_, _| {}).unwrap();
+    }
+
+    /// A replay starts from the parked-window journal and the contexts that
+    /// the recorded reactor read at launch, so it writes the same frames: it
+    /// puts back the window parked before the launch and parks the window
+    /// that isn't in the active context.
+    #[test]
+    fn a_replay_starts_from_the_journal_and_the_contexts_read_at_launch() {
+        use crate::actor::contexts_store::ContextsStore;
+        use crate::actor::parked_journal::JournalEntry;
+        use crate::model::contexts::{ContextKey, Contexts, WindowDesc};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("trace.ron");
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let mut contexts = Contexts::new();
+        let id = contexts.create("C").unwrap();
+        let desc = WindowDesc {
+            wid: WindowId::new(1, 1),
+            bundle_id: Some("com.testapp1".into()),
+            app_name: Some("TestApp1".into()),
+            title: "Window1".into(),
+            window_server_id: Some(WindowServerId::new(1)),
+        };
+        contexts.add_window(id, &desc).unwrap();
+        contexts.switch_to(ContextKey::Named(id)).unwrap();
+        let store = ContextsStore::new(dir.path().join("contexts.json"));
+        store.save(&contexts, Some("boot")).unwrap();
+        let parked_before = CGRect::new(CGPoint::new(500., 0.), CGSize::new(500., 1000.));
+        let mut journal =
+            ParkedJournal::open(dir.path().join("parked.json"), std::time::SystemTime::now());
+        journal
+            .record(vec![JournalEntry {
+                pid: 1,
+                bundle_id: Some("com.testapp1".into()),
+                window_server_id: WindowServerId::new(2),
+                title: "Window2".into(),
+                frame: parked_before.into(),
+            }])
+            .unwrap();
+        let mut config = Config::default();
+        config.settings.default_disable = false;
+        config.settings.animate = false;
+        config.settings.experimental.contexts.enable = true;
+        let (group_indicators_tx, _) = crate::actor::channel();
+        let mut reactor = Reactor::new(
+            Arc::new(config),
+            LayoutManager::new_for_test(),
+            Record::new(Some(&path)),
+            group_indicators_tx,
+            ParkedJournal::open(dir.path().join("parked.json"), std::time::SystemTime::now()),
+        );
+        reactor.process_lookup = Box::new(test_app_process);
+        reactor.open_contexts(store, Some("boot".into()), std::time::SystemTime::now());
+        reactor.record_launch_state();
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            bounds: vec![screen],
+            spaces: vec![Some(SpaceId::new(1))],
+            scale_factors: vec![1.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        let mut apps = Apps::new();
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        let frame_writes = |requests: Vec<Request>| -> Vec<(WindowId, CGRect)> {
+            requests
+                .into_iter()
+                .filter_map(|request| match request {
+                    Request::SetWindowFrame(wid, frame, _) => Some((wid, frame)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let recorded = frame_writes(apps.requests());
+        assert!(recorded.contains(&(WindowId::new(1, 2), parked_before)));
+        assert_eq!(
+            vec![WindowId::new(1, 2)],
+            reactor.parked.keys().copied().collect::<Vec<_>>()
+        );
+        drop(reactor);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        replay(&path, move |_, request| _ = tx.send(request)).unwrap();
+        let mut replayed = vec![];
+        while let Ok(request) = rx.recv_timeout(Duration::from_millis(200)) {
+            replayed.push(request);
+        }
+        assert_eq!(recorded, frame_writes(replayed));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use tempfile::NamedTempFile;
 use tokio::sync::mpsc::unbounded_channel;
@@ -21,8 +22,9 @@ use tracing::Span;
 use super::{Event, Reactor};
 use crate::actor::app::{AppThreadHandle, Request};
 use crate::actor::layout::LayoutManager;
-use crate::actor::parked_journal::ParkedJournal;
+use crate::actor::parked_journal::{JournalEntry, ParkedJournal};
 use crate::config::Config;
+use crate::model::contexts::Contexts;
 
 thread_local! {
     static DESERIALIZE_THREAD_HANDLE: RefCell<Option<AppThreadHandle>> = RefCell::new(None);
@@ -41,7 +43,17 @@ pub struct Record {
 }
 
 // The format is simple:
-// One line for the layout, followed by one line per event.
+// One line for the config, one for the layout, one for the state read at
+// launch, and then one line per event. Recordings made before the state
+// line existed start their events on the third line.
+
+/// What the reactor read at launch besides the config and the layout: the
+/// parked-window journal, and the contexts if they were read.
+#[derive(Serialize, Deserialize)]
+pub(super) struct LaunchState {
+    pub(super) journal: Vec<JournalEntry>,
+    pub(super) contexts: Option<Contexts>,
+}
 
 impl Record {
     pub fn new(path: Option<&Path>) -> Self {
@@ -84,6 +96,14 @@ impl Record {
         write!(file, "{config}\n{layout}\n").unwrap();
     }
 
+    /// Records what the reactor read at launch. Call it before the first
+    /// event.
+    pub(super) fn launch_state(&mut self, state: &LaunchState) {
+        let Some(file) = self.file() else { return };
+        let line = ron::ser::to_string(state).unwrap();
+        write!(file, "{line}\n").unwrap();
+    }
+
     pub(super) fn on_event(&mut self, event: &Event) {
         let Some(file) = self.file() else { return };
         let line = ron::ser::to_string(&event).unwrap();
@@ -102,15 +122,32 @@ pub fn replay(
     let mut lines = file.lines();
     let config = ron::de::from_str(&lines.next().expect("Empty restore file")?)?;
     let layout = ron::de::from_str(&lines.next().expect("Expected layout line")?)?;
+    let mut first_event = None;
+    let mut state = None;
+    if let Some(line) = lines.next() {
+        let line = line?;
+        match ron::de::from_str::<LaunchState>(&line) {
+            Ok(read) => state = Some(read),
+            Err(_) => first_event = Some(line),
+        }
+    }
     let (group_indicators_tx, _) = crate::actor::channel();
-    // A replay must not read or change the journal of a running Sugarglider.
+    // A replay must not read or change the journal or the contexts of a
+    // running Sugarglider, so both stay in memory.
+    let journal = match &mut state {
+        Some(state) => ParkedJournal::in_memory_with(std::mem::take(&mut state.journal)),
+        None => ParkedJournal::in_memory(),
+    };
     let mut reactor = Reactor::new(
         Arc::new(config),
         layout,
         Record::new(None),
         group_indicators_tx,
-        ParkedJournal::in_memory(),
+        journal,
     );
+    if let Some(contexts) = state.and_then(|state| state.contexts) {
+        reactor.contexts = contexts;
+    }
     std::thread::spawn(move || {
         // Unfortunately we have to spawn a thread because the reactor blocks
         // on raise requests currently.
@@ -118,6 +155,9 @@ pub fn replay(
             on_event(span, request);
         }
     });
+    if let Some(line) = first_event {
+        reactor.handle_event(ron::de::from_str(&line)?);
+    }
     for line in lines {
         reactor.handle_event(ron::de::from_str(&line?)?);
     }
