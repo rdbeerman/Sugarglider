@@ -611,6 +611,16 @@ fn write_preferences_to_path(
     }
     doc["settings"]["status_icon"]["enable"] = value(prefs.status_icon_enable);
 
+    // Ensure [settings.drag_drop] table exists. Indexing a missing key would
+    // create an inline table.
+    if let Some(settings) = doc["settings"].as_table_mut() {
+        let mut drag_drop = toml_edit::Table::new();
+        drag_drop.set_dotted(settings.is_dotted());
+        settings.entry("drag_drop").or_insert(toml_edit::Item::Table(drag_drop));
+    }
+    doc["settings"]["drag_drop"]["enable"] = value(prefs.drag_drop_enable);
+    doc["settings"]["drag_drop"]["live_preview"] = value(prefs.drag_drop_live_preview);
+
     // Ensure [settings.experimental.contexts] table exists. Indexing a missing
     // key would create an inline table.
     if let Some(settings) = doc["settings"].as_table_mut() {
@@ -1821,6 +1831,8 @@ mod tests {
             vec![
                 "settings.animate",
                 "settings.default_layout_kind",
+                "settings.drag_drop.enable",
+                "settings.drag_drop.live_preview",
                 "settings.experimental.contexts.enable",
                 "settings.focus_follows_mouse",
                 "settings.inner_gap",
@@ -1835,6 +1847,43 @@ mod tests {
         prefs.contexts_enable = false;
         write_preferences_to_path(&prefs, &path).unwrap();
         assert!(!Config::load(Some(&path)).unwrap().settings.experimental.contexts.enable);
+    }
+
+    /// The drag-and-drop switches save in each form a file can give the
+    /// `drag_drop` table, next to its other settings and comments.
+    #[test]
+    fn the_drag_and_drop_switches_save() {
+        let files = [
+            "",
+            "[settings.drag_drop]\n# Pixels.\ndrag_threshold = 10.0\n",
+            "[settings]\ndrag_drop.drag_threshold = 10.0\n",
+            "[settings]\ndrag_drop = { drag_threshold = 10.0 }\n",
+            "settings.drag_drop.drag_threshold = 10.0\n",
+        ];
+        let mut prefs: PreferencesJson = serde_json::from_str(PREFERENCES_FROM_SWIFT).unwrap();
+        for file in files {
+            for (enable, live_preview) in [(false, true), (true, false)] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("glide.toml");
+                std::fs::write(&path, file).unwrap();
+                prefs.drag_drop_enable = enable;
+                prefs.drag_drop_live_preview = live_preview;
+
+                write_preferences_to_path(&prefs, &path).unwrap();
+
+                let written = std::fs::read_to_string(&path).unwrap();
+                let config = Config::load(Some(&path)).unwrap_or_else(|e| panic!("{e}\n{written}"));
+                let drag_drop = config.settings.drag_drop;
+                assert_eq!(enable, drag_drop.enable, "{written}");
+                assert_eq!(live_preview, drag_drop.live_preview, "{written}");
+                if !file.is_empty() {
+                    assert_eq!(10.0, drag_drop.drag_threshold, "{written}");
+                }
+                for comment in file.lines().filter(|line| line.starts_with('#')) {
+                    assert!(written.contains(comment), "{written}");
+                }
+            }
+        }
     }
 
     /// Saving the contexts switch keeps the file's comments and other
