@@ -544,9 +544,9 @@ fn r25_a_second_switch_waits_for_its_own_raise() {
     assert_eq!(d, s.reactor.contexts.active());
 }
 
-/// R25. The failures and timeouts of the batches that come before the
-/// switch's focusing raise don't end the wait for the switch. The failure of
-/// the focusing raise itself does.
+/// R25. The failures and timeouts of the raises before the switch's focusing
+/// raise don't end the wait for the switch; the failure of the focusing
+/// raise itself does.
 #[test]
 fn r25_the_batches_before_the_focusing_raise_dont_end_the_wait() {
     let TwoApps { mut s, c, d, other } = two_apps();
@@ -559,7 +559,7 @@ fn r25_the_batches_before_the_focusing_raise_dont_end_the_wait() {
     s.apps.simulate_until_quiet(&mut s.reactor);
 
     s.reactor.handle_event(Event::RaiseRequestFailed {
-        windows: vec![other],
+        windows: vec![wid(1)],
         sequence_id,
         quiet: Quiet::Yes,
     });
@@ -567,7 +567,17 @@ fn r25_the_batches_before_the_focusing_raise_dont_end_the_wait() {
     activate(&mut s, 1, wid(1), Order::GloballyLast);
     assert_eq!(d, s.reactor.contexts.active(), "the focusing raise hasn't gone out");
 
+    // A failure of another raise of the sequence still doesn't end the wait
+    // once the focusing raise is on its way.
     s.reactor.handle_event(Event::RaiseFocusSent { sequence_id });
+    s.reactor.handle_event(Event::RaiseRequestFailed {
+        windows: vec![wid(1)],
+        sequence_id,
+        quiet: Quiet::Yes,
+    });
+    activate(&mut s, 1, wid(1), Order::GloballyLast);
+    assert_eq!(d, s.reactor.contexts.active(), "the focusing raise hasn't failed");
+
     s.reactor.handle_event(Event::RaiseRequestFailed {
         windows: vec![other],
         sequence_id,

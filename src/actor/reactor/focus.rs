@@ -87,7 +87,11 @@ impl Reactor {
             if self.switch_guard.raise.as_ref().is_none_or(|raise| raise.focus != wid) {
                 self.switch_guard.pending_focus = Some(wid);
             }
-            debug!(?wid, guard = ?self.switch_guard, "Ignoring focus while a switch is in progress");
+            debug!(
+                ?wid,
+                guard = ?self.switch_guard,
+                "Ignoring focus while a switch is in progress"
+            );
             return;
         }
         if !self.windows.contains_key(&wid) || self.pending_first_seen.contains(&wid) {
@@ -270,12 +274,23 @@ impl Reactor {
         }
     }
 
+    /// A raise request failed for `windows`. The wait for the switch ends
+    /// only when the focusing raise failed, once it was sent; the failure of
+    /// another raise of the sequence doesn't.
+    pub(super) fn raise_failed(&mut self, sequence_id: u64, windows: &[WindowId]) {
+        let Some(raise) = &self.switch_guard.raise else { return };
+        if sequence_id >= raise.sequence_id && raise.sent && windows.contains(&raise.focus) {
+            self.switch_guard.raise = None;
+            self.finish_guard();
+        }
+    }
+
     /// A raise sequence reported a completed raise of `window`, or with `None`,
-    /// that it failed or timed out. A sequence at least as new as the switch's
-    /// ends the wait for it, because a request identical to the queued one
-    /// replaces it. Until the focusing raise is sent, only a completed raise
-    /// of the switch's window ends the wait: the failures and timeouts of the
-    /// batches before the focusing raise don't.
+    /// that it timed out. A sequence at least as new as the switch's ends the
+    /// wait for it, because a request identical to the queued one replaces
+    /// it. Until the focusing raise is sent, only a completed raise of the
+    /// switch's window ends the wait: a timeout of the batch before the
+    /// focusing raise doesn't.
     pub(super) fn raise_ended(&mut self, sequence_id: u64, window: Option<WindowId>) {
         let Some(raise) = &self.switch_guard.raise else { return };
         if sequence_id < raise.sequence_id {

@@ -1531,9 +1531,12 @@ impl Reactor {
                 self.raise_ended(sequence_id, Some(window_id));
             }
             Event::RaiseRequestFailed { windows, sequence_id, quiet } => {
-                let msg = raise::Event::RaiseRequestFailed { windows, sequence_id };
+                let msg = raise::Event::RaiseRequestFailed {
+                    windows: windows.clone(),
+                    sequence_id,
+                };
                 _ = self.raise_manager_tx.send((Span::current(), msg));
-                self.raise_ended(sequence_id, None);
+                self.raise_failed(sequence_id, &windows);
                 if quiet == Quiet::No
                     && let Some(main_window) = self.main_window()
                 {
