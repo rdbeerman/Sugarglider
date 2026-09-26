@@ -9,6 +9,7 @@
 
 mod animation;
 mod contexts;
+mod contexts_snapshot;
 mod create_context;
 mod focus;
 mod main_window;
@@ -43,6 +44,7 @@ use tracing::{Span, debug, error, info, instrument, trace, warn};
 
 use super::mouse;
 use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, pid_t};
+use crate::actor::contexts_snapshot::ContextsSnapshot;
 use crate::actor::contexts_store::{self, ContextsStore};
 use crate::actor::layout::{
     self, DragUpdate, DropAction, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo,
@@ -422,6 +424,10 @@ pub struct Reactor {
     layout_file: Option<PathBuf>,
     /// Ends the process with an exit code.
     exit: Box<dyn FnMut(i32) + Send>,
+    /// The snapshot of the contexts published last.
+    published_contexts: Option<Arc<ContextsSnapshot>>,
+    /// Where snapshots of the contexts go.
+    publish_contexts: Box<dyn FnMut(Arc<ContextsSnapshot>) + Send>,
 }
 
 /// How many times in a row we write the same frame to a window before giving
@@ -577,6 +583,8 @@ impl Reactor {
                 reactor.record_launch_state();
                 reactor.layout_file = Some(crate::config::restore_file());
                 reactor.exit = Box::new(|code| std::process::exit(code));
+                reactor.publish_contexts = Box::new(crate::actor::contexts_snapshot::publish);
+                reactor.publish_contexts_snapshot();
                 reactor.mouse_tx.replace(mouse_tx.clone());
                 reactor.status_tx.replace(status_tx.clone());
                 let space_manager = SpaceManager::new(
@@ -653,6 +661,8 @@ impl Reactor {
             added_since_switch: HashSet::default(),
             layout_file: None,
             exit: Box::new(|code| info!(code, "Not quitting a reactor that has no exit")),
+            published_contexts: None,
+            publish_contexts: Box::new(|_| {}),
         }
     }
 
@@ -736,6 +746,7 @@ impl Reactor {
     fn handle_event(&mut self, event: Event) {
         self.on_event(event);
         self.exit_if_windows_are_back();
+        self.publish_contexts_snapshot();
     }
 
     fn on_event(&mut self, event: Event) {
