@@ -585,6 +585,22 @@ fn write_preferences_to_path(
     }
     doc["settings"]["status_icon"]["enable"] = value(prefs.status_icon_enable);
 
+    // Ensure [settings.experimental.contexts] table exists. Indexing a missing
+    // key would create an inline table.
+    if let Some(settings) = doc["settings"].as_table_mut() {
+        let experimental = settings.entry("experimental").or_insert_with(|| {
+            let mut experimental = toml_edit::Table::new();
+            experimental.set_implicit(true);
+            toml_edit::Item::Table(experimental)
+        });
+        if let Some(experimental) = experimental.as_table_mut() {
+            let mut contexts = toml_edit::Table::new();
+            contexts.set_dotted(experimental.is_dotted());
+            experimental.entry("contexts").or_insert(toml_edit::Item::Table(contexts));
+        }
+    }
+    doc["settings"]["experimental"]["contexts"]["enable"] = value(prefs.contexts_enable);
+
     // Update window_rules as an array of tables
     let mut rules_array = toml_edit::ArrayOfTables::new();
     for rule in &prefs.window_rules {
@@ -1484,5 +1500,89 @@ mod tests {
             bound_to("Alt + KeyT"),
             WmCommand::Wm(WmCmd::Exec(ExecCmd::String(cmd))) if cmd == "open -a Terminal"
         ));
+    }
+
+    fn leaf_keys(prefix: &str, table: &toml::Table, keys: &mut Vec<String>) {
+        for (key, value) in table {
+            let path = format!("{prefix}.{key}");
+            match value {
+                toml::Value::Table(table) => leaf_keys(&path, table, keys),
+                _ => keys.push(path),
+            }
+        }
+    }
+
+    /// The Preferences window writes only its fixed list of settings, the
+    /// contexts switch among them, and the config file reads the switch back.
+    #[test]
+    fn the_contexts_switch_saves_with_only_the_fixed_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        let mut prefs: PreferencesJson = serde_json::from_str(PREFERENCES_FROM_SWIFT).unwrap();
+        assert!(prefs.contexts_enable);
+
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut top_level: Vec<&str> = written.keys().map(String::as_str).collect();
+        top_level.sort();
+        assert_eq!(vec!["keys", "settings", "window_rules"], top_level);
+        let mut settings = Vec::new();
+        leaf_keys(
+            "settings",
+            written["settings"].as_table().unwrap(),
+            &mut settings,
+        );
+        settings.sort();
+        assert_eq!(
+            vec![
+                "settings.animate",
+                "settings.default_layout_kind",
+                "settings.experimental.contexts.enable",
+                "settings.focus_follows_mouse",
+                "settings.inner_gap",
+                "settings.mouse_follows_focus",
+                "settings.outer_gap",
+                "settings.status_icon.enable",
+            ],
+            settings
+        );
+        assert!(Config::load(Some(&path)).unwrap().settings.experimental.contexts.enable);
+
+        prefs.contexts_enable = false;
+        write_preferences_to_path(&prefs, &path).unwrap();
+        assert!(!Config::load(Some(&path)).unwrap().settings.experimental.contexts.enable);
+    }
+
+    /// Saving the contexts switch keeps the file's comments and other
+    /// experimental settings in each form a file can give the `experimental`
+    /// table, and never adds a second `contexts` table.
+    #[test]
+    fn the_contexts_switch_saves_into_the_existing_experimental_table() {
+        let files = [
+            // The form that sugarglider.default.toml uses.
+            "[settings.experimental]\n\n# Scroll layout settings.\nscroll.enable = true\n\n\
+             # Named window sets.\ncontexts.enable = false\n",
+            "[settings.experimental.scroll]\nenable = true\n",
+            "[settings]\nexperimental.scroll.enable = true\n",
+            "[settings]\nexperimental = { scroll = { enable = true } }\n",
+        ];
+        let prefs: PreferencesJson = serde_json::from_str(PREFERENCES_FROM_SWIFT).unwrap();
+        for file in files {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("glide.toml");
+            std::fs::write(&path, file).unwrap();
+
+            write_preferences_to_path(&prefs, &path).unwrap();
+
+            let written = std::fs::read_to_string(&path).unwrap();
+            let config = Config::load(Some(&path)).unwrap_or_else(|e| panic!("{e}\n{written}"));
+            assert!(config.settings.experimental.contexts.enable, "{written}");
+            assert!(config.settings.experimental.scroll.enable, "{written}");
+            for comment in file.lines().filter(|line| line.starts_with('#')) {
+                assert!(written.contains(comment), "{written}");
+            }
+        }
     }
 }

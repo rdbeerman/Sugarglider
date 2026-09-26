@@ -59,6 +59,9 @@ public class PreferencesViewModel: ObservableObject {
     @Published public var defaultSplitDirection: SplitDirection = .auto
     @Published public var defaultColumnWidth: Double = 400
 
+    // Experimental
+    @Published public var contextsEnable: Bool = false
+
     // Hotkeys (read-only, loaded from config)
     @Published public var hotkeys: [HotkeyBinding] = []
 
@@ -147,6 +150,8 @@ public class PreferencesViewModel: ObservableObject {
         // Map layout kind: "scroll" -> .column, "tree" -> .tree
         defaultLayout = config.defaultLayoutKind == "scroll" ? .column : .tree
 
+        contextsEnable = config.contextsEnable
+
         // Load hotkeys
         hotkeys = config.hotkeys
 
@@ -180,6 +185,7 @@ public class PreferencesViewModel: ObservableObject {
             $dragDropEnable.map { _ in () }.eraseToAnyPublisher(),
             $dragDropLivePreview.map { _ in () }.eraseToAnyPublisher(),
             $defaultLayout.map { _ in () }.eraseToAnyPublisher(),
+            $contextsEnable.map { _ in () }.eraseToAnyPublisher(),
             $appRules.map { _ in () }.eraseToAnyPublisher(),
         ]
 
@@ -222,6 +228,7 @@ public class PreferencesViewModel: ObservableObject {
             dragDropLivePreview: dragDropLivePreview,
             // Map layout mode: .column -> "scroll", .tree -> "tree"
             defaultLayoutKind: defaultLayout == .column ? "scroll" : "tree",
+            contextsEnable: contextsEnable,
             windowRules: appRules.map { rule in
                 WindowRuleJson(
                     appName: rule.appName.isEmpty ? nil : rule.appName,

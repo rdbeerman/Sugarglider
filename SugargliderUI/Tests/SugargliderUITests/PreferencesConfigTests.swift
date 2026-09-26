@@ -27,6 +27,7 @@ final class PreferencesConfigTests: XCTestCase {
     dragDropEnable: true,
     dragDropLivePreview: false,
     defaultLayoutKind: "tree",
+    contextsEnable: true,
     windowRules: [
       WindowRuleJson(appName: "Finder", bundleId: "com.apple.finder", behavior: "float"),
       WindowRuleJson(appName: "Calculator", behavior: "float"),
@@ -53,5 +54,29 @@ final class PreferencesConfigTests: XCTestCase {
     let fixture = try Self.jsonObject(Data(contentsOf: Self.fixtureURL))
 
     XCTAssertEqual(fixture, encoded)
+  }
+
+  /// `sugarglider_get_config` sends the contexts switch and a sort order for
+  /// each key binding.
+  func testDecodesTheContextsSwitchThatRustSends() throws {
+    let json = """
+      {
+        "statusIconEnable": true, "animate": true, "focusFollowsMouse": false,
+        "mouseFollowsFocus": false, "outerGap": 0.0, "innerGap": 0.0,
+        "dragDropEnable": true, "dragDropLivePreview": true, "defaultLayoutKind": "tree",
+        "contextsEnable": true, "windowRules": [],
+        "hotkeys": [
+          { "key": "⌥Z", "commandId": "toggle_global_enabled",
+            "description": "Toggle tiling globally", "category": "System",
+            "defaultKey": "⌥Z", "sortOrder": 0 }
+        ]
+      }
+      """
+
+    let config = try JSONDecoder().decode(PreferencesConfig.self, from: Data(json.utf8))
+
+    XCTAssertTrue(config.contextsEnable)
+    XCTAssertEqual(config.hotkeys.map(\.commandId), ["toggle_global_enabled"])
+    XCTAssertFalse(PreferencesConfig().contextsEnable)
   }
 }

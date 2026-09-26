@@ -1,5 +1,6 @@
 {
   "animate": false,
+  "contextsEnable": true,
   "defaultLayoutKind": "tree",
   "dragDropEnable": true,
   "dragDropLivePreview": false,

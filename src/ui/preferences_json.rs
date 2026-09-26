@@ -41,6 +41,9 @@ pub struct PreferencesJson {
     // Layout settings
     pub default_layout_kind: String,
 
+    // Experimental features
+    pub contexts_enable: bool,
+
     // Window rules
     pub window_rules: Vec<WindowRuleJson>,
 
@@ -95,6 +98,7 @@ impl PreferencesJson {
                 LayoutKind::Tree => "tree".to_string(),
                 LayoutKind::Scroll => "scroll".to_string(),
             },
+            contexts_enable: settings.experimental.contexts.enable,
             window_rules: config.window_rules.iter().map(WindowRuleJson::from_rule).collect(),
             hotkeys: {
                 // Build a map of command_id -> default hotkey from the default config
@@ -146,6 +150,7 @@ impl PreferencesJson {
             "scroll" => LayoutKind::Scroll,
             _ => LayoutKind::Tree,
         };
+        settings.experimental.contexts.enable = self.contexts_enable;
 
         let window_rules: Vec<WindowRule> =
             self.window_rules.iter().map(WindowRuleJson::to_rule).collect();
@@ -769,6 +774,7 @@ mod tests {
             drag_drop_enable: true,
             drag_drop_live_preview: true,
             default_layout_kind: "tree".to_string(),
+            contexts_enable: true,
             window_rules: vec![WindowRuleJson {
                 app_name: Some("Finder".to_string()),
                 bundle_id: Some("com.apple.finder".to_string()),
@@ -918,6 +924,28 @@ mod tests {
             bindings.iter().map(|(key, cmd)| (key.to_string(), cmd.clone())).collect();
         expected.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(expected, keys);
+    }
+
+    /// The Preferences switch shows and sets
+    /// `settings.experimental.contexts.enable` and leaves the other
+    /// experimental settings alone.
+    #[test]
+    fn the_contexts_switch_follows_the_contexts_flag() {
+        let mut config = Config::default();
+        config.settings.experimental.contexts.enable = true;
+        config.settings.experimental.scroll.enable = true;
+
+        let json = serde_json::to_value(PreferencesJson::from_config(&config)).unwrap();
+        assert_eq!(serde_json::json!(true), json["contextsEnable"]);
+
+        let mut prefs: PreferencesJson = serde_json::from_value(json).unwrap();
+        prefs.contexts_enable = false;
+        let applied = prefs.apply_to_config(&config);
+        assert!(!applied.settings.experimental.contexts.enable);
+        assert!(applied.settings.experimental.scroll.enable);
+
+        prefs.contexts_enable = true;
+        assert!(prefs.apply_to_config(&applied).settings.experimental.contexts.enable);
     }
 
     #[test]

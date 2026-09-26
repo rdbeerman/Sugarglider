@@ -23,6 +23,9 @@ public struct PreferencesConfig: Codable {
     // Layout settings
     public var defaultLayoutKind: String
 
+    // Experimental features
+    public var contextsEnable: Bool
+
     // Window rules
     public var windowRules: [WindowRuleJson]
 
@@ -39,6 +42,7 @@ public struct PreferencesConfig: Codable {
         dragDropEnable: Bool = true,
         dragDropLivePreview: Bool = true,
         defaultLayoutKind: String = "tree",
+        contextsEnable: Bool = false,
         windowRules: [WindowRuleJson] = [],
         hotkeys: [HotkeyBinding] = []
     ) {
@@ -51,6 +55,7 @@ public struct PreferencesConfig: Codable {
         self.dragDropEnable = dragDropEnable
         self.dragDropLivePreview = dragDropLivePreview
         self.defaultLayoutKind = defaultLayoutKind
+        self.contextsEnable = contextsEnable
         self.windowRules = windowRules
         self.hotkeys = hotkeys
     }

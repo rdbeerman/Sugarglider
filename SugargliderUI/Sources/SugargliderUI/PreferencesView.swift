@@ -114,6 +114,14 @@ struct GeneralPane: View {
                         .frame(width: 40)
                 }
             }
+
+            Section {
+                Toggle("Contexts (experimental)", isOn: $viewModel.contextsEnable)
+            } footer: {
+                Text("Named sets of windows that you switch between, each with its own layout.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
         }
         .formStyle(.grouped)
         .padding()
