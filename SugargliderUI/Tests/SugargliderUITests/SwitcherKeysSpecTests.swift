@@ -73,7 +73,7 @@ final class SwitcherKeysSpecTests: SwitcherSpecTestCase {
     for key: SwitcherKey in [.commandEnter, .shiftCommandEnter, .commandP] {
       let model = try makeModel(payload)
       XCTAssertTrue(model.handle(key), "\(key)")
-      XCTAssertEqual(model.message, "No window had focus when the switcher opened.", "\(key)")
+      XCTAssertEqual(model.message, ContextSwitcherModel.noTargetWindowMessage, "\(key)")
       XCTAssertEqual(model.mode, .list, "\(key)")
     }
     XCTAssertEqual(backend.sent, [])

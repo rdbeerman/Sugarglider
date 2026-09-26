@@ -344,12 +344,21 @@ final class ContextSwitcherModelTests: XCTestCase {
     XCTAssertEqual(closed, 0)
   }
 
+  /// C2: Rust sends no target window when the focused window is untracked,
+  /// parked, or Sugarglider's own. The window keys are then off, and the
+  /// panel says why.
   func testWindowCommandsNeedATargetWindow() throws {
+    XCTAssertTrue(try makeModel().hasTargetWindow)
+
     var payload = try Fixtures.payload()
     payload.targetWindow = nil
     let model = try makeModel(payload)
+    XCTAssertFalse(model.hasTargetWindow)
     model.handle(.commandEnter)
-    XCTAssertEqual(model.message, "No window had focus when the switcher opened.")
+    XCTAssertEqual(
+      model.message,
+      "No window to add, move, or pin. Focus a window that Sugarglider manages first."
+    )
     model.handle(.commandP)
     XCTAssertEqual(backend.sent, [])
     XCTAssertNil(model.targetWindow)

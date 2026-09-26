@@ -253,6 +253,16 @@ final class ContextSwitcherModel: ObservableObject {
     return payload.windows.first { $0.id == target }
   }
 
+  /// Whether ⌘↩, ⇧⌘↩, and ⌘P have a window to act on. Rust sends no target
+  /// window when none had focus, or when the focused window is untracked,
+  /// parked, or Sugarglider's own.
+  var hasTargetWindow: Bool {
+    payload.targetWindow != nil
+  }
+
+  static let noTargetWindowMessage =
+    "No window to add, move, or pin. Focus a window that Sugarglider manages first."
+
   var highlightedRow: SwitcherRow? {
     rows.indices.contains(highlight) ? rows[highlight] : nil
   }
@@ -500,7 +510,7 @@ final class ContextSwitcherModel: ObservableObject {
 
   private func requireTargetWindow() -> SwitcherWindowId? {
     guard let target = payload.targetWindow else {
-      message = "No window had focus when the switcher opened."
+      message = Self.noTargetWindowMessage
       return nil
     }
     return target

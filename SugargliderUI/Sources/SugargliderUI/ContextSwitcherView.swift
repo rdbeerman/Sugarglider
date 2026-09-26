@@ -280,13 +280,19 @@ struct ContextSwitcherView: View {
           ForEach(Array(line.enumerated()), id: \.offset) { _, hint in
             (Text(hint.key).fontWeight(.semibold) + Text(" " + hint.action))
               .lineLimit(1)
+              .opacity(hint.enabled ? 1 : 0.4)
           }
           Spacer(minLength: 0)
         }
       }
-      if model.mode == .list, let target = model.targetWindow {
-        Text("Window: \(target.title.isEmpty ? "Untitled" : target.title) — \(target.detail)")
-          .lineLimit(1)
+      if model.mode == .list {
+        if let target = model.targetWindow {
+          Text("Window: \(target.title.isEmpty ? "Untitled" : target.title) — \(target.detail)")
+            .lineLimit(1)
+        } else if !model.hasTargetWindow {
+          Text(ContextSwitcherModel.noTargetWindowMessage)
+            .lineLimit(1)
+        }
       }
     }
     .font(.system(size: 12))
@@ -295,27 +301,43 @@ struct ContextSwitcherView: View {
     .padding(.vertical, 10)
   }
 
-  private var hintLines: [[(key: String, action: String)]] {
+  private typealias Hint = (key: String, action: String, enabled: Bool)
+
+  private var hintLines: [[Hint]] {
     switch model.mode {
     case .list:
       let pin = model.targetWindow?.pinned == true ? "unpin" : "pin"
+      let window = model.hasTargetWindow
       return [
-        [("↩", "switch"), ("⌘↩", "add window"), ("⇧⌘↩", "move window"), ("⌘N", "new")],
         [
-          ("⌘E", "edit"), ("⌘R", "rename"), ("⌘1–9", "number"), ("⌘P", pin),
-          ("⌘⌫", "delete"), ("esc", "close"),
+          ("↩", "switch", true), ("⌘↩", "add window", window), ("⇧⌘↩", "move window", window),
+          ("⌘N", "new", true),
+        ],
+        [
+          ("⌘E", "edit", true), ("⌘R", "rename", true), ("⌘1–9", "number", true),
+          ("⌘P", pin, window), ("⌘⌫", "delete", true), ("esc", "close", true),
         ],
       ]
     case .naming:
-      return [[("↩", "choose windows"), ("esc", "back")]]
+      return [[("↩", "choose windows", true), ("esc", "back", true)]]
     case .rename:
-      return [[("↩", "rename"), ("esc", "back")]]
+      return [[("↩", "rename", true), ("esc", "back", true)]]
     case .create:
-      return [[("↑↓", "select"), ("space", "check"), ("↩", "create"), ("esc", "back")]]
+      return [
+        [
+          ("↑↓", "select", true), ("space", "check", true), ("↩", "create", true),
+          ("esc", "back", true),
+        ]
+      ]
     case .edit:
-      return [[("↑↓", "select"), ("space", "check"), ("↩", "save"), ("esc", "back")]]
+      return [
+        [
+          ("↑↓", "select", true), ("space", "check", true), ("↩", "save", true),
+          ("esc", "back", true),
+        ]
+      ]
     case .confirmDelete:
-      return [[("↩", "delete"), ("esc", "cancel")]]
+      return [[("↩", "delete", true), ("esc", "cancel", true)]]
     }
   }
 

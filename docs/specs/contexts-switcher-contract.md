@@ -89,7 +89,7 @@ In this example the Zed window (record 1) is open but not on screen (another Spa
 | Key | Type | Meaning |
 |---|---|---|
 | `display_id` | u32 or null | The `CGDirectDisplayID` of the focused screen. The panel centers on it. Null or an unknown id means the main screen. |
-| `target_window` | window or null | The window that had focus when the reactor handled `open_context_switcher` (spec: "target window"). Every command about a window carries this id, never the window focused when the command is sent. Null disables ⌘↩, ⇧⌘↩, and ⌘P. |
+| `target_window` | window or null | The window that had focus when the reactor handled `open_context_switcher` (spec: "target window"). Every command about a window carries this id, never the window focused when the command is sent. It is null when no window had focus, or when the focused window is untracked, parked (for example Finder's window after R12 step 6), or Sugarglider's own. Otherwise `windows` holds it. Null disables ⌘↩, ⇧⌘↩, and ⌘P: the panel dims their hints and says why. |
 | `contexts` | array | Every named context. |
 | `contexts[].id` | u32 | The context id. |
 | `contexts[].name` | string | The name. |

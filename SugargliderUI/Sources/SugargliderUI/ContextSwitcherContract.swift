@@ -99,8 +99,11 @@ import Foundation
 /// - `display_id`: the `CGDirectDisplayID` of the focused screen. The panel
 ///   centers on it. Null or unknown means the main screen.
 /// - `target_window`: the window that had focus when the reactor handled
-///   `open_context_switcher`, or null. Every command about a window carries
-///   this id, never the window focused when the command is sent.
+///   `open_context_switcher`. Every command about a window carries this id,
+///   never the window focused when the command is sent. It is null when no
+///   window had focus, or when the focused window is untracked, parked, or
+///   Sugarglider's own. Then the panel disables ⌘↩, ⇧⌘↩, and ⌘P and says
+///   why. Otherwise `windows` holds it.
 /// - `contexts`: every named context. `number` is 1 to 9 or null.
 ///   `hotkey` is the binding that runs `switch_context` with that number,
 ///   formatted like the Preferences hotkey list, or null when none is bound.

@@ -229,7 +229,7 @@ final class SwitcherContractSpecTests: SwitcherSpecTestCase {
     XCTAssertEqual(model.highlight, 1)
     XCTAssertNil(model.targetWindow)
     model.handle(.commandEnter)
-    XCTAssertEqual(model.message, "No window had focus when the switcher opened.")
+    XCTAssertEqual(model.message, ContextSwitcherModel.noTargetWindowMessage)
     XCTAssertEqual(backend.sent, [])
   }
 
