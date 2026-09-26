@@ -647,7 +647,7 @@ impl LayoutManager {
             layout,
             LayoutKind::Tree,
         );
-        if let Some(mapping) = self.layout_mapping.get_mut(&space)
+        if let Some((mapping, _)) = self.active_mapping_mut(space)
             && mapping.active_layout() == layout
         {
             mapping.replace_active_layout(new_layout);
@@ -726,6 +726,22 @@ impl LayoutManager {
         mapping.active_layout()
     }
 
+    /// Selects the layout `offset` steps away in the Space's active mapping.
+    fn change_layout_index(&mut self, space: SpaceId, offset: i16) -> EventResponse {
+        let allow_scroll = self.scroll_enabled;
+        let Some((mapping, tree)) = self.active_mapping_mut(space) else {
+            return EventResponse::default();
+        };
+        // FIXME: Update windows in the new layout.
+        let layout = Self::change_layout_index_filtered(mapping, tree, offset, allow_scroll);
+        if let Some(wid) = self.focused_window
+            && let Some(node) = self.tree.window_node(layout, wid)
+        {
+            self.tree.select(node);
+        }
+        EventResponse::default()
+    }
+
     pub fn debug_tree(&self, space: SpaceId) {
         self.debug_tree_desc(space, "", false);
     }
@@ -757,12 +773,11 @@ impl LayoutManager {
             LayoutEvent::SpaceExposed(space, size) => {
                 self.debug_tree(space);
                 let kind = self.default_layout_kind;
-                {
-                    let mapping = self
-                        .layout_mapping
-                        .entry(space)
-                        .or_insert_with(|| SpaceLayoutMapping::new(size, &mut self.tree, kind));
-                    mapping.activate_size(size, &mut self.tree);
+                self.layout_mapping
+                    .entry(space)
+                    .or_insert_with(|| SpaceLayoutMapping::new(size, &mut self.tree, kind));
+                if let Some((mapping, tree)) = self.active_mapping_mut(space) {
+                    mapping.activate_size(size, tree);
                 }
                 self.ensure_layout_kind_allowed_for_space(space);
                 return EventResponse {
@@ -1093,14 +1108,14 @@ impl LayoutManager {
         let Some(space) = space else {
             return EventResponse::default();
         };
-        let Some(mapping) = self.layout_mapping.get_mut(&space) else {
+        let Some((mapping, tree)) = self.active_mapping_mut(space) else {
             error!(
                 ?command, ?self.layout_mapping,
                 "Could not find layout mapping for current space");
             return EventResponse::default();
         };
         if command.modifies_layout() {
-            mapping.prepare_modify(&mut self.tree);
+            mapping.prepare_modify(tree);
         }
         let layout = mapping.active_layout();
 
@@ -1163,32 +1178,8 @@ impl LayoutManager {
             LayoutCommand::ToggleWindowFloating => unreachable!(),
             LayoutCommand::ToggleFocusFloating => unreachable!(),
 
-            LayoutCommand::NextLayout => {
-                // FIXME: Update windows in the new layout.
-                let layout =
-                    Self::change_layout_index_filtered(mapping, &self.tree, 1, self.scroll_enabled);
-                if let Some(wid) = self.focused_window
-                    && let Some(node) = self.tree.window_node(layout, wid)
-                {
-                    self.tree.select(node);
-                }
-                EventResponse::default()
-            }
-            LayoutCommand::PrevLayout => {
-                // FIXME: Update windows in the new layout.
-                let layout = Self::change_layout_index_filtered(
-                    mapping,
-                    &self.tree,
-                    -1,
-                    self.scroll_enabled,
-                );
-                if let Some(wid) = self.focused_window
-                    && let Some(node) = self.tree.window_node(layout, wid)
-                {
-                    self.tree.select(node);
-                }
-                EventResponse::default()
-            }
+            LayoutCommand::NextLayout => self.change_layout_index(space, 1),
+            LayoutCommand::PrevLayout => self.change_layout_index(space, -1),
             LayoutCommand::MoveFocus(direction) => {
                 let is_scroll = self.tree.is_scroll_layout(layout);
                 let use_wrapping = self.scroll_enabled
@@ -1393,7 +1384,9 @@ impl LayoutManager {
                     layout,
                     new_kind,
                 );
-                mapping.replace_active_layout(new_layout);
+                if let Some((mapping, _)) = self.active_mapping_mut(space) {
+                    mapping.replace_active_layout(new_layout);
+                }
                 self.viewports.remove(&layout);
                 EventResponse::default()
             }
@@ -2498,8 +2491,23 @@ impl LayoutManager {
 }
 
 impl LayoutManager {
+    /// The mapping whose active layout the Space shows.
+    fn active_mapping(&self, space: SpaceId) -> Option<&SpaceLayoutMapping> {
+        self.layout_mapping.get(&space)
+    }
+
+    /// The mapping whose active layout the Space shows, with the tree that
+    /// holds its layouts.
+    fn active_mapping_mut(
+        &mut self,
+        space: SpaceId,
+    ) -> Option<(&mut SpaceLayoutMapping, &mut LayoutTree)> {
+        let mapping = self.layout_mapping.get_mut(&space)?;
+        Some((mapping, &mut self.tree))
+    }
+
     fn try_layout(&self, space: SpaceId) -> Option<LayoutId> {
-        self.layout_mapping.get(&space)?.active_layout().into()
+        self.active_mapping(space)?.active_layout().into()
     }
 
     fn layout(&self, space: SpaceId) -> LayoutId {
