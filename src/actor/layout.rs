@@ -5334,4 +5334,1291 @@ mod tests {
             restored.layout_sorted(space, screen)
         );
     }
+
+    /// Shows `key` on the Space without sending its windows again.
+    fn show(mgr: &mut LayoutManager, space: SpaceId, size: CGSize, key: ContextKey) {
+        let context = ActiveContext { key, members: BTreeSet::new() };
+        _ = mgr.handle_event(LayoutEvent::SpaceExposed(space, size, context));
+    }
+
+    /// The frames the Space shows after `show`.
+    fn shown_frames(
+        mgr: &mut LayoutManager,
+        space: SpaceId,
+        screen: CGRect,
+        key: ContextKey,
+    ) -> Vec<(WindowId, CGRect)> {
+        show(mgr, space, screen.size, key);
+        mgr.layout_sorted(space, screen)
+    }
+
+    /// The frames the Space shows after `switch`.
+    fn switched_frames(
+        mgr: &mut LayoutManager,
+        space: SpaceId,
+        screen: CGRect,
+        key: ContextKey,
+        showing: &[WindowId],
+    ) -> Vec<(WindowId, CGRect)> {
+        switch(mgr, space, screen.size, key, showing);
+        mgr.layout_sorted(space, screen)
+    }
+
+    /// Focuses the window and moves it.
+    fn move_window(mgr: &mut LayoutManager, space: SpaceId, wid: WindowId, direction: Direction) {
+        _ = mgr.handle_event(LayoutEvent::WindowFocused(vec![space], wid));
+        _ = mgr.handle_command(Some(space), &[space], LayoutCommand::MoveNode(direction));
+    }
+
+    const NO_FRAMES: Vec<(WindowId, CGRect)> = Vec::new();
+
+    fn context_keys(mgr: &LayoutManager) -> HashSet<(SpaceId, ContextKey)> {
+        mgr.context_layouts.keys().copied().collect()
+    }
+
+    /// R2, L1, L2. Each context keeps its own layout on each Space and screen
+    /// size, and Everything's layouts don't change.
+    #[test]
+    fn contexts_on_two_spaces_keep_a_layout_per_screen_size() {
+        let mut mgr = LayoutManager::new_for_test();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let small = rect(0, 0, 120, 120);
+        let wide = rect(0, 0, 240, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let on1 = [w(1), w(2), w(3)];
+        let on2 = [w(4), w(5), w(6)];
+        let d_on1 = [w(2), w(3)];
+        let d_on2 = [w(4), w(5)];
+        let [c, d] = named_contexts(["C", "D"]);
+        let everything = ContextKey::Everything;
+
+        switch(&mut mgr, space1, small.size, everything, &on1);
+        switch(&mut mgr, space2, small.size, everything, &on2);
+        switch(&mut mgr, space1, small.size, c, &on1);
+        move_window(&mut mgr, space1, w(1), Direction::Up);
+        // D starts from C's layout without w1.
+        switch(&mut mgr, space1, small.size, d, &d_on1);
+        move_window(&mut mgr, space1, w(3), Direction::Up);
+        switch(&mut mgr, space1, wide.size, c, &on1);
+        move_window(&mut mgr, space1, w(3), Direction::Up);
+        switch(&mut mgr, space2, small.size, c, &on2);
+        move_window(&mut mgr, space2, w(6), Direction::Up);
+        // D starts from C's layout without w6.
+        switch(&mut mgr, space2, wide.size, d, &d_on2);
+        move_window(&mut mgr, space2, w(5), Direction::Up);
+
+        assert_eq!(
+            [(space1, c), (space1, d), (space2, c), (space2, d)]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            context_keys(&mgr),
+        );
+        assert_eq!(2, mgr.context_layouts[&(space1, c)].layouts().len());
+
+        for _ in 0..2 {
+            assert_eq!(
+                vec![
+                    (w(1), rect(0, 0, 40, 120)),
+                    (w(2), rect(40, 0, 40, 120)),
+                    (w(3), rect(80, 0, 40, 120)),
+                ],
+                switched_frames(&mut mgr, space1, small, everything, &on1),
+            );
+            assert_eq!(
+                vec![
+                    (w(1), rect(0, 0, 80, 120)),
+                    (w(2), rect(80, 0, 80, 120)),
+                    (w(3), rect(160, 0, 80, 120)),
+                ],
+                switched_frames(&mut mgr, space1, wide, everything, &on1),
+            );
+            assert_eq!(
+                vec![
+                    (w(1), rect(0, 0, 120, 60)),
+                    (w(2), rect(0, 60, 60, 60)),
+                    (w(3), rect(60, 60, 60, 60)),
+                ],
+                switched_frames(&mut mgr, space1, small, c, &on1),
+            );
+            assert_eq!(
+                vec![
+                    (w(1), rect(0, 0, 240, 40)),
+                    (w(2), rect(0, 80, 240, 40)),
+                    (w(3), rect(0, 40, 240, 40)),
+                ],
+                switched_frames(&mut mgr, space1, wide, c, &on1),
+            );
+            assert_eq!(
+                vec![(w(2), rect(0, 60, 120, 60)), (w(3), rect(0, 0, 120, 60))],
+                switched_frames(&mut mgr, space1, small, d, &d_on1),
+            );
+            assert_eq!(
+                vec![(w(2), rect(0, 60, 240, 60)), (w(3), rect(0, 0, 240, 60))],
+                switched_frames(&mut mgr, space1, wide, d, &d_on1),
+            );
+            assert_eq!(
+                vec![
+                    (w(4), rect(0, 0, 40, 120)),
+                    (w(5), rect(40, 0, 40, 120)),
+                    (w(6), rect(80, 0, 40, 120)),
+                ],
+                switched_frames(&mut mgr, space2, small, everything, &on2),
+            );
+            assert_eq!(
+                vec![
+                    (w(4), rect(0, 0, 80, 120)),
+                    (w(5), rect(80, 0, 80, 120)),
+                    (w(6), rect(160, 0, 80, 120)),
+                ],
+                switched_frames(&mut mgr, space2, wide, everything, &on2),
+            );
+            assert_eq!(
+                vec![
+                    (w(4), rect(0, 60, 60, 60)),
+                    (w(5), rect(60, 60, 60, 60)),
+                    (w(6), rect(0, 0, 120, 60)),
+                ],
+                switched_frames(&mut mgr, space2, small, c, &on2),
+            );
+            assert_eq!(
+                vec![
+                    (w(4), rect(0, 60, 120, 60)),
+                    (w(5), rect(120, 60, 120, 60)),
+                    (w(6), rect(0, 0, 240, 60)),
+                ],
+                switched_frames(&mut mgr, space2, wide, c, &on2),
+            );
+            assert_eq!(
+                vec![(w(4), rect(0, 60, 120, 60)), (w(5), rect(0, 0, 120, 60))],
+                switched_frames(&mut mgr, space2, small, d, &d_on2),
+            );
+            assert_eq!(
+                vec![(w(4), rect(0, 60, 240, 60)), (w(5), rect(0, 0, 240, 60))],
+                switched_frames(&mut mgr, space2, wide, d, &d_on2),
+            );
+        }
+    }
+
+    /// L1. A split, a move into the nested container, and a resize inside it
+    /// change only C's layout.
+    #[test]
+    fn a_nested_split_under_a_context_changes_only_that_contexts_layout() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let on1 = [w(1), w(2), w(3), w(4)];
+        let on2 = [w(5), w(6)];
+        let [c, d] = named_contexts(["C", "D"]);
+        let everything = ContextKey::Everything;
+        let visible = [space1, space2];
+
+        switch(&mut mgr, space1, screen.size, everything, &on1);
+        switch(&mut mgr, space2, screen.size, everything, &on2);
+        switch(&mut mgr, space1, screen.size, d, &on1);
+        switch(&mut mgr, space1, screen.size, c, &on1);
+
+        // C becomes [w1 / [w2 | [w3 / w4]]], with w3 taking 3/4 of its column.
+        _ = mgr.handle_event(WindowFocused(vec![space1], w(1)));
+        _ = mgr.handle_command(Some(space1), &visible, MoveNode(Direction::Up));
+        _ = mgr.handle_event(WindowFocused(vec![space1], w(3)));
+        _ = mgr.handle_command(Some(space1), &visible, Split(Orientation::Vertical));
+        _ = mgr.handle_event(WindowFocused(vec![space1], w(4)));
+        _ = mgr.handle_command(Some(space1), &visible, MoveNode(Direction::Left));
+        _ = mgr.handle_event(WindowFocused(vec![space1], w(3)));
+        _ = mgr.handle_command(
+            Some(space1),
+            &visible,
+            Resize {
+                direction: Direction::Down,
+                percent: 12.5,
+            },
+        );
+        let c_frames = vec![
+            (w(1), rect(0, 0, 120, 60)),
+            (w(2), rect(0, 60, 60, 60)),
+            (w(3), rect(60, 60, 60, 45)),
+            (w(4), rect(60, 105, 60, 15)),
+        ];
+        assert_eq!(c_frames, mgr.layout_sorted(space1, screen));
+
+        let side_by_side = vec![
+            (w(1), rect(0, 0, 30, 120)),
+            (w(2), rect(30, 0, 30, 120)),
+            (w(3), rect(60, 0, 30, 120)),
+            (w(4), rect(90, 0, 30, 120)),
+        ];
+        let space2_frames = vec![(w(5), rect(0, 0, 60, 120)), (w(6), rect(60, 0, 60, 120))];
+        assert_eq!(space2_frames, mgr.layout_sorted(space2, screen));
+        assert_eq!(side_by_side, shown_frames(&mut mgr, space1, screen, d));
+        assert_eq!(side_by_side, shown_frames(&mut mgr, space1, screen, everything));
+
+        for _ in 0..2 {
+            assert_eq!(side_by_side, switched_frames(&mut mgr, space1, screen, d, &on1));
+            assert_eq!(c_frames, switched_frames(&mut mgr, space1, screen, c, &on1));
+            assert_eq!(
+                side_by_side,
+                switched_frames(&mut mgr, space1, screen, everything, &on1)
+            );
+            assert_eq!(
+                space2_frames,
+                switched_frames(&mut mgr, space2, screen, everything, &on2)
+            );
+        }
+    }
+
+    /// L7, L9. Floating a window that is in C and D takes it out of C's
+    /// layouts at every size. D keeps its place, and unfloating the window in
+    /// C doesn't move it in D.
+    #[test]
+    fn floating_and_unfloating_a_shared_window_keeps_its_place_in_the_other_context() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let small = rect(0, 0, 120, 120);
+        let wide = rect(0, 0, 240, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c, d] = named_contexts(["C", "D"]);
+        let everything = ContextKey::Everything;
+        let side_by_side = vec![
+            (w(1), rect(0, 0, 40, 120)),
+            (w(2), rect(40, 0, 40, 120)),
+            (w(3), rect(80, 0, 40, 120)),
+        ];
+
+        switch(&mut mgr, space, small.size, everything, &all);
+        switch(&mut mgr, space, small.size, c, &all);
+        switch(&mut mgr, space, small.size, d, &all);
+        move_window(&mut mgr, space, w(2), Direction::Up);
+        let d_frames = vec![
+            (w(1), rect(0, 60, 60, 60)),
+            (w(2), rect(0, 0, 120, 60)),
+            (w(3), rect(60, 60, 60, 60)),
+        ];
+        assert_eq!(d_frames, mgr.layout_sorted(space, small));
+        switch(&mut mgr, space, small.size, c, &all);
+        move_window(&mut mgr, space, w(1), Direction::Up);
+        switch(&mut mgr, space, wide.size, c, &all);
+        move_window(&mut mgr, space, w(3), Direction::Up);
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 240, 40)),
+                (w(2), rect(0, 80, 240, 40)),
+                (w(3), rect(0, 40, 240, 40)),
+            ],
+            mgr.layout_sorted(space, wide),
+        );
+        switch(&mut mgr, space, small.size, c, &all);
+
+        _ = mgr.handle_event(WindowFocused(vec![space], w(2)));
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        assert_eq!(
+            vec![(w(1), rect(0, 0, 120, 60)), (w(3), rect(0, 60, 120, 60))],
+            mgr.layout_sorted(space, small),
+        );
+        // C's layout for the other size lost w2 too.
+        assert_eq!(
+            vec![(w(1), rect(0, 0, 240, 60)), (w(3), rect(0, 60, 240, 60))],
+            shown_frames(&mut mgr, space, wide, c),
+        );
+        assert_eq!(d_frames, shown_frames(&mut mgr, space, small, d));
+        assert_eq!(side_by_side, shown_frames(&mut mgr, space, small, everything));
+
+        // w2 still has focus. Unfloating it in C puts it after C's selection.
+        show(&mut mgr, space, small.size, c);
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        let c_small = vec![
+            (w(1), rect(0, 0, 120, 40)),
+            (w(2), rect(0, 80, 120, 40)),
+            (w(3), rect(0, 40, 120, 40)),
+        ];
+        assert_eq!(c_small, mgr.layout_sorted(space, small));
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 240, 40)),
+                (w(2), rect(0, 80, 240, 40)),
+                (w(3), rect(0, 40, 240, 40)),
+            ],
+            switched_frames(&mut mgr, space, wide, c, &all),
+        );
+        assert_eq!(d_frames, switched_frames(&mut mgr, space, small, d, &all));
+        assert_eq!(
+            side_by_side,
+            switched_frames(&mut mgr, space, small, everything, &all)
+        );
+        assert_eq!(c_small, switched_frames(&mut mgr, space, small, c, &all));
+    }
+
+    /// L9. Floating and unfloating a window under Everything leaves its place
+    /// in a context's layout alone.
+    #[test]
+    fn floating_under_everything_keeps_a_windows_place_in_a_context() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c] = named_contexts(["C"]);
+        let everything = ContextKey::Everything;
+
+        switch(&mut mgr, space, screen.size, everything, &all);
+        switch(&mut mgr, space, screen.size, c, &all);
+        move_window(&mut mgr, space, w(1), Direction::Up);
+        switch(&mut mgr, space, screen.size, everything, &all);
+
+        _ = mgr.handle_event(WindowFocused(vec![space], w(2)));
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        assert_eq!(
+            vec![(w(1), rect(0, 0, 60, 120)), (w(3), rect(60, 0, 60, 120))],
+            mgr.layout_sorted(space, screen),
+        );
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 40, 120)),
+                (w(2), rect(80, 0, 40, 120)),
+                (w(3), rect(40, 0, 40, 120)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 120, 60)),
+                (w(2), rect(0, 60, 60, 60)),
+                (w(3), rect(60, 60, 60, 60)),
+            ],
+            switched_frames(&mut mgr, space, screen, c, &all),
+        );
+    }
+
+    /// L7. A window has one floating frame, whichever context it floats in.
+    #[test]
+    fn a_shared_window_floats_at_the_same_frame_in_every_context() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c, d] = named_contexts(["C", "D"]);
+
+        switch(&mut mgr, space, screen.size, ContextKey::Everything, &all);
+        switch(&mut mgr, space, screen.size, c, &all);
+        switch(&mut mgr, space, screen.size, d, &all);
+        switch(&mut mgr, space, screen.size, c, &all);
+
+        _ = mgr.handle_event(WindowFocused(vec![space], w(2)));
+        let response = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        assert_eq!(vec![(w(2), CGRect::ZERO)], response.frame_overrides);
+        let moved = rect(10, 20, 50, 40);
+        _ = mgr.handle_event(WindowFrameChanged { wid: w(2), frame: moved });
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+
+        switch(&mut mgr, space, screen.size, d, &all);
+        _ = mgr.handle_event(WindowFocused(vec![space], w(2)));
+        let response = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        assert_eq!(vec![(w(2), moved)], response.frame_overrides);
+        assert_eq!(Some(moved), mgr.floating_restore_frame(w(2)));
+    }
+
+    /// L7. A size lock belongs to the window, so a lock set under C also holds
+    /// in D and in Everything.
+    #[test]
+    fn a_size_lock_set_in_one_context_holds_in_the_others() {
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c, d] = named_contexts(["C", "D"]);
+
+        switch(&mut mgr, space, screen.size, ContextKey::Everything, &all);
+        switch(&mut mgr, space, screen.size, d, &all);
+        switch(&mut mgr, space, screen.size, c, &all);
+        _ = mgr.handle_event(LayoutEvent::WindowFocused(vec![space], w(1)));
+        let feedback = set_size_share(&mut mgr, space, SizeShare::Fraction(0.5));
+        assert_eq!(Some(SizeShareOutcome::Applied), feedback.map(|f| f.outcome));
+        let locked = vec![
+            (w(1), rect(0, 0, 60, 120)),
+            (w(2), rect(60, 0, 30, 120)),
+            (w(3), rect(90, 0, 30, 120)),
+        ];
+        assert_eq!(locked, mgr.layout_sorted(space, screen));
+        assert_eq!(locked, switched_frames(&mut mgr, space, screen, d, &all));
+        assert_eq!(
+            locked,
+            switched_frames(&mut mgr, space, screen, ContextKey::Everything, &all)
+        );
+    }
+
+    /// R6, L2. After the active context is deleted, each lookup of its Space
+    /// logs one error and uses Everything's layout. Other Spaces and the
+    /// windows' other layouts are untouched. Showing Unsorted ends the
+    /// errors.
+    #[test]
+    fn deleting_the_active_context_falls_back_to_everything_until_unsorted_shows() {
+        let mut mgr = LayoutManager::new_for_test();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let on1 = [w(1), w(2), w(3)];
+        let on2 = [w(4), w(5)];
+        let mut contexts = Contexts::new();
+        let c_id = contexts.create("C").unwrap();
+        let d_id = contexts.create("D").unwrap();
+        let (c, d) = (ContextKey::Named(c_id), ContextKey::Named(d_id));
+        let everything = ContextKey::Everything;
+        let side_by_side = vec![
+            (w(1), rect(0, 0, 40, 120)),
+            (w(2), rect(40, 0, 40, 120)),
+            (w(3), rect(80, 0, 40, 120)),
+        ];
+        let d1_frames = vec![(w(1), rect(0, 0, 120, 60)), (w(3), rect(0, 60, 120, 60))];
+        let d2_frames = vec![(w(4), rect(0, 60, 120, 60)), (w(5), rect(0, 0, 120, 60))];
+
+        switch(&mut mgr, space1, screen.size, everything, &on1);
+        switch(&mut mgr, space2, screen.size, everything, &on2);
+        switch(&mut mgr, space1, screen.size, c, &on1);
+        move_window(&mut mgr, space1, w(1), Direction::Up);
+        assert_eq!(
+            d1_frames,
+            switched_frames(&mut mgr, space1, screen, d, &[w(1), w(3)])
+        );
+        switch(&mut mgr, space2, screen.size, d, &on2);
+        move_window(&mut mgr, space2, w(5), Direction::Up);
+        assert_eq!(d2_frames, mgr.layout_sorted(space2, screen));
+        switch(&mut mgr, space1, screen.size, c, &on1);
+        contexts.switch_to(c).unwrap();
+        assert_eq!(5, mgr.tree.layouts().len());
+
+        contexts.delete(c_id).unwrap();
+        mgr.remove_context_layouts(c_id);
+        assert_eq!(ContextKey::Unsorted, contexts.active());
+        assert_eq!(4, mgr.tree.layouts().len());
+        assert_eq!(
+            [(space1, d), (space2, d)].into_iter().collect::<HashSet<_>>(),
+            context_keys(&mgr),
+        );
+
+        let mut frames = vec![];
+        assert_eq!(1, count_errors(|| frames = mgr.layout_sorted(space1, screen)));
+        assert_eq!(side_by_side, frames);
+        assert_eq!(0, count_errors(|| frames = mgr.layout_sorted(space2, screen)));
+        assert_eq!(d2_frames, frames);
+
+        // The reactor shows Unsorted, whose layout starts from the one the
+        // Space shows.
+        let unsorted = ActiveContext {
+            key: ContextKey::Unsorted,
+            members: [w(2)].into_iter().collect(),
+        };
+        _ = mgr.handle_event(LayoutEvent::SpaceExposed(space1, screen.size, unsorted));
+        assert_eq!(0, count_errors(|| frames = mgr.layout_sorted(space1, screen)));
+        assert_eq!(vec![(w(2), rect(0, 0, 120, 120))], frames);
+
+        assert_eq!(d1_frames, shown_frames(&mut mgr, space1, screen, d));
+        assert_eq!(side_by_side, shown_frames(&mut mgr, space1, screen, everything));
+    }
+
+    /// L2. Deleting a context removes every layout its mapping holds,
+    /// including the one that a layout kind change just replaced.
+    #[test]
+    fn deleting_a_context_after_a_layout_kind_change_leaves_no_layout() {
+        use LayoutCommand::*;
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&config_with_scroll(true, LayoutKind::Tree));
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c] = named_contexts(["C"]);
+
+        switch(&mut mgr, space, screen.size, ContextKey::Everything, &all);
+        switch(&mut mgr, space, screen.size, c, &all);
+        _ = mgr.handle_command(Some(space), &[space], ChangeLayoutKind);
+        assert_eq!(LayoutKind::Scroll, mgr.active_layout_kind(space));
+        let scroll_layout = mgr.context_layouts[&(space, c)].active_layout();
+        _ = mgr.viewport_mut(scroll_layout, screen.size.width);
+        assert_eq!(2, mgr.context_layouts[&(space, c)].layouts().len());
+        assert_eq!(3, mgr.tree.layouts().len());
+
+        mgr.remove_context_layouts(context_id(c));
+        assert!(mgr.context_layouts.is_empty());
+        assert_eq!(1, mgr.tree.layouts().len());
+        assert!(mgr.viewport(scroll_layout).is_none());
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 40, 120)),
+                (w(2), rect(40, 0, 40, 120)),
+                (w(3), rect(80, 0, 40, 120)),
+            ],
+            shown_frames(&mut mgr, space, screen, ContextKey::Everything),
+        );
+    }
+
+    /// L2. A `layout.ron` saved with context layouts restores them. Dropping
+    /// the ids that `contexts.json` no longer has removes exactly their
+    /// layouts, on every Space and size.
+    #[test]
+    fn a_restored_layout_drops_the_layouts_of_deleted_contexts() {
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let small = rect(0, 0, 120, 120);
+        let wide = rect(0, 0, 240, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let on1 = [w(1), w(2), w(3)];
+        let on2 = [w(4), w(5)];
+        let mut contexts = Contexts::new();
+        let c_id = contexts.create("C").unwrap();
+        let d_id = contexts.create("D").unwrap();
+        let (c, d) = (ContextKey::Named(c_id), ContextKey::Named(d_id));
+        let everything = ContextKey::Everything;
+        let unsorted = ContextKey::Unsorted;
+
+        switch(&mut mgr, space1, small.size, everything, &on1);
+        switch(&mut mgr, space2, small.size, everything, &on2);
+        switch(&mut mgr, space1, small.size, c, &on1);
+        move_window(&mut mgr, space1, w(1), Direction::Up);
+        switch(&mut mgr, space1, wide.size, c, &on1);
+        move_window(&mut mgr, space1, w(3), Direction::Up);
+        switch(&mut mgr, space1, small.size, c, &on1);
+        switch(&mut mgr, space1, small.size, d, &[w(2), w(3)]);
+        switch(&mut mgr, space1, small.size, unsorted, &[w(3)]);
+        switch(&mut mgr, space2, small.size, d, &on2);
+        move_window(&mut mgr, space2, w(5), Direction::Up);
+        // w6 is only in D's layout.
+        _ = mgr.handle_event(WindowAdded(space2, w(6), win_info()));
+        assert_eq!(
+            vec![
+                (w(4), rect(0, 80, 120, 40)),
+                (w(5), rect(0, 0, 120, 40)),
+                (w(6), rect(0, 40, 120, 40)),
+            ],
+            mgr.layout_sorted(space2, small),
+        );
+        switch(&mut mgr, space2, small.size, c, &on2);
+        assert_eq!(8, mgr.tree.layouts().len());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.ron");
+        mgr.save(path.clone()).unwrap();
+        contexts.delete(d_id).unwrap();
+        let json = serde_json::to_string(&contexts).unwrap();
+        let mut contexts: Contexts = serde_json::from_str(&json).unwrap();
+
+        let mut restored = LayoutManager::load(path, default_config()).unwrap();
+        assert_eq!(8, restored.tree.layouts().len());
+        restored.retain_context_layouts(|id| contexts.get(id).is_some());
+        assert_eq!(
+            [(space1, unsorted), (space1, c), (space2, c)]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            context_keys(&restored),
+        );
+        assert_eq!(6, restored.tree.layouts().len());
+        assert!(!restored.tree.has_window(w(6)));
+        assert_eq!(
+            [w(1), w(2), w(3), w(4), w(5)].into_iter().collect::<BTreeSet<_>>(),
+            restored.all_windows(),
+        );
+        _ = restored.handle_event(WindowRemoved(w(6)));
+
+        let errors = count_errors(|| {
+            assert_eq!(
+                vec![
+                    (w(1), rect(0, 0, 120, 60)),
+                    (w(2), rect(0, 60, 60, 60)),
+                    (w(3), rect(60, 60, 60, 60)),
+                ],
+                switched_frames(&mut restored, space1, small, c, &on1),
+            );
+            assert_eq!(
+                vec![
+                    (w(1), rect(0, 0, 240, 40)),
+                    (w(2), rect(0, 80, 240, 40)),
+                    (w(3), rect(0, 40, 240, 40)),
+                ],
+                switched_frames(&mut restored, space1, wide, c, &on1),
+            );
+            assert_eq!(
+                vec![(w(3), rect(0, 0, 120, 120))],
+                switched_frames(&mut restored, space1, small, unsorted, &[w(3)]),
+            );
+            assert_eq!(
+                vec![
+                    (w(1), rect(0, 0, 40, 120)),
+                    (w(2), rect(40, 0, 40, 120)),
+                    (w(3), rect(80, 0, 40, 120)),
+                ],
+                switched_frames(&mut restored, space1, small, everything, &on1),
+            );
+            assert_eq!(
+                vec![(w(4), rect(0, 60, 120, 60)), (w(5), rect(0, 0, 120, 60))],
+                switched_frames(&mut restored, space2, small, c, &on2),
+            );
+            assert_eq!(
+                vec![(w(4), rect(0, 0, 60, 120)), (w(5), rect(60, 0, 60, 120))],
+                switched_frames(&mut restored, space2, small, everything, &on2),
+            );
+        });
+        assert_eq!(0, errors);
+
+        // A new context named like the deleted one gets a new id and starts
+        // from the layout the Space shows, not from D's old layout.
+        let new_d = ContextKey::Named(contexts.create("d").unwrap());
+        assert_ne!(d, new_d);
+        assert_eq!(
+            vec![(w(4), rect(0, 0, 60, 120)), (w(5), rect(60, 0, 60, 120))],
+            switched_frames(&mut restored, space2, small, new_d, &on2),
+        );
+    }
+
+    /// L1, L9. Turning off scroll layouts converts every context's layout on
+    /// every Space, and each keeps exactly its own windows.
+    #[test]
+    fn turning_off_scroll_layouts_keeps_each_contexts_windows() {
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&config_with_scroll(true, LayoutKind::Scroll));
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let on1 = [w(1), w(2), w(3)];
+        let on2 = [w(4), w(5)];
+        let [c, d] = named_contexts(["C", "D"]);
+        let everything = ContextKey::Everything;
+
+        switch(&mut mgr, space1, screen.size, everything, &on1);
+        switch(&mut mgr, space1, screen.size, c, &[w(1), w(2)]);
+        switch(&mut mgr, space1, screen.size, d, &[w(2), w(3)]);
+        switch(&mut mgr, space2, screen.size, everything, &on2);
+        switch(&mut mgr, space2, screen.size, c, &on2);
+        let keys = [
+            (space1, everything),
+            (space1, c),
+            (space1, d),
+            (space2, everything),
+            (space2, c),
+        ];
+        let kinds = |mgr: &LayoutManager| {
+            keys.map(|(space, key)| {
+                mgr.tree.layout_kind(mgr.mapping(space, key).unwrap().active_layout())
+            })
+        };
+        assert_eq!([LayoutKind::Scroll; 5], kinds(&mgr));
+
+        mgr.set_config(&config_with_scroll(false, LayoutKind::Tree));
+        assert_eq!([LayoutKind::Tree; 5], kinds(&mgr));
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 40, 120)),
+                (w(2), rect(40, 0, 40, 120)),
+                (w(3), rect(80, 0, 40, 120)),
+            ],
+            shown_frames(&mut mgr, space1, screen, everything),
+        );
+        assert_eq!(
+            vec![(w(1), rect(0, 0, 60, 120)), (w(2), rect(60, 0, 60, 120))],
+            shown_frames(&mut mgr, space1, screen, c),
+        );
+        assert_eq!(
+            vec![(w(2), rect(0, 0, 60, 120)), (w(3), rect(60, 0, 60, 120))],
+            shown_frames(&mut mgr, space1, screen, d),
+        );
+        let halves = vec![(w(4), rect(0, 0, 60, 120)), (w(5), rect(60, 0, 60, 120))];
+        assert_eq!(halves, shown_frames(&mut mgr, space2, screen, everything));
+        assert_eq!(halves, shown_frames(&mut mgr, space2, screen, c));
+    }
+
+    /// L1. A context's scroll layout for another screen size becomes a tree
+    /// when that size is shown with scroll layouts off.
+    #[test]
+    fn a_contexts_remembered_scroll_layout_becomes_a_tree_when_shown() {
+        use LayoutCommand::*;
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&config_with_scroll(true, LayoutKind::Tree));
+        let space = SpaceId::new(1);
+        let small = rect(0, 0, 120, 120);
+        let wide = rect(0, 0, 240, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c] = named_contexts(["C"]);
+
+        switch(&mut mgr, space, small.size, ContextKey::Everything, &all);
+        switch(&mut mgr, space, small.size, c, &all);
+        move_window(&mut mgr, space, w(1), Direction::Up);
+        switch(&mut mgr, space, wide.size, c, &all);
+        move_window(&mut mgr, space, w(3), Direction::Up);
+        _ = mgr.handle_command(Some(space), &[space], ChangeLayoutKind);
+        assert_eq!(LayoutKind::Scroll, mgr.active_layout_kind(space));
+        let c_small = vec![
+            (w(1), rect(0, 0, 120, 60)),
+            (w(2), rect(0, 60, 60, 60)),
+            (w(3), rect(60, 60, 60, 60)),
+        ];
+        assert_eq!(c_small, switched_frames(&mut mgr, space, small, c, &all));
+
+        mgr.set_config(&config_with_scroll(false, LayoutKind::Tree));
+        show(&mut mgr, space, wide.size, c);
+        assert_eq!(LayoutKind::Tree, mgr.active_layout_kind(space));
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 80, 120)),
+                (w(2), rect(160, 0, 80, 120)),
+                (w(3), rect(80, 0, 80, 120)),
+            ],
+            mgr.layout_sorted(space, wide),
+        );
+        assert_eq!(c_small, shown_frames(&mut mgr, space, small, c));
+    }
+
+    /// L1. A restored manager whose config turns scroll layouts off converts
+    /// its context layouts too.
+    #[test]
+    fn restoring_with_scroll_layouts_off_converts_context_layouts() {
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&config_with_scroll(true, LayoutKind::Scroll));
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c] = named_contexts(["C"]);
+        let everything = ContextKey::Everything;
+        let unsorted = ContextKey::Unsorted;
+
+        switch(&mut mgr, space, screen.size, everything, &all);
+        switch(&mut mgr, space, screen.size, c, &[w(1), w(2)]);
+        switch(&mut mgr, space, screen.size, unsorted, &[w(3)]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.ron");
+        mgr.save(path.clone()).unwrap();
+
+        let config_off = config_with_scroll(false, LayoutKind::Tree);
+        let mut restored = LayoutManager::load(path, config_off.clone()).unwrap();
+        let kinds = |mgr: &LayoutManager| {
+            [everything, c, unsorted]
+                .map(|key| mgr.tree.layout_kind(mgr.mapping(space, key).unwrap().active_layout()))
+        };
+        assert_eq!([LayoutKind::Scroll; 3], kinds(&restored));
+        restored.set_config(&config_off);
+        assert_eq!([LayoutKind::Tree; 3], kinds(&restored));
+
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 40, 120)),
+                (w(2), rect(40, 0, 40, 120)),
+                (w(3), rect(80, 0, 40, 120)),
+            ],
+            shown_frames(&mut restored, space, screen, everything),
+        );
+        assert_eq!(
+            vec![(w(1), rect(0, 0, 60, 120)), (w(2), rect(60, 0, 60, 120))],
+            shown_frames(&mut restored, space, screen, c),
+        );
+        assert_eq!(
+            vec![(w(3), rect(0, 0, 120, 120))],
+            shown_frames(&mut restored, space, screen, unsorted),
+        );
+    }
+
+    /// R28. With no context active, every Space keeps only Everything's
+    /// layouts, and nothing logs an error.
+    #[test]
+    fn without_contexts_only_everythings_layouts_exist() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&config_with_scroll(true, LayoutKind::Tree));
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let small = rect(0, 0, 120, 120);
+        let wide = rect(0, 0, 240, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let on1 = [w(1), w(2), w(3)];
+        let on2 = [w(4), w(5)];
+        let everything = ContextKey::Everything;
+
+        let errors = count_errors(|| {
+            switch(&mut mgr, space1, small.size, everything, &on1);
+            switch(&mut mgr, space2, small.size, everything, &on2);
+            move_window(&mut mgr, space1, w(1), Direction::Up);
+            switch(&mut mgr, space1, wide.size, everything, &on1);
+            move_window(&mut mgr, space1, w(3), Direction::Up);
+            _ = mgr.handle_command(Some(space1), &[space1], NextLayout);
+            _ = mgr.handle_command(Some(space1), &[space1], PrevLayout);
+            _ = mgr.handle_event(WindowFocused(vec![space1], w(2)));
+            _ = mgr.handle_command(Some(space1), &[space1], ToggleWindowFloating);
+            _ = mgr.handle_command(Some(space1), &[space1], ToggleWindowFloating);
+            _ = mgr.handle_event(WindowAdded(space2, w(6), win_info()));
+            _ = mgr.handle_event(WindowRemoved(w(4)));
+            _ = mgr.handle_command(Some(space2), &[space2], ChangeLayoutKind);
+            // Everything ignores the members it's given.
+            let context = ActiveContext {
+                key: everything,
+                members: on1.into_iter().collect(),
+            };
+            _ = mgr.handle_event(SpaceExposed(space1, small.size, context));
+            mgr.set_config(&config_with_scroll(false, LayoutKind::Tree));
+        });
+        assert_eq!(0, errors);
+        assert!(mgr.context_layouts.is_empty());
+        assert!(mgr.active_contexts.values().all(|&key| key == everything));
+        assert!(mgr.serialize_to_string().contains(",context_layouts:{},"));
+
+        // Floating took w2 out of every size's layout, so it comes back last
+        // where it wasn't unfloated.
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 120, 40)),
+                (w(2), rect(0, 80, 120, 40)),
+                (w(3), rect(0, 40, 120, 40)),
+            ],
+            switched_frames(&mut mgr, space1, small, everything, &on1),
+        );
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 240, 40)),
+                (w(2), rect(0, 80, 240, 40)),
+                (w(3), rect(0, 40, 240, 40)),
+            ],
+            switched_frames(&mut mgr, space1, wide, everything, &on1),
+        );
+        assert_eq!(LayoutKind::Tree, mgr.active_layout_kind(space2));
+        assert_eq!(
+            vec![(w(5), rect(0, 0, 60, 120)), (w(6), rect(60, 0, 60, 120))],
+            shown_frames(&mut mgr, space2, small, everything),
+        );
+    }
+
+    /// L2. `NextLayout` and `PrevLayout` work under Everything, do nothing
+    /// under Unsorted, and work again when Everything shows again.
+    #[test]
+    fn next_layout_works_under_everything_and_not_under_unsorted() {
+        use LayoutCommand::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let small = rect(0, 0, 120, 120);
+        let wide = rect(0, 0, 240, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let everything = ContextKey::Everything;
+        let unsorted = ContextKey::Unsorted;
+
+        switch(&mut mgr, space, small.size, everything, &all);
+        move_window(&mut mgr, space, w(1), Direction::Up);
+        switch(&mut mgr, space, wide.size, everything, &all);
+        move_window(&mut mgr, space, w(3), Direction::Up);
+        let l2_wide = vec![
+            (w(1), rect(0, 0, 240, 40)),
+            (w(2), rect(0, 80, 240, 40)),
+            (w(3), rect(0, 40, 240, 40)),
+        ];
+        assert_eq!(l2_wide, mgr.layout_sorted(space, wide));
+        _ = mgr.handle_command(Some(space), &[space], NextLayout);
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 240, 60)),
+                (w(2), rect(0, 60, 120, 60)),
+                (w(3), rect(120, 60, 120, 60)),
+            ],
+            mgr.layout_sorted(space, wide),
+        );
+        _ = mgr.handle_command(Some(space), &[space], PrevLayout);
+        assert_eq!(l2_wide, mgr.layout_sorted(space, wide));
+
+        // Give Unsorted two layouts.
+        switch(&mut mgr, space, wide.size, unsorted, &all);
+        move_window(&mut mgr, space, w(1), Direction::Down);
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 40, 240, 40)),
+                (w(2), rect(0, 80, 240, 40)),
+                (w(3), rect(0, 0, 240, 40)),
+            ],
+            mgr.layout_sorted(space, wide),
+        );
+        switch(&mut mgr, space, small.size, unsorted, &all);
+        move_window(&mut mgr, space, w(1), Direction::Down);
+        assert_eq!(2, mgr.context_layouts[&(space, unsorted)].layouts().len());
+        let unsorted_small = vec![
+            (w(1), rect(0, 80, 120, 40)),
+            (w(2), rect(0, 40, 120, 40)),
+            (w(3), rect(0, 0, 120, 40)),
+        ];
+        assert_eq!(unsorted_small, mgr.layout_sorted(space, small));
+        _ = mgr.handle_command(Some(space), &[space], NextLayout);
+        assert_eq!(unsorted_small, mgr.layout_sorted(space, small));
+        _ = mgr.handle_command(Some(space), &[space], PrevLayout);
+        assert_eq!(unsorted_small, mgr.layout_sorted(space, small));
+
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 120, 60)),
+                (w(2), rect(0, 60, 60, 60)),
+                (w(3), rect(60, 60, 60, 60)),
+            ],
+            switched_frames(&mut mgr, space, small, everything, &all),
+        );
+        _ = mgr.handle_command(Some(space), &[space], NextLayout);
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 120, 40)),
+                (w(2), rect(0, 80, 120, 40)),
+                (w(3), rect(0, 40, 120, 40)),
+            ],
+            mgr.layout_sorted(space, small),
+        );
+    }
+
+    /// L9. With no context active, changing the layout kind at one screen size
+    /// leaves the windows in the layout of another size.
+    #[test]
+    fn changing_the_layout_kind_under_everything_keeps_another_sizes_layout() {
+        use LayoutCommand::*;
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&config_with_scroll(true, LayoutKind::Tree));
+        let space = SpaceId::new(1);
+        let small = rect(0, 0, 120, 120);
+        let wide = rect(0, 0, 240, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let everything = ContextKey::Everything;
+
+        switch(&mut mgr, space, small.size, everything, &all);
+        move_window(&mut mgr, space, w(1), Direction::Up);
+        switch(&mut mgr, space, wide.size, everything, &all);
+        move_window(&mut mgr, space, w(3), Direction::Up);
+        switch(&mut mgr, space, small.size, everything, &all);
+        _ = mgr.handle_command(Some(space), &[space], ChangeLayoutKind);
+        assert_eq!(LayoutKind::Scroll, mgr.active_layout_kind(space));
+
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 240, 40)),
+                (w(2), rect(0, 80, 240, 40)),
+                (w(3), rect(0, 40, 240, 40)),
+            ],
+            shown_frames(&mut mgr, space, wide, everything),
+        );
+    }
+
+    /// L3. A context whose first layout is made with no members starts
+    /// empty.
+    #[test]
+    fn a_context_with_no_members_starts_with_an_empty_layout() {
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c] = named_contexts(["C"]);
+
+        switch(&mut mgr, space, screen.size, ContextKey::Everything, &all);
+        assert_eq!(NO_FRAMES, shown_frames(&mut mgr, space, screen, c));
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 1, vec![(w(2), win_info())]));
+        assert_eq!(
+            vec![(w(2), rect(0, 0, 120, 120))],
+            mgr.layout_sorted(space, screen)
+        );
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 40, 120)),
+                (w(2), rect(40, 0, 40, 120)),
+                (w(3), rect(80, 0, 40, 120)),
+            ],
+            shown_frames(&mut mgr, space, screen, ContextKey::Everything),
+        );
+    }
+
+    /// L1, L3. A context can be the first thing a Space shows. Its layout and
+    /// Everything's start empty and fill separately.
+    #[test]
+    fn a_context_can_be_shown_first_on_a_new_space() {
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let [c] = named_contexts(["C"]);
+
+        let context = ActiveContext {
+            key: c,
+            members: [w(1), w(2)].into_iter().collect(),
+        };
+        let errors = count_errors(|| {
+            _ = mgr.handle_event(SpaceExposed(space, screen.size, context));
+        });
+        assert_eq!(0, errors);
+        assert!(mgr.layout_mapping.contains_key(&space));
+        assert_eq!(
+            [(space, c)].into_iter().collect::<HashSet<_>>(),
+            context_keys(&mgr)
+        );
+        assert_eq!(NO_FRAMES, mgr.layout_sorted(space, screen));
+
+        let halves = vec![(w(1), rect(0, 0, 60, 120)), (w(2), rect(60, 0, 60, 120))];
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 1, make_windows(1, 2)));
+        assert_eq!(halves, mgr.layout_sorted(space, screen));
+        assert_eq!(
+            NO_FRAMES,
+            shown_frames(&mut mgr, space, screen, ContextKey::Everything)
+        );
+        _ = mgr.handle_event(WindowsOnScreenUpdated(space, 1, make_windows(1, 3)));
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 40, 120)),
+                (w(2), rect(40, 0, 40, 120)),
+                (w(3), rect(80, 0, 40, 120)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+        assert_eq!(halves, shown_frames(&mut mgr, space, screen, c));
+    }
+
+    /// L3. The members passed with `SpaceExposed` shape only a context's first
+    /// layout on the Space.
+    #[test]
+    fn members_shape_only_a_contexts_first_layout() {
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c] = named_contexts(["C"]);
+        let thirds = vec![
+            (w(1), rect(0, 0, 40, 120)),
+            (w(2), rect(40, 0, 40, 120)),
+            (w(3), rect(80, 0, 40, 120)),
+        ];
+
+        switch(&mut mgr, space, screen.size, ContextKey::Everything, &all);
+        assert_eq!(thirds, switched_frames(&mut mgr, space, screen, c, &all));
+        show(&mut mgr, space, screen.size, ContextKey::Everything);
+        let context = ActiveContext {
+            key: c,
+            members: [w(1)].into_iter().collect(),
+        };
+        _ = mgr.handle_event(SpaceExposed(space, screen.size, context));
+        assert_eq!(thirds, mgr.layout_sorted(space, screen));
+    }
+
+    /// R29, L2. Dropping named contexts never removes Unsorted's layouts,
+    /// and dropping a context that has no layouts changes nothing.
+    #[test]
+    fn dropping_context_layouts_keeps_unsorted() {
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c, never_shown] = named_contexts(["C", "Never shown"]);
+        let unsorted = ContextKey::Unsorted;
+
+        switch(&mut mgr, space, screen.size, ContextKey::Everything, &all);
+        switch(&mut mgr, space, screen.size, unsorted, &[w(3)]);
+        switch(&mut mgr, space, screen.size, c, &all);
+        let keys = [(space, unsorted), (space, c)].into_iter().collect::<HashSet<_>>();
+        assert_eq!(3, mgr.tree.layouts().len());
+
+        mgr.remove_context_layouts(context_id(never_shown));
+        assert_eq!(keys, context_keys(&mgr));
+        assert_eq!(3, mgr.tree.layouts().len());
+        mgr.retain_context_layouts(|_| true);
+        assert_eq!(keys, context_keys(&mgr));
+        assert_eq!(3, mgr.tree.layouts().len());
+        // C was cloned from Unsorted's layout, so w3 comes first.
+        assert_eq!(
+            vec![
+                (w(1), rect(40, 0, 40, 120)),
+                (w(2), rect(80, 0, 40, 120)),
+                (w(3), rect(0, 0, 40, 120)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+
+        mgr.retain_context_layouts(|_| false);
+        assert_eq!(
+            [(space, unsorted)].into_iter().collect::<HashSet<_>>(),
+            context_keys(&mgr),
+        );
+        assert_eq!(2, mgr.tree.layouts().len());
+        show(&mut mgr, space, screen.size, unsorted);
+        let mut frames = vec![];
+        assert_eq!(0, count_errors(|| frames = mgr.layout_sorted(space, screen)));
+        assert_eq!(vec![(w(3), rect(0, 0, 120, 120))], frames);
+    }
+
+    /// A window that closes leaves every layout it has a node in, whatever the
+    /// context.
+    #[test]
+    fn a_closed_window_leaves_every_contexts_layout() {
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c, d] = named_contexts(["C", "D"]);
+
+        switch(&mut mgr, space, screen.size, ContextKey::Everything, &all);
+        switch(&mut mgr, space, screen.size, c, &all);
+        move_window(&mut mgr, space, w(1), Direction::Up);
+        switch(&mut mgr, space, screen.size, d, &[w(2), w(3)]);
+
+        _ = mgr.handle_event(WindowRemoved(w(2)));
+        assert!(!mgr.tree.has_window(w(2)));
+        assert_eq!(
+            vec![(w(3), rect(0, 0, 120, 120))],
+            mgr.layout_sorted(space, screen)
+        );
+        assert_eq!(
+            vec![(w(1), rect(0, 0, 120, 60)), (w(3), rect(0, 60, 120, 60))],
+            shown_frames(&mut mgr, space, screen, c),
+        );
+        assert_eq!(
+            vec![(w(1), rect(0, 0, 60, 120)), (w(3), rect(60, 0, 60, 120))],
+            shown_frames(&mut mgr, space, screen, ContextKey::Everything),
+        );
+    }
+
+    /// The windows of an app that quits leave every context's layout.
+    #[test]
+    fn a_quit_apps_windows_leave_every_contexts_layout() {
+        use LayoutEvent::*;
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let a = WindowId::new(1, 1);
+        let b1 = WindowId::new(2, 1);
+        let b2 = WindowId::new(2, 2);
+        let [c, d] = named_contexts(["C", "D"]);
+        let everything = ContextKey::Everything;
+        let show_windows = |mgr: &mut LayoutManager, key: ContextKey, windows: &[WindowId]| {
+            let context = ActiveContext {
+                key,
+                members: windows.iter().copied().collect(),
+            };
+            _ = mgr.handle_event(SpaceExposed(space, screen.size, context));
+            for pid in [1, 2] {
+                let windows = windows
+                    .iter()
+                    .filter(|wid| wid.pid == pid)
+                    .map(|&wid| (wid, win_info()))
+                    .collect();
+                _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, windows));
+            }
+        };
+
+        for quit in [AppClosed(2), AppsRunningUpdated([1].into_iter().collect())] {
+            let mut mgr = LayoutManager::new_for_test();
+            show_windows(&mut mgr, everything, &[a, b1, b2]);
+            show_windows(&mut mgr, c, &[a, b1]);
+            show_windows(&mut mgr, d, &[b1, b2]);
+            assert_eq!(
+                vec![(b1, rect(0, 0, 60, 120)), (b2, rect(60, 0, 60, 120))],
+                mgr.layout_sorted(space, screen),
+            );
+
+            _ = mgr.handle_event(quit);
+            assert_eq!(NO_FRAMES, mgr.layout_sorted(space, screen));
+            assert_eq!(
+                vec![(a, rect(0, 0, 120, 120))],
+                shown_frames(&mut mgr, space, screen, c)
+            );
+            assert_eq!(
+                vec![(a, rect(0, 0, 120, 120))],
+                shown_frames(&mut mgr, space, screen, everything)
+            );
+        }
+    }
+
+    /// R4, R6, L3. Layouts belong to a context's id, not its name. Renaming
+    /// keeps them, and a new context with a deleted one's name, in any case,
+    /// starts from the layout the Space shows.
+    #[test]
+    fn a_context_recreated_under_a_case_variant_name_starts_fresh() {
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let everything = ContextKey::Everything;
+        let mut contexts = Contexts::new();
+        let work_id = contexts.create("Work").unwrap();
+        let work = ContextKey::Named(work_id);
+        let work_frames = vec![
+            (w(1), rect(0, 0, 120, 60)),
+            (w(2), rect(0, 60, 60, 60)),
+            (w(3), rect(60, 60, 60, 60)),
+        ];
+
+        switch(&mut mgr, space, screen.size, everything, &all);
+        switch(&mut mgr, space, screen.size, work, &all);
+        move_window(&mut mgr, space, w(1), Direction::Up);
+        assert_eq!(work_frames, mgr.layout_sorted(space, screen));
+
+        contexts.rename(work_id, "WORK").unwrap();
+        assert!(contexts.create("work").is_err());
+        assert!(contexts.create("everything").is_err());
+        assert!(contexts.create("UNSORTED").is_err());
+        switch(&mut mgr, space, screen.size, everything, &all);
+        assert_eq!(work_frames, switched_frames(&mut mgr, space, screen, work, &all));
+
+        switch(&mut mgr, space, screen.size, everything, &all);
+        contexts.delete(work_id).unwrap();
+        mgr.remove_context_layouts(work_id);
+        let again = ContextKey::Named(contexts.create("work").unwrap());
+        assert_ne!(work, again);
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 40, 120)),
+                (w(2), rect(40, 0, 40, 120)),
+                (w(3), rect(80, 0, 40, 120)),
+            ],
+            switched_frames(&mut mgr, space, screen, again, &all),
+        );
+    }
+
+    /// R28. Layouts saved before contexts existed restore with no context
+    /// layouts, and each Space shows Everything's layout without an error.
+    #[test]
+    fn layouts_saved_before_contexts_restore_to_everything() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots");
+        let mut restored = 0;
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("ron") {
+                continue;
+            }
+            let mgr: LayoutManager = ron::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(mgr.context_layouts.is_empty(), "{path:?}");
+            assert!(mgr.active_contexts.is_empty(), "{path:?}");
+            assert!(!mgr.layout_mapping.is_empty(), "{path:?}");
+            for (&space, mapping) in &mgr.layout_mapping {
+                let mut layout = None;
+                assert_eq!(0, count_errors(|| layout = mgr.try_layout(space)), "{path:?}");
+                assert_eq!(Some(mapping.active_layout()), layout, "{path:?}");
+            }
+            assert!(
+                mgr.serialize_to_string().contains(",context_layouts:{},"),
+                "{path:?}"
+            );
+            restored += 1;
+        }
+        assert!(restored >= 4, "only {restored} snapshots in {dir:?}");
+    }
 }

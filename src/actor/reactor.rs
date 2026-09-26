@@ -3886,6 +3886,57 @@ pub mod tests {
         );
     }
 
+    /// R28. Without contexts, every Space the reactor exposes shows
+    /// Everything's layout, so no context layout is ever made.
+    #[test]
+    fn it_shows_everything_on_every_space_without_contexts() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let shorter = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            spaces: vec![Some(space1)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_event(Event::SpaceChanged(
+            vec![Some(space2)],
+            WindowsOnScreen::new(vec![]),
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![shorter],
+            spaces: vec![Some(space1)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        apps.simulate_until_quiet(&mut reactor);
+
+        assert!(reactor.layout.serialize_to_string().contains(",context_layouts:{},"));
+        let mut frames = reactor.layout.calculate_layout(space1, shorter, &reactor.config);
+        frames.sort_by_key(|&(wid, _)| wid);
+        assert_eq!(
+            vec![
+                (
+                    WindowId::new(1, 1),
+                    CGRect::new(CGPoint::new(0., 0.), CGSize::new(500., 900.))
+                ),
+                (
+                    WindowId::new(1, 2),
+                    CGRect::new(CGPoint::new(500., 0.), CGSize::new(500., 900.))
+                ),
+            ],
+            frames
+        );
+    }
+
     /// Moves the window slightly without the mouse, as an app might, so the
     /// next layout pass has something to correct.
     fn nudge_window(apps: &mut Apps, reactor: &mut Reactor, wid: WindowId) {
