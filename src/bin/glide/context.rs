@@ -226,16 +226,24 @@ fn json(snapshot: &ContextsSnapshot) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
     use clap::Parser;
+    use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
     use pretty_assertions::assert_eq;
+    use serde::Deserialize;
     use serde_json::json;
     use sugarglider::actor::contexts_snapshot::{
         ContextSummary, EverythingSummary, ScreenContext, UnsortedSummary,
     };
+    use sugarglider::config::Config;
     use sugarglider::model::contexts::ContextId;
+    use sugarglider::sys::message_port::{LocalMessagePort, RemoteMessagePort};
 
     use super::*;
-    use crate::{Command, Opt};
+    use crate::{Client, Command, Opt};
 
     fn id(id: u32) -> ContextId {
         serde_json::from_value(json!(id)).unwrap()
@@ -507,5 +515,423 @@ mod tests {
     #[test]
     fn a_bad_number_sends_nothing() {
         assert!(run_with(&["switch", "0"], Response::Success).requests.is_empty());
+    }
+
+    /// The requests of Sugarglider before contexts, as an older server reads
+    /// them.
+    #[derive(Serialize, Deserialize, Debug)]
+    enum RequestBeforeContexts {
+        Ping(String),
+        UpdateConfig(Config),
+        Service(ServiceRequestBeforeContexts),
+        SetEnabled(bool),
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    enum ServiceRequestBeforeContexts {
+        Install,
+        Uninstall,
+    }
+
+    /// The replies of Sugarglider before contexts.
+    #[derive(Serialize, Deserialize, Debug)]
+    enum ResponseBeforeContexts {
+        Pong(String),
+        Success,
+    }
+
+    /// How a server from before contexts answers a message: with nothing
+    /// when it can't read the request.
+    fn older_server_reply(message: &[u8]) -> Vec<u8> {
+        let reply = match ron::de::from_bytes::<RequestBeforeContexts>(message) {
+            Ok(RequestBeforeContexts::Ping(text)) => {
+                ResponseBeforeContexts::Pong(text.chars().rev().collect())
+            }
+            Ok(_) => ResponseBeforeContexts::Success,
+            Err(_) => return Vec::new(),
+        };
+        ron::ser::to_string(&reply).unwrap().into_bytes()
+    }
+
+    struct OlderServer {
+        messages: usize,
+    }
+
+    impl Transport for &mut OlderServer {
+        fn request(&mut self, message: &[u8]) -> Result<Vec<u8>, SendError> {
+            self.messages += 1;
+            Ok(older_server_reply(message))
+        }
+    }
+
+    /// Every subcommand, with each output form.
+    const EVERY_SUBCOMMAND: [&[&str]; 8] = [
+        &["list"],
+        &["list", "--json"],
+        &["current"],
+        &["current", "--json"],
+        &["create", "Client work"],
+        &["switch", "2"],
+        &["switch", "cli"],
+        &["everything"],
+    ];
+
+    /// I4. A server from before contexts can't read any context request and
+    /// replies with nothing. Every subcommand then says to restart it, on
+    /// stderr, and exits with status 1.
+    #[test]
+    fn every_subcommand_asks_to_restart_an_older_server() {
+        for args in EVERY_SUBCOMMAND {
+            let command = parse(args).unwrap();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let mut server = OlderServer { messages: 0 };
+            let status = run(&command, || Some(&mut server), &mut out, &mut err);
+            assert_eq!(
+                (1, "", format!("{OLD_SERVER}\n")),
+                (
+                    status,
+                    &*String::from_utf8(out).unwrap(),
+                    String::from_utf8(err).unwrap()
+                ),
+                "{args:?}"
+            );
+            assert_eq!(1, server.messages, "{args:?}");
+        }
+        assert_eq!(
+            "The running Sugarglider doesn't support contexts. Restart it.",
+            OLD_SERVER
+        );
+    }
+
+    /// I4, through a real message port. A server from before contexts
+    /// returns no data, and the client reads that as an empty reply, not as
+    /// a failure to reach the server.
+    #[test]
+    fn an_older_server_behind_a_real_port_gets_the_restart_message() {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let name = format!("com.test.sugarglider.context_cli.{}.{nanos}", std::process::id());
+        let messages = Arc::new(Mutex::new(0));
+        let counter = messages.clone();
+        let _server = LocalMessagePort::new(&name, move |_, message| {
+            *counter.lock().unwrap() += 1;
+            older_server_reply(message)
+        })
+        .unwrap();
+        let client = thread::spawn(move || {
+            let command = parse(&["list"]).unwrap();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let connect = || RemoteMessagePort::new(&name).ok().map(|port| Client { port });
+            let status = run(&command, connect, &mut out, &mut err);
+            (
+                status,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        });
+        let start = Instant::now();
+        while !client.is_finished() && start.elapsed() < Duration::from_secs(5) {
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.05, false);
+        }
+
+        let (status, out, err) = client.join().unwrap();
+        assert_eq!((1, "", format!("{OLD_SERVER}\n")), (status, &*out, err));
+        assert_eq!(1, *messages.lock().unwrap());
+    }
+
+    /// A server that can't be reached.
+    struct Unreachable(fn() -> SendError);
+
+    impl Transport for Unreachable {
+        fn request(&mut self, _: &[u8]) -> Result<Vec<u8>, SendError> {
+            Err((self.0)())
+        }
+    }
+
+    /// A server that runs but doesn't answer gives the reason on stderr and
+    /// status 1.
+    #[test]
+    fn a_server_that_does_not_answer_fails_with_the_reason() {
+        for (error, reason) in [
+            (
+                (|| SendError::Timeout) as fn() -> SendError,
+                "Could not reach Sugarglider: Message send timed out\n",
+            ),
+            (
+                || SendError::InvalidPort,
+                "Could not reach Sugarglider: Message port is invalid\n",
+            ),
+            (
+                || SendError::SendFailed(-2),
+                "Could not reach Sugarglider: Message send failed with code -2\n",
+            ),
+        ] {
+            for args in EVERY_SUBCOMMAND {
+                let command = parse(args).unwrap();
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                let status = run(&command, || Some(Unreachable(error)), &mut out, &mut err);
+                assert_eq!(
+                    (1, "", reason),
+                    (
+                        status,
+                        &*String::from_utf8(out).unwrap(),
+                        &*String::from_utf8(err).unwrap()
+                    ),
+                    "{args:?}"
+                );
+            }
+        }
+    }
+
+    /// Every subcommand fails with the server's reason on stderr and status
+    /// 1 when the feature is off, and prints nothing on stdout.
+    #[test]
+    fn every_subcommand_fails_with_the_reason_when_contexts_are_off() {
+        let reason = "Contexts are off. Turn them on with enable = true under \
+                      [settings.experimental.contexts] in the config file.";
+        for args in EVERY_SUBCOMMAND {
+            let ran = run_with(args, Response::Error(reason.into()));
+            assert_eq!(
+                (1, "", format!("{reason}\n")),
+                (ran.status, &*ran.out, ran.err),
+                "{args:?}"
+            );
+            assert_eq!(1, ran.requests.len());
+        }
+    }
+
+    /// A reply that doesn't fit the subcommand fails with status 1.
+    #[test]
+    fn a_reply_that_does_not_fit_the_subcommand_fails() {
+        let unexpected = "Unexpected reply from Sugarglider: ";
+        for (args, reply, reason) in [
+            (&["current"][..], Response::Success, "Success"),
+            (&["list", "--json"], Response::Pong("x".into()), "Pong(\"x\")"),
+            (&["create", "X"], Response::Pong("x".into()), "Pong(\"x\")"),
+            (&["everything"], Response::Pong("x".into()), "Pong(\"x\")"),
+        ] {
+            let ran = run_with(args, reply);
+            assert_eq!(
+                (1, "", format!("{unexpected}{reason}\n")),
+                (ran.status, &*ran.out, ran.err),
+                "{args:?}"
+            );
+        }
+        let ran = run_with(&["switch", "cli"], Response::Contexts(snapshot()));
+        assert_eq!((1, ""), (ran.status, &*ran.out));
+        assert!(ran.err.starts_with(unexpected), "{}", ran.err);
+    }
+
+    /// Two screens that show Everything, a context without a number, and
+    /// no unsorted window.
+    fn everything_on_two_screens() -> ContextsSnapshot {
+        let mut snapshot = snapshot();
+        snapshot.active = ContextKey::Everything;
+        snapshot.screens = vec![
+            ScreenContext {
+                id: 1,
+                shows: ContextKey::Everything,
+            },
+            ScreenContext {
+                id: 2,
+                shows: ContextKey::Everything,
+            },
+        ];
+        snapshot.contexts[1].number = None;
+        snapshot.contexts[1].apps.clear();
+        snapshot.contexts[1].windows = 0;
+        snapshot.unsorted.windows = 0;
+        snapshot
+    }
+
+    /// Runs the command and returns what it printed as JSON. It prints one
+    /// JSON value and a newline on stdout, and nothing on stderr.
+    fn printed_json(args: &[&str], snapshot: ContextsSnapshot) -> serde_json::Value {
+        let ran = run_with(args, Response::Contexts(snapshot));
+        assert_eq!((0, ""), (ran.status, &*ran.err));
+        assert!(ran.out.ends_with("}\n"), "{}", ran.out);
+        let mut values = serde_json::Deserializer::from_str(&ran.out).into_iter();
+        let value = values.next().unwrap().unwrap();
+        assert!(values.next().is_none(), "{}", ran.out);
+        value
+    }
+
+    /// The JSON is the shape in the spec's "Command line" section when no
+    /// named context is active: a context without a number has a null
+    /// number, every screen is listed, and each names what it shows.
+    #[test]
+    fn list_json_under_everything_and_without_a_number() {
+        assert_eq!(
+            json!({
+              "scope": "global",
+              "screens": [
+                { "id": 1, "active": "Everything" },
+                { "id": 2, "active": "Everything" }
+              ],
+              "contexts": [
+                { "name": "Comms", "number": 1, "active": false,
+                  "apps": ["WhatsApp", "Microsoft Teams"], "windows": 2 },
+                { "name": "Relax", "number": null, "active": false,
+                  "apps": [], "windows": 0 }
+              ],
+              "unsorted": 0
+            }),
+            printed_json(&["list", "--json"], everything_on_two_screens())
+        );
+
+        let mut unsorted = snapshot();
+        unsorted.active = ContextKey::Unsorted;
+        unsorted.screens[0].shows = ContextKey::Unsorted;
+        let printed = printed_json(&["list", "--json"], unsorted);
+        assert_eq!(json!([{ "id": 1, "active": "Unsorted" }]), printed["screens"]);
+        assert_eq!(
+            json!([false, false]),
+            json!([
+                printed["contexts"][0]["active"],
+                printed["contexts"][1]["active"]
+            ])
+        );
+
+        let mut none = ContextsSnapshot::off();
+        none.enabled = true;
+        none.screens = vec![ScreenContext {
+            id: 1,
+            shows: ContextKey::Everything,
+        }];
+        assert_eq!(
+            json!({
+              "scope": "global",
+              "screens": [{ "id": 1, "active": "Everything" }],
+              "contexts": [],
+              "unsorted": 0
+            }),
+            printed_json(&["list", "--json"], none)
+        );
+    }
+
+    /// `current --json` prints the snapshot shape with only the active
+    /// context, or with none under Everything.
+    #[test]
+    fn current_json_prints_the_spec_shape_with_the_active_context() {
+        assert_eq!(
+            json!({
+              "scope": "global",
+              "screens": [{ "id": 1, "active": "Comms" }],
+              "contexts": [
+                { "name": "Comms", "number": 1, "active": true,
+                  "apps": ["WhatsApp", "Microsoft Teams"], "windows": 2 }
+              ],
+              "unsorted": 3
+            }),
+            printed_json(&["current", "--json"], snapshot().current())
+        );
+        assert_eq!(
+            json!({
+              "scope": "global",
+              "screens": [
+                { "id": 1, "active": "Everything" },
+                { "id": 2, "active": "Everything" }
+              ],
+              "contexts": [],
+              "unsorted": 0
+            }),
+            printed_json(&["current", "--json"], everything_on_two_screens().current())
+        );
+    }
+
+    /// Names line up by characters, not bytes. A context with no open window
+    /// shows "0 windows" and no apps, and the star marks Everything when it
+    /// is active. No line ends in spaces.
+    #[test]
+    fn list_lines_up_names_by_characters_and_marks_everything() {
+        let mut snapshot = everything_on_two_screens();
+        snapshot.contexts[0].name = "Café".into();
+        snapshot.contexts[0].number = Some(9);
+        snapshot.contexts[0].apps = vec!["Zed".into()];
+        snapshot.contexts[0].windows = 1;
+        snapshot.contexts[1].name = "Ünïcode wörk".into();
+
+        let ran = run_with(&["list"], Response::Contexts(snapshot));
+
+        assert_eq!(
+            "  9 Café          1 window  Zed\n\
+            \x20   Ünïcode wörk  0 windows\n\
+            *   Everything\n",
+            ran.out
+        );
+        assert_eq!((0, ""), (ran.status, &*ran.err));
+    }
+
+    /// `current` names Unsorted when it is active.
+    #[test]
+    fn current_prints_unsorted() {
+        let mut snapshot = snapshot();
+        snapshot.active = ContextKey::Unsorted;
+        snapshot.screens[0].shows = ContextKey::Unsorted;
+        let ran = run_with(&["current"], Response::Contexts(snapshot.current()));
+        assert_eq!((0, "Unsorted\n", ""), (ran.status, &*ran.out, &*ran.err));
+    }
+
+    /// A query is sent as it was typed: a number from 1 to 9, with or
+    /// without spaces and leading zeros, or any other text as a name.
+    #[test]
+    fn a_query_is_sent_as_a_number_or_as_the_text_typed() {
+        for (query, reference) in [
+            ("1", ContextRef::Number(1)),
+            (" 3 ", ContextRef::Number(3)),
+            ("007", ContextRef::Number(7)),
+            ("Client work", ContextRef::Name("Client work".into())),
+            (" cli ", ContextRef::Name(" cli ".into())),
+            ("+3", ContextRef::Name("+3".into())),
+            ("3.0", ContextRef::Name("3.0".into())),
+            ("٣", ContextRef::Name("٣".into())),
+            ("", ContextRef::Name(String::new())),
+        ] {
+            let ran = run_with(&["switch", query], Response::Success);
+            assert_eq!((0, "", ""), (ran.status, &*ran.out, &*ran.err), "{query:?}");
+            assert_eq!(vec![switch(reference)], ran.requests, "{query:?}");
+        }
+        for query in ["00", "256", "99999999999"] {
+            let ran = run_with(&["switch", query], Response::Success);
+            assert_eq!(
+                (1, "", format!("Context numbers go from 1 to 9, not {query}\n")),
+                (ran.status, &*ran.out, ran.err)
+            );
+            assert!(ran.requests.is_empty());
+        }
+    }
+
+    /// The name of a new context is sent as it was typed, and a reason the
+    /// server gives goes to stderr.
+    #[test]
+    fn create_sends_the_name_and_prints_a_refusal() {
+        let ran = run_with(&["create", " Café \"A\" "], Response::Success);
+        assert_eq!((0, "", ""), (ran.status, &*ran.out, &*ran.err));
+        assert_eq!(
+            vec![ContextRequest::Run(ContextCommand::CreateContext(
+                " Café \"A\" ".into()
+            ))],
+            ran.requests
+        );
+
+        let reason = "\"Everything\" is a reserved name";
+        let ran = run_with(&["create", "Everything"], Response::Error(reason.into()));
+        assert_eq!((1, "", format!("{reason}\n")), (ran.status, &*ran.out, ran.err));
+    }
+
+    /// M5c. `sugarglider context add <query>` adds the focused window to a
+    /// context.
+    #[test]
+    #[ignore = "bug: M5c has no `sugarglider context add`; it needs M5b's add_window_to_context command"]
+    fn add_sends_one_command_for_the_focused_window() {
+        let parsed = parse(&["add", "Comms"]);
+        assert!(parsed.is_ok(), "{parsed:?}");
+        let ran = run_with(&["add", "Comms"], Response::Success);
+        assert_eq!((0, "", ""), (ran.status, &*ran.out, &*ran.err));
+        assert_eq!(1, ran.requests.len());
+        assert!(
+            matches!(ran.requests[0], ContextRequest::Run(_)),
+            "{:?}",
+            ran.requests
+        );
     }
 }
