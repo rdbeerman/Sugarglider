@@ -13,6 +13,7 @@ use super::Reactor;
 use super::animation::Animation;
 use crate::actor::app::{WindowId, pid_t};
 use crate::actor::parked_journal::JournalEntry;
+use crate::collections::HashSet;
 use crate::model::parking_origin;
 use crate::sys::app::Process;
 use crate::sys::window_server::WindowServerId;
@@ -95,20 +96,35 @@ impl Reactor {
         Ok(writes.into_iter().map(|(wid, _)| wid).collect())
     }
 
-    /// Puts parked windows back at the frames they had before they were
-    /// parked. Their journal entries stay until the windows report those
-    /// frames.
+    /// Puts parked windows back. A window that the layout places goes to its
+    /// frame in the layout now. Any other window, such as a floating one, goes
+    /// back to the frame it had before it was parked. The journal entries stay
+    /// until the windows report the frames written.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "only tests park windows until context switching")
     )]
     pub(super) fn unpark_windows(&mut self, wids: &[WindowId]) {
+        let laid_out = self.windows_in_layout();
         for wid in wids {
             let Some(frame) = self.parked.remove(wid) else { continue };
             self.frame_attempts.remove(wid);
-            self.pending_frame_overrides.insert(*wid, frame);
+            if !laid_out.contains(wid) {
+                self.pending_frame_overrides.insert(*wid, frame);
+            }
         }
         self.update_layout(&[], true);
+    }
+
+    /// The windows that the active layouts of the visible Spaces give a frame.
+    /// Floating windows are not among them.
+    fn windows_in_layout(&self) -> HashSet<WindowId> {
+        self.screens
+            .iter()
+            .filter_map(|screen| Some((screen.space?, screen.frame)))
+            .flat_map(|(space, frame)| self.layout.calculate_layout(space, frame, &self.config))
+            .map(|(wid, _)| wid)
+            .collect()
     }
 
     /// The frame that parks a window now at `frame`. It keeps 1 point in a
@@ -260,9 +276,9 @@ mod tests {
     use test_log::test;
 
     use super::super::testing::*;
-    use super::super::{Event, FrameAttempt, MAX_FRAME_ATTEMPTS, Reactor, Requested};
+    use super::super::{Command, Event, FrameAttempt, MAX_FRAME_ATTEMPTS, Reactor, Requested};
     use crate::actor::app::{Request, WindowId, pid_t};
-    use crate::actor::layout::LayoutManager;
+    use crate::actor::layout::{LayoutCommand, LayoutEvent, LayoutManager};
     use crate::actor::parked_journal::{JournalEntry, ParkedJournal};
     use crate::sys::app::{Process, WindowInfo};
     use crate::sys::geometry::CGRectExt;
@@ -1057,7 +1073,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bug: unparking writes the pre-park frame instead of the current tile"]
     fn h3_an_unparked_window_ends_at_its_current_tile() {
         let mut s = Setup::new_on(wide_screen(), 3);
         s.reactor.park_windows(&[wid(1)]).unwrap();
@@ -1480,5 +1495,52 @@ mod tests {
         assert_eq!(vec![wid(4)], parked.unwrap());
         assert_eq!(vec![wid(1), wid(4)], s.parked_windows());
         assert!(s.reactor.park_windows(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn h3_unparking_after_the_layout_changed_writes_only_the_new_tile() {
+        let mut s = Setup::new(3);
+        let old_tile = s.frame(wid(1));
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s.reactor.handle_event(Event::WindowDestroyed(wid(3)));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let new_tile = s.tiles().into_iter().find(|(window, _)| *window == wid(1)).unwrap().1;
+        assert_ne!(old_tile, new_tile);
+
+        s.reactor.unpark_windows(&[wid(1)]);
+
+        let requests = s.apps.requests();
+        assert_eq!(vec![new_tile], frame_writes(&requests, wid(1)));
+        assert_eq!(1, s.journal_on_disk().len());
+        s.handle_requests(requests);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(new_tile, s.frame(wid(1)));
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    #[test]
+    fn h3_a_floating_window_goes_back_to_its_frame_from_before_parking() {
+        let mut s = Setup::new(2);
+        s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        s.reactor.send_layout_event(LayoutEvent::WindowFocused(vec![space()], wid(1)));
+        s.reactor.handle_event(Event::Command(Command::Layout(
+            LayoutCommand::ToggleWindowFloating,
+        )));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let floating = rect(100., 100., 50., 50.);
+        assert_eq!(floating, s.frame(wid(1)));
+        assert_eq!(vec![(wid(2), screen())], s.tiles());
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(rect(999., 999., 50., 50.), s.frame(wid(1)));
+
+        s.reactor.unpark_windows(&[wid(1)]);
+
+        let requests = s.apps.requests();
+        assert_eq!(vec![floating], frame_writes(&requests, wid(1)));
+        s.handle_requests(requests);
+        assert_eq!(floating, s.frame(wid(1)));
+        assert!(s.journal_on_disk().is_empty());
     }
 }
