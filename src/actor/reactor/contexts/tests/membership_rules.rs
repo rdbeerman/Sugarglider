@@ -323,6 +323,41 @@ fn r21_r22_windows_that_arrive_together_rejoin_by_exact_and_similar_titles_in_an
     }
 }
 
+/// R22, R20. C holds an empty record of app 2 with a blank title and no
+/// window server id. App 2 runs again while D is active, with a window whose
+/// title is blank too. Steps 2 and 3 never take a blank title, so the window
+/// matches nothing: it joins D and shows there, and C's record stays empty.
+#[test]
+fn r22_a_relaunched_window_with_a_blank_title_matches_no_blank_record() {
+    for title in ["", "  "] {
+        let mut s = Setup::new(1);
+        let c = s.create("C", &[wid(1)]);
+        let d = s.create("D", &[wid(1)]);
+        empty_record(&mut s, c, WindowId::new(90, 1), 2, title);
+        s.switch(d);
+
+        let blank = launch(&mut s, 5, test_app_info(2), vec![titled(title, 51, 700.)])[0];
+
+        assert_eq!(
+            vec![
+                record("Window1", RecordLink::Live(wid(1))),
+                record(title, RecordLink::Empty),
+            ],
+            records(&s, c),
+            "{title:?}"
+        );
+        assert_eq!(
+            vec![id_of(d)],
+            s.reactor.contexts.contexts_of(blank),
+            "{title:?}"
+        );
+        assert!(s.parked().is_empty(), "{title:?}");
+        let tiles = halves(wid(1), blank);
+        assert_eq!(tiles, s.tiles(), "{title:?}");
+        assert_eq!(tiles, s.frames(&[wid(1), blank]), "{title:?}");
+    }
+}
+
 /// App 2 with window "Doc A" in C and window "Doc B" in C and D. App 1's
 /// window 1 is in both. C is active. Returns the setup, C, D, and app 2's
 /// windows.

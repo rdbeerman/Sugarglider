@@ -636,3 +636,22 @@ fn r12_step_6_without_finder_a_switch_to_an_empty_context_activates_nothing() {
     assert_eq!(vec![wid(1), other], s.parked());
     assert_eq!(empty, s.reactor.contexts.active());
 }
+
+/// R24, R33. While Sugarglider is about to stop managing the Space, the
+/// screen shows Everything although C stays the active context. Focus on a
+/// window of D switches nothing and raises nothing there.
+#[test]
+fn r24_r33_a_screen_that_shows_everything_before_its_space_is_turned_off_never_switches() {
+    let TwoApps { mut s, c, other, .. } = two_apps();
+    s.reactor.handle_event(Event::ShowEverythingOn(vec![space()]));
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    assert!(s.parked().is_empty());
+    let mut raises = capture_raises(&mut s);
+
+    activate(&mut s, 2, other, Order::GloballyFirst);
+    activate(&mut s, 1, wid(1), Order::GloballyLast);
+
+    assert_eq!(c, s.reactor.contexts.active());
+    assert!(raise_requests(&mut raises).is_empty());
+    assert!(s.parked().is_empty());
+}
