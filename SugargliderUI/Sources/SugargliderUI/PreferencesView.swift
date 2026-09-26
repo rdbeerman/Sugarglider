@@ -522,7 +522,7 @@ struct AppRuleRow: View {
         HStack {
             Image(systemName: "app.fill")
                 .foregroundColor(.secondary)
-            Text(rule.appName)
+            Text(rule.appName ?? "")
             Spacer()
             Text(rule.behavior.rawValue)
                 .foregroundColor(.secondary)

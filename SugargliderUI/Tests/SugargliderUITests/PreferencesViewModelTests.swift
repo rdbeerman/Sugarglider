@@ -180,6 +180,27 @@ final class PreferencesViewModelTests: XCTestCase {
     XCTAssertEqual(saved.windowRules.first?.behavior, "float")
   }
 
+  /// A window rule whose condition is an empty string keeps it: an empty
+  /// string and no condition are different rules.
+  func testKeepsEmptyWindowRuleConditions() throws {
+    let rule = WindowRuleJson(appName: "", bundleId: "", behavior: "float")
+    let backend = FakePreferencesBackend(PreferencesConfig(windowRules: [rule]))
+    let model = PreferencesViewModel(backend: backend)
+    let row = try XCTUnwrap(model.appRules.first)
+    XCTAssertEqual(row.appName, "")
+    XCTAssertEqual(row.bundleId, "")
+
+    model.enableAnimations = false
+    model.saveToConfig()
+
+    let updated = try XCTUnwrap(backend.updated.last?.windowRules.first)
+    XCTAssertEqual(updated.appName, "")
+    XCTAssertEqual(updated.bundleId, "")
+    let saved = try XCTUnwrap(backend.saved.last?.windowRules.first)
+    XCTAssertEqual(saved.appName, "")
+    XCTAssertEqual(saved.bundleId, "")
+  }
+
   /// The Hotkeys pane shows the Contexts category, and any category it
   /// doesn't know after the others.
   func testGroupsEveryCategoryOfBindings() {

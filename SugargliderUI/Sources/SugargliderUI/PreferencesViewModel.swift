@@ -26,8 +26,11 @@ public enum AppBehavior: String, CaseIterable {
 
 public struct AppRule: Identifiable {
     public let id = UUID()
-    public var appName: String
-    public var bundleId: String
+    /// The app name condition. `nil` means the rule has none, which is
+    /// different from an empty string, which the file may spell.
+    public var appName: String?
+    /// The bundle id condition, as `appName`.
+    public var bundleId: String?
     public var behavior: AppBehavior
     /// Window-rule conditions the App Rules pane doesn't show. Stored and
     /// saved unchanged.
@@ -37,7 +40,7 @@ public struct AppRule: Identifiable {
     public var axSubrole: String?
 
     public init(
-        appName: String, bundleId: String, behavior: AppBehavior,
+        appName: String?, bundleId: String?, behavior: AppBehavior,
         titleRegex: String? = nil, titleSubstring: String? = nil,
         axRole: String? = nil, axSubrole: String? = nil
     ) {
@@ -121,7 +124,7 @@ public class PreferencesViewModel: ObservableObject {
     }
 
     public func addAppRule() {
-        appRules.append(AppRule(appName: "New App", bundleId: "", behavior: .tile))
+        appRules.append(AppRule(appName: "New App", bundleId: nil, behavior: .tile))
     }
 
     /// Update a hotkey binding and save to config
@@ -210,8 +213,8 @@ public class PreferencesViewModel: ObservableObject {
             default: behavior = .tile
             }
             return AppRule(
-                appName: rule.appName ?? "",
-                bundleId: rule.bundleId ?? "",
+                appName: rule.appName,
+                bundleId: rule.bundleId,
                 behavior: behavior,
                 titleRegex: rule.titleRegex,
                 titleSubstring: rule.titleSubstring,
@@ -287,8 +290,8 @@ public class PreferencesViewModel: ObservableObject {
             contextsEnable: contextsEnable,
             windowRules: appRules.map { rule in
                 WindowRuleJson(
-                    appName: rule.appName.isEmpty ? nil : rule.appName,
-                    bundleId: rule.bundleId.isEmpty ? nil : rule.bundleId,
+                    appName: rule.appName,
+                    bundleId: rule.bundleId,
                     behavior: rule.behavior.rawValue.lowercased(),
                     titleRegex: rule.titleRegex,
                     titleSubstring: rule.titleSubstring,

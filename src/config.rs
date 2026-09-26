@@ -656,15 +656,13 @@ fn write_preferences_to_path(
 
             // Build the 'if' conditions table
             let mut conditions = toml_edit::Table::new();
+            // An empty string is a condition too, so it is written as it
+            // stands: dropping it would widen the rule.
             if let Some(ref app_id) = rule.conditions.app_id {
-                if !app_id.is_empty() {
-                    conditions["app_id"] = value(app_id);
-                }
+                conditions["app_id"] = value(app_id);
             }
             if let Some(ref app_name) = rule.conditions.app_name {
-                if !app_name.is_empty() {
-                    conditions["app_name"] = value(app_name);
-                }
+                conditions["app_name"] = value(app_name);
             }
             if let Some(ref title_regex) = rule.conditions.title_regex {
                 conditions["title_regex"] = value(title_regex.as_str());
@@ -1607,6 +1605,71 @@ mod tests {
         );
         let saved = Config::load(Some(&path)).unwrap();
         assert_eq!(config.window_rules, saved.window_rules);
+    }
+
+    /// A window rule whose condition is an empty string keeps it: a save
+    /// that changes no rule leaves the file alone, and the running config
+    /// keeps the same condition. `app_id = ""` matches only an empty bundle
+    /// id, so dropping the condition would widen the rule to every window.
+    #[test]
+    fn preferences_keep_empty_window_rule_conditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "[[window_rules]]\n\
+             if = { app_id = \"\" }\n\
+             float = true\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            Some(String::new()),
+            config.window_rules[0].conditions.app_id
+        );
+
+        let mut prefs = preferences_for(&config);
+        prefs.animate = !prefs.animate;
+        assert_eq!(
+            config.window_rules,
+            prefs.apply_to_config(&config).window_rules
+        );
+
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("app_id = \"\""), "{written}");
+        assert_eq!(
+            config.window_rules,
+            Config::load(Some(&path)).unwrap().window_rules
+        );
+    }
+
+    /// When a window rule change does rewrite the rules, an empty condition
+    /// is written as it stands, so the rules that stay keep their meaning.
+    #[test]
+    fn preferences_write_empty_window_rule_conditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "[[window_rules]]\n\
+             if = { app_id = \"\" }\n\
+             float = true\n\n\
+             [[window_rules]]\n\
+             if = { app_name = \"Finder\" }\n\
+             float = false\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(2, config.window_rules.len());
+
+        let mut prefs = preferences_for(&config);
+        prefs.window_rules.remove(1); // the window deleted the Finder rule
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(vec![config.window_rules[0].clone()], saved.window_rules);
     }
 
     /// A window rule that the App Rules pane removes goes away, and the
