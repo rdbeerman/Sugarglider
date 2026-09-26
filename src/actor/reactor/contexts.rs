@@ -16,7 +16,8 @@ use crate::actor::app::{WindowId, pid_t};
 use crate::actor::contexts_store::{ContextsStore, Loaded, empty_contexts_after};
 use crate::actor::layout::{ActiveContext, EventResponse, LayoutEvent};
 use crate::model::contexts::{
-    ContextKey, Contexts, RecordLink, SwitchInput, SwitchPlan, SwitchScreen, plan_switch, rank,
+    ContextError, ContextId, ContextKey, Contexts, RecordLink, SwitchInput, SwitchPlan,
+    SwitchScreen, plan_switch, rank,
 };
 use crate::sys::screen::SpaceId;
 
@@ -367,6 +368,26 @@ impl Reactor {
                 self.unpark_windows(&rest);
             }
         }
+    }
+
+    /// Deletes a context. Its windows stay open, and the ones that were only
+    /// in it become unsorted. When it was active, Unsorted shows first, and
+    /// then the context's layouts go.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no command deletes a context yet")
+    )]
+    pub(super) fn delete_context(&mut self, id: ContextId) -> Result<(), ContextError> {
+        let was_active = self.contexts.active() == ContextKey::Named(id);
+        self.contexts.delete(id)?;
+        if was_active {
+            self.apply_again();
+        }
+        self.layout.remove_context_layouts(id);
+        if self.contexts_enabled() {
+            self.save_contexts();
+        }
+        Ok(())
     }
 
     /// Writes `contexts.json`. A failure is logged.
@@ -1682,5 +1703,72 @@ mod tests {
         assert_eq!(right_everything, s.tiles_on(space2, right));
         assert_eq!(vec![(wid(1), left)], s.tiles_on(space(), left));
         assert_eq!(c, s.reactor.contexts.active());
+    }
+
+    /// Counts the errors logged while `f` runs.
+    fn count_errors(f: impl FnOnce()) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        struct ErrorCounter(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ErrorCounter {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() == tracing::Level::ERROR {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(ErrorCounter(count.clone()));
+        tracing::subscriber::with_default(subscriber, f);
+        count.load(Ordering::Relaxed)
+    }
+
+    /// R6, L2.
+    #[test]
+    fn r6_deleting_the_active_context_shows_unsorted_first_without_errors() {
+        let mut s = Setup::new(3);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        let d = s.create("D", &[wid(2)]);
+        s.switch(d);
+        s.switch(c);
+        assert_eq!(vec![wid(3)], s.parked());
+        let ContextKey::Named(c_id) = c else { unreachable!() };
+
+        let errors = count_errors(|| s.reactor.delete_context(c_id).unwrap());
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(0, errors);
+        assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+        assert_eq!(ContextKey::Unsorted, s.saved_active());
+        assert!(s.reactor.layout.context_ids().all(|id| id != c_id));
+        assert_eq!(vec![wid(2)], s.parked());
+        let shown = vec![
+            (wid(1), rect(0., 0., 600., 1000.)),
+            (wid(3), rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(shown, s.tiles());
+        assert_eq!(shown, s.frames(&[wid(1), wid(3)]));
+    }
+
+    /// R6, L2.
+    #[test]
+    fn r6_deleting_a_context_that_is_not_active_moves_nothing() {
+        let mut s = Setup::new(2);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        s.switch(ContextKey::Everything);
+        let frames = s.frames(&[wid(1), wid(2)]);
+        let ContextKey::Named(c_id) = c else { unreachable!() };
+
+        let errors = count_errors(|| s.reactor.delete_context(c_id).unwrap());
+
+        assert_eq!(0, errors);
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(frames, s.frames(&[wid(1), wid(2)]));
+        assert_eq!(0, s.reactor.layout.context_ids().count());
+        assert_eq!(ContextKey::Everything, s.saved_active());
     }
 }
