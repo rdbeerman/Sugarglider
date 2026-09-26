@@ -21,7 +21,7 @@ const FINDER: &str = "com.apple.finder";
 /// end it never arrive, for example because an app didn't answer a write.
 const GUARD_DEADLINE: Duration = Duration::from_secs(2);
 
-/// What a switch waits for before focus from outside counts again (R25).
+/// What a switch waits for before focus from outside counts again.
 /// Until then, activations and main window changes can be the switch's own.
 #[derive(Debug, Default)]
 pub(super) struct SwitchGuard {
@@ -31,7 +31,7 @@ pub(super) struct SwitchGuard {
     /// the parking write hasn't arrived.
     echoes: HashSet<WindowId>,
     /// Finder, when the switch activated it because no window could take
-    /// focus (R12, step 6), until its activation arrives.
+    /// focus, until its activation arrives.
     finder: Option<pid_t>,
     /// When the switch started to wait.
     pub(super) since: Option<Instant>,
@@ -50,7 +50,7 @@ enum FocusOutcome {
     Stays,
     /// Sugarglider switched to a context that shows the window.
     Switched,
-    /// Sugarglider raised a member of the active context instead (R40).
+    /// Sugarglider raised a member of the active context instead.
     RaisedMember,
     /// Nothing happened, and the focus doesn't count.
     Ignored,
@@ -58,8 +58,8 @@ enum FocusOutcome {
 
 impl Reactor {
     /// Handles a window that took focus in a way that counts as the user's.
-    /// While a switch is in progress it is ignored (R25). A window the
-    /// reactor hasn't seen yet waits until the reactor first sees it (R24).
+    /// While a switch is in progress it is ignored. A window the
+    /// reactor hasn't seen yet waits until the reactor first sees it.
     pub(super) fn focus_changed(&mut self, wid: WindowId) {
         if !self.contexts_enabled() {
             return;
@@ -80,7 +80,7 @@ impl Reactor {
     }
 
     /// Applies focus that waited for windows the reactor sees for the first
-    /// time, now that their membership is decided (R24, R38).
+    /// time, now that their membership is decided.
     pub(super) fn focus_windows_seen(&mut self, wids: &[WindowId]) {
         let Some(waiting) = self.focus_waiting else { return };
         if !wids.contains(&waiting) {
@@ -92,7 +92,7 @@ impl Reactor {
         }
     }
 
-    /// R24, R40. When the user focuses a window that isn't a member of its
+    /// When the user focuses a window that isn't a member of its
     /// screen's active context, switches to the most recently used context
     /// that holds it, or to Unsorted. When the window is parked and its app
     /// has a visible member of the active context, raises that member
@@ -159,7 +159,7 @@ impl Reactor {
             .max_by_key(|&wid| (self.contexts.last_focus(wid), wid))
     }
 
-    /// R12 steps 5 and 6, R25. After windows were parked, handles the
+    /// After windows were parked, handles the
     /// layout's `response` and raises `focus`, unless it is the main window
     /// already and `always` is false. When there is no window to focus,
     /// activates Finder instead. Focus from outside counts again when that
@@ -185,7 +185,7 @@ impl Reactor {
         self.guard_switch(sequence.zip(raised), parked, finder);
     }
 
-    /// R25. Starts waiting for the end of a switch: its raise sequence, which
+    /// Starts waiting for the end of a switch: its raise sequence, which
     /// focuses `raise`'s window, or, when it raised nothing, the echo of
     /// every window it parked. With `finder`, the wait also lasts until
     /// Finder's activation arrives.
@@ -282,7 +282,7 @@ impl Reactor {
         }
     }
 
-    /// R12, step 6. When a switch leaves no window to focus, activates
+    /// When a switch leaves no window to focus, activates
     /// Finder quietly, so that keystrokes don't go to a parked window.
     /// Returns Finder's pid when its activation is to come.
     pub(super) fn activate_finder(&mut self) -> Option<pid_t> {

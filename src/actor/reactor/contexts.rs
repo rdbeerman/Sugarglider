@@ -82,7 +82,7 @@ impl Reactor {
         self.shown_with(space, self.contexts.active())
     }
 
-    /// Whether the window is one the Space shows (R13). Under Everything
+    /// Whether the window is one the Space shows. Under Everything
     /// every window is; under a context only its members are.
     pub(super) fn shows_on(&self, space: SpaceId, wid: WindowId) -> bool {
         self.shows_under(self.shown_context(space), wid)
@@ -90,8 +90,8 @@ impl Reactor {
 
     /// Whether the window shows when `key` is shown. A window added to a
     /// context since the last switch counts as a member of the active
-    /// context until the next switch (R37). A tab shows with its group's
-    /// main tab (R36).
+    /// context until the next switch. A tab shows with its group's
+    /// main tab.
     pub(super) fn shows_under(&self, key: ContextKey, wid: WindowId) -> bool {
         let wid = self.membership_window(wid);
         match key {
@@ -103,10 +103,10 @@ impl Reactor {
         }
     }
 
-    /// Whether the window may reach the layout the Space shows (H2): be
+    /// Whether the window may reach the layout the Space shows: be
     /// added to it, change Space in it, or take focus in it from the mouse.
     /// A parked window may not, whatever its geometry says. Under a context
-    /// only the context's members may (L4).
+    /// only the context's members may.
     pub(super) fn reaches_layout(&self, space: SpaceId, wid: WindowId) -> bool {
         !self.parked.contains_key(&wid) && self.shows_on(space, wid)
     }
@@ -223,7 +223,7 @@ impl Reactor {
                 && self.windows[&wid]
                     .window_server_id
                     .is_some_and(|wsid| self.visible_windows.contains(&wsid));
-            // A tab has the membership of its group's main tab (R36).
+            // A tab has the membership of its group's main tab.
             let decides = self.membership_window(wid);
             let mut window = SwitchWindow {
                 wid,
@@ -231,7 +231,7 @@ impl Reactor {
                 ..self.contexts.switch_window(decides)
             };
             if self.added_since_switch.contains(&decides) {
-                // It counts as a member of the active context (R37).
+                // It counts as a member of the active context.
                 match self.contexts.active() {
                     ContextKey::Named(id) if !window.contexts.contains(&id) => {
                         window.contexts.push(id)
@@ -305,10 +305,10 @@ impl Reactor {
     }
 
     /// Switches to `target` on every screen, and focuses `focused`, the
-    /// window whose focus started the switch (R24), or else the most
+    /// window whose focus started the switch, or else the most
     /// recently focused window that shows. When no window can take focus,
-    /// Finder is activated (R12, step 6). Focus from outside counts again
-    /// when the switch ends (R25).
+    /// Finder is activated. Focus from outside counts again
+    /// when the switch ends.
     pub(super) fn switch_context_focusing(
         &mut self,
         target: ContextKey,
@@ -606,7 +606,7 @@ impl Reactor {
     }
 
     /// Has the windows of the running apps rejoin the contexts whose records
-    /// they match, as at launch (R38). Windows found while contexts were off
+    /// they match, as at launch. Windows found while contexts were off
     /// have no membership until then.
     fn rejoin_every_window(&mut self) {
         let mut wids: Vec<WindowId> = self

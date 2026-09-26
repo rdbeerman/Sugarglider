@@ -15,14 +15,14 @@ use crate::sys::window_server::WindowServerId;
 
 impl Reactor {
     /// Decides the membership of windows that the reactor sees for the first
-    /// time (R38). The reactor's windows are the windows it has seen, so a
+    /// time. The reactor's windows are the windows it has seen, so a
     /// window that comes back from being minimized, from a hidden app, or
     /// from another Space is not new.
     ///
     /// Windows found before `StartupComplete` were open before Sugarglider
     /// started. They rejoin the contexts whose records they match, or stay
-    /// unsorted. Later windows rejoin the contexts whose records they match
-    /// (R21), or else join the context that their screen shows (R20).
+    /// unsorted. Later windows rejoin the contexts whose records they match,
+    /// or else join the context that their screen shows.
     ///
     /// Sugarglider's own windows, windows the layout doesn't track, and
     /// windows of apps that haven't registered get no membership. With
@@ -60,7 +60,7 @@ impl Reactor {
         }
     }
 
-    /// R20, R21, R36. A new tab of a native tab group that the reactor knows
+    /// A new tab of a native tab group that the reactor knows
     /// joins the contexts of the group's main tab. The other windows are
     /// matched together against the member records, and each window that
     /// matches nothing joins the context its screen shows. Returns whether
@@ -122,7 +122,7 @@ impl Reactor {
         tabs
     }
 
-    /// The window whose membership decides the window's (R36): the main tab
+    /// The window whose membership decides the window's: the main tab
     /// of its tab group, or the window itself.
     pub(super) fn membership_window(&self, wid: WindowId) -> WindowId {
         self.main_tab(wid).unwrap_or(wid)
@@ -135,7 +135,7 @@ impl Reactor {
         (main != wid && self.tabs_of(wid).contains(&main)).then_some(main)
     }
 
-    /// R36. A new tab joins the contexts of its group's main tab, and is
+    /// A new tab joins the contexts of its group's main tab, and is
     /// pinned when the main tab is. Returns whether it joined anything.
     fn join_tab_group(&mut self, tab: &WindowDesc, main_tab: WindowId) -> bool {
         let mut joined = false;
@@ -160,7 +160,7 @@ impl Reactor {
     }
 
     /// Whether a record of a window of `pid` has `link`'s kind: open, or
-    /// closed and pending (R23).
+    /// closed and pending.
     fn has_records(&self, pid: pid_t, link: fn(RecordLink) -> Option<WindowId>) -> bool {
         self.contexts
             .contexts()
@@ -171,8 +171,8 @@ impl Reactor {
     }
 
     /// The window's title changed. Its member records take the new title,
-    /// so a window that appears with it after a relaunch can match them
-    /// (R22). A title change alone doesn't write `contexts.json`.
+    /// so a window that appears with it after a relaunch can match them. A
+    /// title change alone doesn't write `contexts.json`.
     pub(super) fn title_changed(&mut self, wid: WindowId, title: Secret<String>) {
         if self.contexts_enabled() && self.windows.contains_key(&wid) {
             self.contexts.title_changed(wid, title.expose_secret());
@@ -184,7 +184,7 @@ impl Reactor {
     }
 
     /// A window closed. Its records wait, pending, until its app shows
-    /// whether it quit (R23).
+    /// whether it quit.
     pub(super) fn window_closed(&mut self, wid: WindowId) {
         if self.contexts_enabled() {
             self.contexts.window_closed(wid);
@@ -192,7 +192,7 @@ impl Reactor {
     }
 
     /// The app quit. Its records stay, and keep the windows' last titles, so
-    /// its windows can rejoin when it runs again (R21, R23). The contexts are
+    /// its windows can rejoin when it runs again. The contexts are
     /// saved when the app had records.
     pub(super) fn app_terminated(&mut self, pid: pid_t) {
         if !self.contexts_enabled() {
@@ -209,7 +209,7 @@ impl Reactor {
     }
 
     /// The app showed that it is still running, so its closed windows are
-    /// gone for good, and their pending records go (R23).
+    /// gone for good, and their pending records go.
     pub(super) fn app_still_running(&mut self, pid: pid_t) {
         if !self.contexts_enabled() || !self.apps.contains_key(&pid) {
             return;
@@ -228,7 +228,7 @@ impl Reactor {
         }
     }
 
-    /// R23. A window server list that names an open window of an app shows
+    /// A window server list that names an open window of an app shows
     /// that the app is still running.
     pub(super) fn apps_listed(&mut self, listed: &[WindowServerId]) {
         let mut pids: Vec<pid_t> = listed
@@ -245,7 +245,7 @@ impl Reactor {
     }
 
     /// The windows that a membership command for `window` acts on: the
-    /// window's native tab group (R36). None, and the command does nothing,
+    /// window's native tab group. None, and the command does nothing,
     /// while contexts are off or Sugarglider quits, and when there is no
     /// window, or it is Sugarglider's own, untracked, or parked.
     fn command_windows(&self, window: Option<WindowId>, command: &str) -> Option<Vec<WindowId>> {
@@ -271,7 +271,7 @@ impl Reactor {
         Some(self.tabs_of(wid))
     }
 
-    /// R37. Adds the window and its tabs to the context. They take effect at
+    /// Adds the window and its tabs to the context. They take effect at
     /// the next switch: until then the windows count as members of the
     /// active context, so they stay where they are.
     pub(super) fn add_window_to_context(
@@ -296,7 +296,7 @@ impl Reactor {
         self.save_contexts();
     }
 
-    /// R37. Moves the window and its tabs out of the active context and
+    /// Moves the window and its tabs out of the active context and
     /// into the named one, at once. If they no longer show, they are parked.
     pub(super) fn move_window_to_context(
         &mut self,
@@ -321,7 +321,7 @@ impl Reactor {
         self.park_windows_that_left(&tabs);
     }
 
-    /// R37. Removes the window and its tabs from the active context, at
+    /// Removes the window and its tabs from the active context, at
     /// once. If they no longer show, they are parked.
     pub(super) fn remove_window_from_context(&mut self, window: Option<WindowId>) {
         let Some(tabs) = self.command_windows(window, "remove_window_from_context") else {
@@ -340,7 +340,7 @@ impl Reactor {
         self.park_windows_that_left(&tabs);
     }
 
-    /// R3. Pins the window and its tabs, which makes them members of every
+    /// Pins the window and its tabs, which makes them members of every
     /// context, or unpins them. Unpinned windows that no longer show are
     /// parked.
     pub(super) fn toggle_window_pinned(&mut self, window: Option<WindowId>) {
@@ -363,9 +363,9 @@ impl Reactor {
     }
 
     /// Parks the windows that left the active context and no longer show,
-    /// with their journal entries written first (R30), takes them out of
+    /// with their journal entries written first, takes them out of
     /// the layout, and focuses the active context's most recently focused
-    /// member (R37).
+    /// member.
     fn park_windows_that_left(&mut self, wids: &[WindowId]) {
         if !self.contexts_in_use() {
             return;
@@ -396,9 +396,10 @@ impl Reactor {
         self.focus_after_parking(Default::default(), focus, false, &parked);
     }
 
-    /// Parks the windows of `pid` that must not show (R13), with their
-    /// journal entries written first (R30). The windows that R14 names are
-    /// left alone, and so is the main window, whose focus R24 handles. Does
+    /// Parks the windows of `pid` that must not show, with their journal
+    /// entries written first. Sugarglider's own windows, untracked windows,
+    /// and windows outside the visible-window set are left alone, and so is
+    /// the main window, which has taken focus. Does
     /// nothing while contexts aren't in use and while quitting.
     pub(super) fn park_what_must_not_show(&mut self, pid: pid_t) {
         if !self.contexts_in_use() || self.pending_exit.is_some() {

@@ -1084,7 +1084,7 @@ impl Reactor {
                     && let Some(info) = self.layout_window_info(wid)
                 {
                     // The window leaves the old Space's layouts whether or not
-                    // the new Space's layout may take it (L10).
+                    // the new Space's layout may take it.
                     let added =
                         self.screens[new].space.filter(|&space| self.reaches_layout(space, wid));
                     self.send_layout_event(LayoutEvent::WindowSpaceChanged {
@@ -1710,7 +1710,7 @@ impl Reactor {
             };
             // A parked window stays in the list of a layout it belongs to, at
             // its frame from before parking, so that parking never removes
-            // its node (L5).
+            // its node.
             let parked = self.parked.contains_key(&wid);
             if !(self.reaches_layout(space, wid) || parked && self.shows_on(space, wid)) {
                 continue;
