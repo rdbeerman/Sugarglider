@@ -91,6 +91,26 @@ final class PreferencesViewModelTests: XCTestCase {
     XCTAssertEqual(saved.hotkeys.map(\.command), bindings.map(\.command))
   }
 
+  /// The Hotkeys pane shows the Contexts category, and any category it
+  /// doesn't know after the others.
+  func testGroupsEveryCategoryOfBindings() {
+    let binding = { (key: String, category: String) in
+      HotkeyBinding(key: key, command: #""debug""#, description: key, category: category)
+    }
+    let backend = FakePreferencesBackend(
+      PreferencesConfig(hotkeys: [
+        binding("⌃⌥0", "Contexts"), binding("⌥Z", "System"), binding("⌃⌥1", "Contexts"),
+        binding("⌥X", "Zebra"), binding("⌥H", "Focus"), binding("⌥Y", "Apes"),
+      ]))
+    let model = PreferencesViewModel(backend: backend)
+
+    let groups = model.hotkeysByCategory
+
+    XCTAssertEqual(groups.map(\.category), ["System", "Focus", "Contexts", "Apes", "Zebra"])
+    XCTAssertEqual(groups[2].bindings.map(\.key), ["⌃⌥0", "⌃⌥1"])
+    XCTAssertEqual(groups.map(\.bindings.count).reduce(0, +), model.hotkeys.count)
+  }
+
   /// Rust refuses to save over a config file with an error. The window's
   /// banner shows `lastError`: Rust's message once, without a second
   /// "Failed to save config", until a save succeeds.

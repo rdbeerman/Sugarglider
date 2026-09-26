@@ -65,12 +65,17 @@ public class PreferencesViewModel: ObservableObject {
     // Hotkeys (read-only, loaded from config)
     @Published public var hotkeys: [HotkeyBinding] = []
 
-    /// Hotkeys grouped by category for display
+    /// Hotkeys grouped by category for display. A category missing from the
+    /// order follows the others, so that no binding is hidden.
     public var hotkeysByCategory: [(category: String, bindings: [HotkeyBinding])] {
         let grouped = Dictionary(grouping: hotkeys) { $0.category }
         // Define category order
-        let categoryOrder = ["System", "Focus", "Move", "Resize", "Layout", "Floating", "Scroll Layout", "Developer", "Utilities"]
-        return categoryOrder.compactMap { category in
+        let categoryOrder = [
+            "System", "Focus", "Move", "Resize", "Layout", "Floating", "Scroll Layout", "Contexts",
+            "Developer", "Utilities",
+        ]
+        let otherCategories = grouped.keys.filter { !categoryOrder.contains($0) }.sorted()
+        return (categoryOrder + otherCategories).compactMap { category in
             guard let bindings = grouped[category], !bindings.isEmpty else { return nil }
             return (category: category, bindings: bindings)
         }
