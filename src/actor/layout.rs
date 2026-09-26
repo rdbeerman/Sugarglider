@@ -1002,6 +1002,11 @@ impl LayoutManager {
                 self.floating_restore_frames
                     .entry(wid)
                     .or_insert(FloatingRestoreFrame { frame: info.frame });
+                if self.tree.window_node(self.layout(space), wid).is_some() {
+                    // A new window reaches the layout through the window list
+                    // too, which may have added it already.
+                    return EventResponse::default();
+                }
                 match classify_window(&self.window_rules, &info) {
                     WindowClass::FloatByDefault => self.add_floating_window(wid, Some(space)),
                     WindowClass::Regular => {
@@ -3461,6 +3466,32 @@ mod tests {
             response.raise_windows.is_empty()
                 || response.raise_windows.contains(&WindowId::new(pid, 1))
         );
+    }
+
+    /// L11.
+    #[test]
+    fn l11_adding_a_window_that_has_a_node_in_the_layout_changes_nothing() {
+        use LayoutEvent::*;
+        let screen = rect(0, 0, 300, 30);
+        for scroll in [false, true] {
+            let mut mgr = LayoutManager::new_for_test();
+            if scroll {
+                mgr.set_config(&config_with_scroll(true, LayoutKind::Scroll));
+            }
+            let space = SpaceId::new(1);
+            let pid = 1;
+            _ = mgr.handle_event(SpaceExposed(space, screen.size, EVERYTHING));
+            _ = mgr.handle_event(WindowsOnScreenUpdated(space, pid, make_windows(pid, 2)));
+            _ = mgr.handle_event(WindowFocused(vec![space], WindowId::new(pid, 1)));
+            let before = mgr.layout_sorted(space, screen);
+            let tree = mgr.tree.draw_tree(mgr.layout(space));
+
+            _ = mgr.handle_event(WindowAdded(space, WindowId::new(pid, 2), win_info()));
+            _ = mgr.handle_event(WindowAdded(space, WindowId::new(pid, 1), win_info()));
+
+            assert_eq!(before, mgr.layout_sorted(space, screen), "scroll: {scroll}");
+            assert_eq!(tree, mgr.tree.draw_tree(mgr.layout(space)), "scroll: {scroll}");
+        }
     }
 
     #[test]
