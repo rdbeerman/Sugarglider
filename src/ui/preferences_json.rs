@@ -782,6 +782,73 @@ mod tests {
         assert!(parse_hotkey_string("H").is_none());
     }
 
+    /// Key bindings. Context bindings survive the round trip through the
+    /// preferences JSON, each with its own command id.
+    #[test]
+    fn context_bindings_survive_the_preferences_round_trip() {
+        let id = serde_json::from_value(serde_json::json!(7)).unwrap();
+        let bindings = [
+            ("Ctrl + Alt + Digit0", ContextCommand::ShowEverything),
+            (
+                "Ctrl + Alt + Digit1",
+                ContextCommand::SwitchContext(ContextRef::Number(1)),
+            ),
+            (
+                "Ctrl + Alt + Digit2",
+                ContextCommand::SwitchContext(ContextRef::Number(2)),
+            ),
+            (
+                "Ctrl + Alt + KeyC",
+                ContextCommand::SwitchContext(ContextRef::Name("Comms".into())),
+            ),
+            (
+                "Ctrl + Alt + KeyI",
+                ContextCommand::SwitchContext(ContextRef::Id(id)),
+            ),
+            ("Ctrl + Alt + Tab", ContextCommand::PreviousContext),
+        ];
+        let mut config = Config::default();
+        config.keys = bindings
+            .iter()
+            .map(|(key, cmd)| {
+                let cmd = WmCommand::ReactorCommand(ReactorCommand::Context(cmd.clone()));
+                (Hotkey::from_str(key).unwrap(), cmd)
+            })
+            .collect();
+
+        let json = serde_json::to_string(&PreferencesJson::from_config(&config)).unwrap();
+        let prefs: PreferencesJson = serde_json::from_str(&json).unwrap();
+        let applied = prefs.apply_to_config(&config);
+
+        let mut ids: Vec<&str> = prefs.hotkeys.iter().map(|hk| hk.command_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            vec![
+                "previous_context",
+                "show_everything",
+                "switch_context_1",
+                "switch_context_2",
+                "switch_context_id_7",
+                "switch_context_name_Comms",
+            ],
+            ids
+        );
+        let mut keys: Vec<(String, ContextCommand)> = applied
+            .keys
+            .iter()
+            .map(|(hotkey, cmd)| match cmd {
+                WmCommand::ReactorCommand(ReactorCommand::Context(cmd)) => {
+                    (hotkey.to_string(), cmd.clone())
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        let expected: Vec<(String, ContextCommand)> =
+            bindings.iter().map(|(key, cmd)| (key.to_string(), cmd.clone())).collect();
+        assert_eq!(expected, keys);
+    }
+
     #[test]
     fn test_format_hotkey_roundtrip() {
         // Parse a hotkey, format it, parse it back
