@@ -166,22 +166,65 @@ impl Reactor {
             .reduce(EventResponse::coalesce)
     }
 
+    /// Whether the window server's list of visible windows names at least one
+    /// window the reactor knows, if it knows any. Otherwise the list is taken
+    /// to be incomplete, as it is right after the login window.
+    fn lists_known_windows(&self) -> bool {
+        self.window_ids.is_empty()
+            || self.visible_windows.iter().any(|wsid| self.window_ids.contains_key(wsid))
+    }
+
     /// Shows each visible Space's context in the layout, and applies the
     /// active context again when contexts are in use. Returns the layout's
     /// response to the exposure for the caller to handle.
     ///
-    /// The window server's list of visible windows must name at least one
-    /// window the reactor knows, if it knows any. Otherwise the list is taken
-    /// to be incomplete, as it is right after the login window, and the
-    /// Spaces only show their contexts, so that no window loses its tile.
+    /// When the list of visible windows is incomplete, the Spaces only show
+    /// their contexts, so that no window loses its tile.
     pub(super) fn show_visible_spaces(&mut self) -> Option<EventResponse> {
-        let lists_known_windows = self.window_ids.is_empty()
-            || self.visible_windows.iter().any(|wsid| self.window_ids.contains_key(wsid));
-        if self.contexts_in_use() && lists_known_windows {
+        if self.contexts_in_use() && self.lists_known_windows() {
             return self.apply(Apply::Again).ok().and_then(|(_, response)| response);
         }
         let spaces = self.shown_spaces(self.contexts.active());
         self.expose(&spaces)
+    }
+
+    /// Applies the context each visible Space shows again, as a switch does,
+    /// and runs the switch's focus step when the apply parked the window that
+    /// has the focus: its context's most recently focused member takes the
+    /// focus, or Finder is activated, so that keystrokes don't go to a parked
+    /// window. The apply at `StartupComplete` and the one after a reload turns
+    /// contexts on use this; the other applies only expose the Spaces.
+    pub(super) fn apply_again_focusing_parked_main(&mut self) {
+        if self.contexts_in_use() && self.lists_known_windows() {
+            if let Ok((plan, response)) = self.apply(Apply::Again) {
+                self.finish_apply(plan, response);
+            }
+            return;
+        }
+        if let Some(response) = self.show_visible_spaces() {
+            self.handle_layout_response(response);
+        }
+    }
+
+    /// Handles the layout's response to an apply. When the apply parked the
+    /// window that has the focus, the switch's focus step runs, so that
+    /// keystrokes don't go to a parked window.
+    fn finish_apply(&mut self, plan: SwitchPlan, response: Option<EventResponse>) {
+        let parked: Vec<WindowId> = plan
+            .park
+            .iter()
+            .copied()
+            .filter(|wid| self.parked.contains_key(wid))
+            .collect();
+        let main_parked = self.main_window().is_some_and(|main| parked.contains(&main));
+        if !main_parked {
+            if let Some(response) = response {
+                self.handle_layout_response(response);
+            }
+            return;
+        }
+        info!(?parked, "The apply parked the focused window; moving the focus");
+        self.focus_after_parking(response.unwrap_or_default(), plan.focus, false, &parked);
     }
 
     /// Describes the windows on the visible screens for `plan_switch`. A
@@ -525,7 +568,7 @@ impl Reactor {
             // contexts come back: it was found while they were off.
             self.pending_first_seen.clear();
         }
-        self.apply_again();
+        self.apply_again_focusing_parked_main();
         if !self.contexts_enabled() {
             let rest: Vec<WindowId> = self.parked.keys().copied().collect();
             if !rest.is_empty() {

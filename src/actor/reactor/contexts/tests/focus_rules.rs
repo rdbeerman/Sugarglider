@@ -878,7 +878,6 @@ fn r24_r33_a_screen_that_shows_everything_before_its_space_is_turned_off_never_s
 /// that parks it, the focus moves to C's member, window 1, so keystrokes
 /// don't go to a parked window.
 #[test]
-#[ignore = "bug: the apply at startup parks the focused window and moves the focus nowhere"]
 fn r12_r16_the_apply_at_startup_moves_the_focus_off_the_window_it_parks() {
     let mut s = Setup::on(vec![screen()], vec![Some(space())]);
     let c = ContextKey::Named(s.reactor.contexts.create("C").unwrap());
@@ -908,6 +907,34 @@ fn r12_r16_the_apply_at_startup_moves_the_focus_off_the_window_it_parks() {
     assert_eq!(vec![(wid(1), screen())], s.tiles());
     let focus: Vec<WindowId> = focused(&mut raises).into_iter().flatten().collect();
     assert_eq!(vec![wid(1)], focus);
+}
+
+/// R12 steps 5 and 6, R16. A config reload turns contexts on while the
+/// focused window, window 2, isn't in C. The reload applies C, which parks
+/// window 2, and the focus moves to C's member, window 1.
+#[test]
+fn r12_step_5_a_reload_that_turns_contexts_on_moves_the_focus_off_the_window_it_parks() {
+    let mut s = Setup::on(vec![screen()], vec![Some(space())]);
+    s.reactor.handle_events(s.apps.make_app(1, make_windows(2)));
+    s.reactor.handle_event(Event::StartupComplete);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    let c = s.create("C", &[wid(1)]);
+    s.switch(c);
+    end_raises(&mut s);
+    s.reactor.handle_event(Event::ConfigChanged(config(false)));
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    focus_quietly(&mut s, wid(2));
+    assert!(s.parked().is_empty());
+    let mut raises = capture_raises(&mut s);
+
+    s.reactor.handle_event(Event::ConfigChanged(config(true)));
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    assert_eq!(c, s.reactor.contexts.active());
+    assert_eq!(vec![wid(2)], s.parked());
+    assert_eq!(vec![Some(wid(1))], focused(&mut raises));
+    assert_eq!(vec![(wid(1), screen())], s.tiles());
+    assert_eq!(screen(), s.frame(wid(1)));
 }
 
 /// R12 step 6, R25. A switch to a context without windows activates Finder.
