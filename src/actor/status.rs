@@ -376,4 +376,92 @@ mod tests {
         };
         assert_eq!("3", title(Some(3), &disabled));
     }
+
+    /// The snapshot of `contexts` with one screen that shows the active
+    /// context, and `unsorted` unsorted windows.
+    fn shown(contexts: &Contexts, unsorted: usize) -> ContextsSnapshot {
+        let screens = vec![ScreenContext {
+            id: 1,
+            shows: contexts.active(),
+        }];
+        ContextsSnapshot::new(contexts, screens, unsorted)
+    }
+
+    /// Menu bar, R29. The title in each state of the contexts, without and
+    /// with the Space's number. Everything adds nothing, also while Unsorted
+    /// has windows. A named context shows its name while Unsorted has
+    /// windows too, and Unsorted shows its name with or without windows.
+    #[test]
+    fn the_title_in_each_state_of_the_contexts() {
+        let mut contexts = Contexts::new();
+        let comms = contexts.create("Comms").unwrap();
+        contexts.create("Relax").unwrap();
+        let mut title_in = |key: ContextKey, unsorted: usize, space_number: Option<usize>| {
+            contexts.switch_to(key).unwrap();
+            title(space_number, &shown(&contexts, unsorted))
+        };
+
+        assert_eq!("", title_in(ContextKey::Everything, 0, None));
+        assert_eq!("", title_in(ContextKey::Everything, 3, None));
+        assert_eq!("2", title_in(ContextKey::Everything, 3, Some(2)));
+        assert_eq!("Comms", title_in(ContextKey::Named(comms), 0, None));
+        assert_eq!("Comms", title_in(ContextKey::Named(comms), 3, None));
+        assert_eq!("2 · Comms", title_in(ContextKey::Named(comms), 3, Some(2)));
+        assert_eq!("Unsorted", title_in(ContextKey::Unsorted, 0, None));
+        assert_eq!("Unsorted", title_in(ContextKey::Unsorted, 3, None));
+        assert_eq!("12 · Unsorted", title_in(ContextKey::Unsorted, 0, Some(12)));
+    }
+
+    /// Menu bar, R7. In global scope the title names the active context
+    /// while one screen shows a managed Space, even when another screen
+    /// shows none and so has no entry in the snapshot.
+    #[test]
+    fn with_one_managed_space_the_title_names_the_active_context() {
+        let mut contexts = Contexts::new();
+        let comms = contexts.create("Comms").unwrap();
+        contexts.switch_to(ContextKey::Named(comms)).unwrap();
+        let screens = vec![ScreenContext {
+            id: 2,
+            shows: ContextKey::Named(comms),
+        }];
+        let snapshot = ContextsSnapshot::new(&contexts, screens, 0);
+
+        assert_eq!("Comms", title(None, &snapshot));
+        assert_eq!("2 · Comms", title(Some(2), &snapshot));
+    }
+
+    /// Menu bar, with the coordinator's decision for a desktop without a
+    /// managed Space: while no screen shows a Space that Sugarglider
+    /// manages, for example at the login window or after the user turns the
+    /// Space off, the title names no context, whichever is active. The
+    /// Space's number still shows while the setting is on.
+    #[test]
+    #[ignore = "bug: the title names the active context while no Space is managed"]
+    fn with_no_managed_space_the_title_names_no_context() {
+        let mut contexts = Contexts::new();
+        let comms = contexts.create("Comms").unwrap();
+        for key in [
+            ContextKey::Named(comms),
+            ContextKey::Unsorted,
+            ContextKey::Everything,
+        ] {
+            contexts.switch_to(key).unwrap();
+            let unmanaged = ContextsSnapshot::new(&contexts, Vec::new(), 0);
+
+            assert_eq!("", title(None, &unmanaged), "{key:?}");
+            assert_eq!("2", title(Some(2), &unmanaged), "{key:?}");
+        }
+    }
+
+    /// Menu bar. The title shows the context's name as the model stores it,
+    /// with its case and accents.
+    #[test]
+    fn the_title_shows_the_name_as_written() {
+        let mut contexts = Contexts::new();
+        let id = contexts.create("Café DÉJÀ vu").unwrap();
+        contexts.switch_to(ContextKey::Named(id)).unwrap();
+
+        assert_eq!("Café DÉJÀ vu", title(None, &shown(&contexts, 0)));
+        assert_eq!("1 · Café DÉJÀ vu", title(Some(1), &shown(&contexts, 0)));
+    }
 }
