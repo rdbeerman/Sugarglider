@@ -91,6 +91,49 @@ final class PreferencesViewModelTests: XCTestCase {
     XCTAssertEqual(saved.hotkeys.map(\.command), bindings.map(\.command))
   }
 
+  /// Two rows that name one hotkey: the window refuses the key for the
+  /// second row, shows why in the banner, keeps the old key, and saves
+  /// nothing.
+  func testRefusesAKeyAnotherRowAlreadyUses() throws {
+    let toggle = HotkeyBinding(
+      key: "⌥Z", command: #""toggle_global_enabled""#, description: "Toggle tiling globally",
+      category: "System")
+    let focus = HotkeyBinding(
+      key: "⌥H", command: #"{"move_focus":"left"}"#, description: "Focus left",
+      category: "Focus", defaultKey: "⌥H")
+    let backend = FakePreferencesBackend(PreferencesConfig(hotkeys: [toggle, focus]))
+    let model = PreferencesViewModel(backend: backend)
+    let second = try XCTUnwrap(model.hotkeys.last)
+
+    model.updateHotkey(id: second.id, newKey: "⌥Z")
+
+    XCTAssertEqual(model.hotkeys.map(\.key), ["⌥Z", "⌥H"])
+    XCTAssertEqual(
+      model.lastError,
+      #"⌥Z is already assigned to "Toggle tiling globally". The key was not changed."#)
+    XCTAssertEqual(backend.updated.count, 0)
+    XCTAssertEqual(backend.saved.count, 0)
+  }
+
+  /// The reset button refuses a default key that another row already uses.
+  func testRefusesAResetToAKeyAnotherRowAlreadyUses() throws {
+    let toggle = HotkeyBinding(
+      key: "⌥Z", command: #""toggle_global_enabled""#, description: "Toggle tiling globally",
+      category: "System")
+    let focus = HotkeyBinding(
+      key: "⌥H", command: #"{"move_focus":"left"}"#, description: "Focus left",
+      category: "Focus", defaultKey: "⌥Z")
+    let backend = FakePreferencesBackend(PreferencesConfig(hotkeys: [toggle, focus]))
+    let model = PreferencesViewModel(backend: backend)
+    let second = try XCTUnwrap(model.hotkeys.last)
+
+    model.resetHotkeyToDefault(id: second.id)
+
+    XCTAssertEqual(model.hotkeys.map(\.key), ["⌥Z", "⌥H"])
+    XCTAssertEqual(backend.saved.count, 0)
+    XCTAssertNotNil(model.lastError)
+  }
+
   /// The Hotkeys pane shows the Contexts category, and any category it
   /// doesn't know after the others.
   func testGroupsEveryCategoryOfBindings() {

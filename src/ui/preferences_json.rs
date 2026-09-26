@@ -159,9 +159,15 @@ impl PreferencesJson {
     }
 
     /// The key bindings, each with the command it carries. A binding whose
-    /// key or command doesn't parse is dropped.
+    /// key or command doesn't parse is dropped. When two rows name the same
+    /// hotkey, the later row wins, as in a TOML table.
     pub fn bindings(&self) -> Vec<(Hotkey, WmCommand)> {
-        self.hotkeys.iter().filter_map(HotkeyBindingJson::binding).collect()
+        let mut bindings: Vec<(Hotkey, WmCommand)> = Vec::new();
+        for binding in self.hotkeys.iter().filter_map(HotkeyBindingJson::binding) {
+            bindings.retain(|(hotkey, _)| *hotkey != binding.0);
+            bindings.push(binding);
+        }
+        bindings
     }
 }
 
@@ -759,6 +765,34 @@ mod tests {
             command_json(&WmCommand::Wm(WmCmd::ToggleGlobalEnabled)),
             command_json(&applied.keys[0].1)
         );
+    }
+
+    /// Key bindings. Two rows that name one hotkey resolve to the later row,
+    /// and the running config gets one binding for it.
+    #[test]
+    fn two_rows_of_one_hotkey_resolve_to_the_later_row() {
+        let hotkey = Hotkey::from_str("Alt + KeyZ").unwrap();
+        let mut config = Config::default();
+        config.keys = vec![
+            (hotkey, WmCommand::Wm(WmCmd::ToggleGlobalEnabled)),
+            (hotkey, WmCommand::Wm(WmCmd::ToggleSpaceActivated)),
+        ];
+
+        let json = serde_json::to_string(&PreferencesJson::from_config(&config)).unwrap();
+        let prefs: PreferencesJson = serde_json::from_str(&json).unwrap();
+        assert_eq!(2, prefs.hotkeys.len(), "the window shows both rows");
+
+        let bindings = prefs.bindings();
+        assert_eq!(1, bindings.len());
+        assert_eq!(hotkey, bindings[0].0);
+        assert_eq!(
+            command_json(&WmCommand::Wm(WmCmd::ToggleSpaceActivated)),
+            command_json(&bindings[0].1)
+        );
+
+        let applied = prefs.apply_to_config(&config);
+        assert_eq!(1, applied.keys.len());
+        assert_eq!(hotkey, applied.keys[0].0);
     }
 
     /// Keys. The config loader accepts these key names ([`KeyCode::name`]

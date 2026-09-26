@@ -111,6 +111,10 @@ public class PreferencesViewModel: ObservableObject {
         guard let index = hotkeys.firstIndex(where: { $0.id == id }) else {
             return
         }
+        if let other = rowUsing(newKey, besides: id) {
+            lastError = "\(newKey) is already assigned to \"\(other.description)\". The key was not changed."
+            return
+        }
 
         // Update the local state
         hotkeys[index].key = newKey
@@ -125,12 +129,23 @@ public class PreferencesViewModel: ObservableObject {
               let defaultKey = hotkeys[index].defaultKey else {
             return
         }
+        if let other = rowUsing(defaultKey, besides: id) {
+            lastError = "\(defaultKey) is already assigned to \"\(other.description)\". The key was not changed."
+            return
+        }
 
         // Update the local state to the default
         hotkeys[index].key = defaultKey
 
         // Save to config
         saveToConfig()
+    }
+
+    /// The other row that already uses `key`, if any. The window refuses a
+    /// key that another row uses, because two rows with one hotkey abort the
+    /// window manager when it registers them.
+    private func rowUsing(_ key: String, besides id: HotkeyBinding.ID) -> HotkeyBinding? {
+        hotkeys.first { $0.id != id && $0.key == key }
     }
 
     // MARK: - Config Loading
