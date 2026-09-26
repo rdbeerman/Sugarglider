@@ -13,6 +13,7 @@ use tracing::{Span, debug, info};
 use super::{Event, Reactor, Record, Requested, TransactionId, animation};
 use crate::actor::app::{AppThreadHandle, Request, WindowId};
 use crate::actor::layout::LayoutManager;
+use crate::actor::parked_journal::ParkedJournal;
 use crate::actor::reactor;
 use crate::config::Config;
 use crate::sys::app::{AppInfo, WindowInfo};
@@ -26,7 +27,13 @@ impl Reactor {
         config.settings.animate = false;
         let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
         let (group_indicators_tx, _) = crate::actor::channel();
-        Reactor::new(Arc::new(config), layout, record, group_indicators_tx)
+        Reactor::new(
+            Arc::new(config),
+            layout,
+            record,
+            group_indicators_tx,
+            ParkedJournal::in_memory(),
+        )
     }
 
     pub fn new_for_test_with_animation(
@@ -38,7 +45,13 @@ impl Reactor {
         config.settings.animate = animate;
         let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
         let (group_indicators_tx, _) = crate::actor::channel();
-        let mut reactor = Reactor::new(Arc::new(config), layout, record, group_indicators_tx);
+        let mut reactor = Reactor::new(
+            Arc::new(config),
+            layout,
+            record,
+            group_indicators_tx,
+            ParkedJournal::in_memory(),
+        );
         let (tx, rx) = unbounded_channel();
         reactor.animation_tx = Some(tx);
         (reactor, rx)

@@ -33,6 +33,10 @@ pub fn restore_file() -> PathBuf {
     data_dir().join("layout.ron")
 }
 
+pub fn parked_journal_file() -> PathBuf {
+    data_dir().join("parked.json")
+}
+
 pub fn config_path() -> PathBuf {
     let try_paths = default_config_paths();
     for path in &try_paths {

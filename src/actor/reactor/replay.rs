@@ -21,6 +21,7 @@ use tracing::Span;
 use super::{Event, Reactor};
 use crate::actor::app::{AppThreadHandle, Request};
 use crate::actor::layout::LayoutManager;
+use crate::actor::parked_journal::ParkedJournal;
 use crate::config::Config;
 
 thread_local! {
@@ -102,8 +103,14 @@ pub fn replay(
     let config = ron::de::from_str(&lines.next().expect("Empty restore file")?)?;
     let layout = ron::de::from_str(&lines.next().expect("Expected layout line")?)?;
     let (group_indicators_tx, _) = crate::actor::channel();
-    let mut reactor =
-        Reactor::new(Arc::new(config), layout, Record::new(None), group_indicators_tx);
+    // A replay must not read or change the journal of a running Sugarglider.
+    let mut reactor = Reactor::new(
+        Arc::new(config),
+        layout,
+        Record::new(None),
+        group_indicators_tx,
+        ParkedJournal::in_memory(),
+    );
     std::thread::spawn(move || {
         // Unfortunately we have to spawn a thread because the reactor blocks
         // on raise requests currently.

@@ -9,6 +9,7 @@
 
 mod animation;
 mod main_window;
+mod parking;
 mod replay;
 
 #[cfg(test)]
@@ -18,7 +19,7 @@ mod testing;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{mem, thread};
 
 use animation::{Animation, AnimationManager, Message as AnimationMessage};
@@ -37,6 +38,7 @@ use crate::actor::layout::{
     self, ActiveContext, DragUpdate, DropAction, LayoutCommand, LayoutEvent, LayoutManager,
     LayoutWindowInfo,
 };
+use crate::actor::parked_journal::ParkedJournal;
 use crate::actor::raise::{self, RaiseManager, RaiseRequest};
 use crate::actor::space_manager::SpaceManager;
 use crate::actor::{group_bars, space_manager, status, window_server, wm_controller};
@@ -290,6 +292,10 @@ pub struct Reactor {
     /// window server reports them. This handles Cmd+W closing where the window
     /// is hidden rather than destroyed.
     hidden_windows: HashSet<WindowServerId>,
+    /// Windows parked in a screen corner, with the frame each had before.
+    parked: HashMap<WindowId, CGRect>,
+    /// The frames of parked windows, on disk before the windows move.
+    journal: ParkedJournal,
 }
 
 /// How many times in a row we write the same frame to a window before giving
@@ -429,8 +435,15 @@ impl Reactor {
         thread::Builder::new()
             .name("reactor".to_string())
             .spawn(move || {
-                let mut reactor =
-                    Reactor::new(config.clone(), layout, record, group_indicators_tx.clone());
+                let journal =
+                    ParkedJournal::open(crate::config::parked_journal_file(), SystemTime::now());
+                let mut reactor = Reactor::new(
+                    config.clone(),
+                    layout,
+                    record,
+                    group_indicators_tx.clone(),
+                    journal,
+                );
                 reactor.mouse_tx.replace(mouse_tx.clone());
                 reactor.status_tx.replace(status_tx.clone());
                 let space_manager = SpaceManager::new(
@@ -460,6 +473,7 @@ impl Reactor {
         mut layout: LayoutManager,
         mut record: Record,
         group_indicators_tx: group_bars::Sender,
+        journal: ParkedJournal,
     ) -> Reactor {
         // FIXME: Remove apps that are no longer running from restored state.
         record.start(&config, &layout);
@@ -490,6 +504,8 @@ impl Reactor {
             debug_drop_zones_visible: false,
             startup_complete: false,
             hidden_windows: HashSet::default(),
+            parked: HashMap::default(),
+            journal,
         }
     }
 
@@ -592,6 +608,7 @@ impl Reactor {
             }
             Event::ApplicationThreadTerminated(pid) => {
                 self.apps.remove(&pid);
+                self.forget_parked_app(pid);
                 self.send_layout_event(LayoutEvent::AppClosed(pid));
             }
             Event::ApplicationActivated(..)
@@ -643,16 +660,19 @@ impl Reactor {
                     // Check if there's already a visible window from the same app
                     // with the same frame (indicating this is a tab). If so, don't
                     // add - let the existing window represent this position.
+                    // Parked windows share a corner without being tabs.
                     let frame_key = Self::frame_key(&window.frame_monotonic);
-                    let dominated_by_existing = self.visible_windows.iter().any(|wsid| {
-                        self.window_ids.get(wsid).is_some_and(|other_wid| {
-                            *other_wid != wid
-                                && other_wid.pid == wid.pid
-                                && self.windows.get(other_wid).is_some_and(|other_window| {
-                                    Self::frame_key(&other_window.frame_monotonic) == frame_key
-                                })
-                        })
-                    });
+                    let dominated_by_existing = !self.parked.contains_key(&wid)
+                        && self.visible_windows.iter().any(|wsid| {
+                            self.window_ids.get(wsid).is_some_and(|other_wid| {
+                                *other_wid != wid
+                                    && other_wid.pid == wid.pid
+                                    && !self.parked.contains_key(other_wid)
+                                    && self.windows.get(other_wid).is_some_and(|other_window| {
+                                        Self::frame_key(&other_window.frame_monotonic) == frame_key
+                                    })
+                            })
+                        });
                     if !dominated_by_existing {
                         self.send_layout_event(LayoutEvent::WindowAdded(space, wid, info));
                     }
@@ -672,23 +692,28 @@ impl Reactor {
                     self.hidden_windows.remove(&wsid);
                 }
                 // Check if another window will take this window's place (tab sibling)
-                // before removing it from self.windows.
-                let dominated_by_sibling = self
-                    .windows
-                    .get(&wid)
-                    .map(|w| {
-                        let frame_key = Self::frame_key(&w.frame_monotonic);
-                        self.windows.iter().any(|(other_wid, other_window)| {
-                            *other_wid != wid
-                                && other_wid.pid == wid.pid
-                                && Self::frame_key(&other_window.frame_monotonic) == frame_key
+                // before removing it from self.windows. Parked windows share a
+                // corner without being tabs.
+                let dominated_by_sibling = !self.parked.contains_key(&wid)
+                    && self
+                        .windows
+                        .get(&wid)
+                        .map(|w| {
+                            let frame_key = Self::frame_key(&w.frame_monotonic);
+                            self.windows.iter().any(|(other_wid, other_window)| {
+                                *other_wid != wid
+                                    && other_wid.pid == wid.pid
+                                    && !self.parked.contains_key(other_wid)
+                                    && Self::frame_key(&other_window.frame_monotonic) == frame_key
+                            })
                         })
-                    })
-                    .unwrap_or(false);
-                if self.windows.remove(&wid).is_none() {
+                        .unwrap_or(false);
+                let window = self.windows.remove(&wid);
+                if window.is_none() {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
                 self.frame_attempts.remove(&wid);
+                self.forget_parked_window(wid, window.and_then(|window| window.window_server_id));
                 // Only send WindowRemoved if no sibling will take its place.
                 // For tabs, the sibling window already represents this position.
                 if !dominated_by_sibling {
@@ -743,6 +768,7 @@ impl Reactor {
                             self.update_layout(&[], true);
                         }
                     }
+                    self.confirm_unparked(wid, new_frame);
                     return;
                 }
                 let old_frame = mem::replace(&mut window.frame_monotonic, new_frame);
@@ -1447,20 +1473,26 @@ impl Reactor {
                 continue;
             };
             // Tabs in the same window group will have the same visual frame.
-            let frame_key = Self::frame_key(&window.frame_monotonic);
-            // If we've already seen a window with this frame, skip this one
-            // unless it's the main window (active tab).
-            if seen_frames.contains(&frame_key) {
-                if main_window != Some(wid) {
-                    continue;
+            // Parked windows share a corner without being tabs.
+            if !self.parked.contains_key(&wid) {
+                let frame_key = Self::frame_key(&window.frame_monotonic);
+                // If we've already seen a window with this frame, skip this one
+                // unless it's the main window (active tab).
+                if seen_frames.contains(&frame_key) {
+                    if main_window != Some(wid) {
+                        continue;
+                    }
+                    // This is the main window, remove the previous entry with this frame
+                    // and add this one instead.
+                    if let Some(windows) = app_windows.get_mut(&space) {
+                        windows.retain(|(other, info)| {
+                            self.parked.contains_key(other)
+                                || Self::frame_key(&info.frame) != frame_key
+                        });
+                    }
                 }
-                // This is the main window, remove the previous entry with this frame
-                // and add this one instead.
-                if let Some(windows) = app_windows.get_mut(&space) {
-                    windows.retain(|(_, info)| Self::frame_key(&info.frame) != frame_key);
-                }
+                seen_frames.insert(frame_key);
             }
-            seen_frames.insert(frame_key);
             app_windows.entry(space).or_default().push((wid, layout_info));
         }
         let screens = self.screens.clone();
@@ -1733,6 +1765,11 @@ impl Reactor {
                 // here rather than deferred to mouse up.
                 continue;
             }
+            if self.parked.contains_key(&wid) {
+                // A parked window keeps its place in the layout but stays in
+                // its corner.
+                continue;
+            }
             let Some(window) = self.windows.get_mut(&wid) else {
                 // If we restored a saved state the window may not be available yet.
                 continue;
@@ -1781,6 +1818,17 @@ impl Reactor {
         // animate on top of that.
         let skip_anim =
             skip_anim || !self.config.settings.animate || self.layout.has_active_scroll_animation();
+        self.send_animation(anim, skip_anim);
+
+        // Refresh debug overlay if visible
+        self.refresh_debug_drop_zones();
+    }
+
+    /// Hands the frames to the animation manager, which ends any animation in
+    /// progress before it writes them. With no animation manager, the final
+    /// frames are written at once. `skip_anim` writes the final frames
+    /// without animating.
+    fn send_animation(&self, anim: Animation, skip_anim: bool) {
         if let Some(tx) = &self.animation_tx
             && !anim.is_empty()
         {
@@ -1799,9 +1847,6 @@ impl Reactor {
         } else {
             anim.skip_to_end();
         }
-
-        // Refresh debug overlay if visible
-        self.refresh_debug_drop_zones();
     }
 
     /// Animate windows to preview positions during a drag operation.
