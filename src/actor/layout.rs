@@ -5022,6 +5022,53 @@ mod tests {
         assert_eq!(side_by_side, mgr.layout_sorted(space, screen));
     }
 
+    /// L7, L9.
+    #[test]
+    fn a_window_floated_in_one_context_floats_in_the_others() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c, d] = named_contexts(["C", "D"]);
+
+        switch(&mut mgr, space, screen.size, ContextKey::Everything, &all);
+        switch(&mut mgr, space, screen.size, d, &all);
+        switch(&mut mgr, space, screen.size, c, &all);
+        _ = mgr.handle_event(WindowFocused(vec![space], w(2)));
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+
+        // D's layout drops w2 when D shows, because w2 still floats.
+        switch(&mut mgr, space, screen.size, d, &all);
+        assert_eq!(
+            vec![(w(1), rect(0, 0, 60, 120)), (w(3), rect(60, 0, 60, 120))],
+            mgr.layout_sorted(space, screen),
+        );
+        assert!(mgr.floating_windows_in_space(space).contains(&w(2)));
+
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 40, 120)),
+                (w(2), rect(80, 0, 40, 120)),
+                (w(3), rect(40, 0, 40, 120)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+        switch(&mut mgr, space, screen.size, c, &all);
+        assert!(!mgr.floating_windows_in_space(space).contains(&w(2)));
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 40, 120)),
+                (w(2), rect(80, 0, 40, 120)),
+                (w(3), rect(40, 0, 40, 120)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+    }
+
     /// L9.
     #[test]
     fn changing_the_layout_kind_in_one_context_keeps_nodes_in_another() {
