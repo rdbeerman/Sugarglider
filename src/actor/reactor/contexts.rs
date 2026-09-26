@@ -389,17 +389,19 @@ impl Reactor {
     }
 
     /// Whether Unsorted is listed among the contexts to switch to: some
-    /// context exists, and some window of a running app is in no context.
-    /// Sugarglider's own windows and windows the layout doesn't track don't
-    /// count. Before the first context exists, only Everything is listed.
+    /// context exists, and some window of a running app that is in the
+    /// visible-window set is in no context. Sugarglider's own windows and
+    /// windows the layout doesn't track don't count. Before the first
+    /// context exists, only Everything is listed.
     pub(super) fn lists_unsorted(&self) -> bool {
         if self.contexts.contexts().is_empty() {
             return false;
         }
         let own_pid = std::process::id() as pid_t;
-        self.windows.keys().any(|&wid| {
+        self.windows.iter().any(|(&wid, window)| {
             wid.pid != own_pid
                 && self.apps.contains_key(&wid.pid)
+                && window.window_server_id.is_some_and(|wsid| self.visible_windows.contains(&wsid))
                 && self.contexts.is_unsorted(wid)
                 && self
                     .layout_window_info(wid)
@@ -4781,6 +4783,59 @@ mod tests {
         let tiled: Vec<WindowId> = s.tiles().into_iter().map(|(wid, _)| wid).collect();
         assert_eq!(vec![wid(2), own], tiled);
         assert_eq!(vec![wid(1)], s.parked());
+    }
+
+    /// R29. A window closed with ⌘W, which its app no longer lists but never
+    /// reports destroyed, doesn't keep Unsorted listed.
+    #[test]
+    fn r29_a_window_closed_without_being_destroyed_doesnt_keep_unsorted_listed() {
+        let mut s = Setup::new(3);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        s.switch(c);
+        assert_eq!(vec![wid(3)], s.parked());
+        assert!(s.reactor.lists_unsorted());
+
+        s.apps.windows.remove(&wid(3));
+        s.reactor.handle_event(Event::WindowsDiscovered {
+            pid: 1,
+            new: vec![],
+            known_visible: vec![wid(1), wid(2)],
+        });
+
+        assert!(s.reactor.windows.contains_key(&wid(3)));
+        assert!(!s.reactor.lists_unsorted());
+        switch_by_name(&mut s, "unsorted");
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(c, s.reactor.contexts.active());
+    }
+
+    /// R29. A window the layout doesn't track, such as a floating panel, and
+    /// a window of an app that quit don't keep Unsorted listed.
+    #[test]
+    fn r29_untracked_windows_and_windows_of_apps_that_quit_dont_keep_unsorted_listed() {
+        let mut s = Setup::new(2);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        s.switch(c);
+        assert!(!s.reactor.lists_unsorted());
+        let panel = WindowId::new(2, 1);
+        let quitting = WindowId::new(3, 1);
+        let at = |sys_id: u32| WindowInfo {
+            sys_id: Some(WindowServerId::new(sys_id)),
+            ..make_window(1)
+        };
+        s.reactor.handle_events(s.apps.make_app(2, vec![at(20)]));
+        s.reactor.handle_events(s.apps.make_app(3, vec![at(30)]));
+        let mut listed = on_screen(&s, &[wid(1), wid(2), panel, quitting]);
+        listed.info[2].layer = 3;
+        s.reactor
+            .handle_event(Event::WindowsOnScreenUpdated { pid: None, on_screen: listed });
+        s.reactor.contexts.add_window(id_of(c), &s.desc(quitting)).unwrap();
+        assert!(!s.reactor.lists_unsorted(), "only the panel is in no context");
+
+        s.reactor.contexts.remove_window(id_of(c), quitting).unwrap();
+        assert!(s.reactor.lists_unsorted(), "app 3's window is in no context");
+        s.reactor.handle_event(Event::ApplicationThreadTerminated(3));
+        assert!(!s.reactor.lists_unsorted());
     }
 
     /// Commands and dispatch, R29. A name resolves to Everything or Unsorted
