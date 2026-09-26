@@ -1071,8 +1071,9 @@ impl Contexts {
     /// empty records. When the app's records take it over that, the oldest
     /// empty records go: first the ones that were empty already, then the
     /// app's own, each in list order, which is the order the records were
-    /// added. Loading `contexts.json` applies no limit, because every record
-    /// is empty after a restart.
+    /// added. Contexts and the pinned list without records of the app are
+    /// left alone. Loading `contexts.json` applies no limit, because every
+    /// record is empty after a restart.
     pub fn app_terminated(&mut self, pid: pid_t) {
         self.last_focus.retain(|wid, _| wid.pid != pid);
         let lists = self
@@ -1088,6 +1089,9 @@ impl Contexts {
                     RecordLink::Empty => false,
                 })
                 .collect();
+            if !emptied.contains(&true) {
+                continue;
+            }
             for (record, emptied) in records.iter_mut().zip(&emptied) {
                 if *emptied {
                     record.link = RecordLink::Empty;
@@ -3910,15 +3914,30 @@ mod tests {
     }
 
     /// `contexts.json` keeps every record, because every record is empty
-    /// after a restart, even in a context with more than 50 members.
+    /// after a restart, even in a context with more than 50 members. An app
+    /// without records in the context doesn't trim it when it quits. An app
+    /// with a record there does.
     #[test]
     fn contexts_json_keeps_every_record() {
         let mut cx = Contexts::new();
         let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
         for idx in 0..60 {
             cx.add_window(a, &window(1, idx, "App", &format!("W {idx}"))).unwrap();
         }
-        assert_eq!(round_trip(&cx).get(a).unwrap().members.len(), 60);
+        let mut cx = round_trip(&cx);
+        assert_eq!(cx.get(a).unwrap().members.len(), 60);
+        let other = window(2, 1, "Other", "Other");
+        cx.add_window(b, &other).unwrap();
+        cx.app_terminated(2);
+        assert_eq!(cx.get(a).unwrap().members.len(), 60);
+        assert_eq!(records(&cx, b), vec![("Other", RecordLink::Empty)]);
+        let late = window(3, 1, "Late", "Late");
+        cx.add_window(a, &late).unwrap();
+        cx.app_terminated(3);
+        let titles: Vec<&str> = records(&cx, a).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(titles.len(), MAX_EMPTY_RECORDS);
+        assert_eq!((titles[0], titles[49]), ("W 11", "Late"));
     }
 
     /// R24: focus on a member of the active context, pinned or not, never
