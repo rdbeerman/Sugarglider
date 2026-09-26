@@ -297,7 +297,6 @@ mod tests {
     /// its contexts, and its app drops out of a context without another open
     /// window of it.
     #[test]
-    #[ignore = "bug: the snapshot counts a closed member window as open, because the reactor never marks its records closed (R23)"]
     fn closing_a_member_window_publishes_the_lower_counts() {
         let mut s = Setup::new(3);
         let c = s.reactor.contexts.create("C").unwrap();
