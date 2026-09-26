@@ -125,38 +125,39 @@ extension SwitcherKey {
   }
 }
 
-// MARK: - Controller
+// MARK: - Presenter
 
-/// Shows and hides the one switcher panel.
+/// Puts the switcher on screen and takes it off.
 @MainActor
-final class ContextSwitcherController: NSObject, NSWindowDelegate {
-  static let shared = ContextSwitcherController()
+protocol ContextSwitcherPresenter: AnyObject {
+  /// Called when the switcher loses key status.
+  var onResignKey: () -> Void { get set }
+  func present(_ model: ContextSwitcherModel, displayId: UInt32?)
+  func dismiss()
+}
 
+/// Shows the switcher in its one panel, centered on a screen.
+@MainActor
+final class ContextSwitcherPanelPresenter: NSObject, ContextSwitcherPresenter, NSWindowDelegate {
+  var onResignKey: () -> Void = {}
   private var panel: ContextSwitcherPanel?
-  private var model: ContextSwitcherModel?
 
-  /// Shows a fresh switcher for a show payload, replacing one that is open.
-  func show(json: String) {
-    let payload: SwitcherPayload
-    do {
-      payload = try ContextSwitcherJSON.decode(SwitcherPayload.self, from: json)
-    } catch {
-      NSLog("Sugarglider: can't read the context switcher payload: %@", String(describing: error))
-      return
-    }
-    hide()
-
-    let model = ContextSwitcherModel(payload: payload, backend: RustContextSwitcherBackend())
-    model.onClose = { [weak self] in self?.hide() }
-    self.model = model
-
+  func present(_ model: ContextSwitcherModel, displayId: UInt32?) {
     let panel = self.panel ?? makePanel()
     panel.keyHandler = { [weak model] key in model?.handle(key) ?? false }
     panel.contentView = NSHostingView(rootView: ContextSwitcherView(model: model))
-    if let screen = Self.screen(displayId: payload.displayId) {
+    let key = NSDeviceDescriptionKey("NSScreenNumber")
+    let screens = NSScreen.screens.map { screen in
+      (
+        displayId: (screen.deviceDescription[key] as? NSNumber)?.uint32Value,
+        visibleFrame: screen.visibleFrame
+      )
+    }
+    if let visibleFrame = Self.visibleFrame(
+      displayId: displayId, screens: screens, main: NSScreen.main?.visibleFrame)
+    {
       panel.setFrame(
-        ContextSwitcherPanel.frame(
-          size: ContextSwitcherPanel.size, centeredIn: screen.visibleFrame),
+        ContextSwitcherPanel.frame(size: ContextSwitcherPanel.size, centeredIn: visibleFrame),
         display: false
       )
     }
@@ -164,15 +165,13 @@ final class ContextSwitcherController: NSObject, NSWindowDelegate {
     panel.orderFrontRegardless()
   }
 
-  func hide() {
-    guard model != nil else { return }
-    model = nil
+  func dismiss() {
     panel?.keyHandler = nil
     panel?.orderOut(nil)
   }
 
   func windowDidResignKey(_ notification: Notification) {
-    hide()
+    onResignKey()
   }
 
   private func makePanel() -> ContextSwitcherPanel {
@@ -182,16 +181,68 @@ final class ContextSwitcherController: NSObject, NSWindowDelegate {
     return panel
   }
 
-  /// The screen with this display id, or the main screen.
-  private static func screen(displayId: UInt32?) -> NSScreen? {
-    let key = NSDeviceDescriptionKey("NSScreenNumber")
-    if let displayId,
-      let screen = NSScreen.screens.first(where: {
-        ($0.deviceDescription[key] as? NSNumber)?.uint32Value == displayId
-      })
-    {
-      return screen
+  /// The visible frame of the screen with this display id, or of the main
+  /// screen when no screen has it.
+  static func visibleFrame(
+    displayId: UInt32?,
+    screens: [(displayId: UInt32?, visibleFrame: NSRect)],
+    main: NSRect?
+  ) -> NSRect? {
+    if let displayId, let screen = screens.first(where: { $0.displayId == displayId }) {
+      return screen.visibleFrame
     }
-    return NSScreen.main ?? NSScreen.screens.first
+    return main ?? screens.first?.visibleFrame
+  }
+}
+
+// MARK: - Controller
+
+/// Opens and closes the switcher.
+@MainActor
+final class ContextSwitcherController {
+  static let shared = ContextSwitcherController(
+    presenter: ContextSwitcherPanelPresenter(),
+    makeBackend: { RustContextSwitcherBackend() }
+  )
+
+  private let presenter: ContextSwitcherPresenter
+  private let makeBackend: () -> ContextSwitcherBackend
+  /// The open switcher's model, or nil when it is closed.
+  private(set) var model: ContextSwitcherModel?
+
+  init(presenter: ContextSwitcherPresenter, makeBackend: @escaping () -> ContextSwitcherBackend) {
+    self.presenter = presenter
+    self.makeBackend = makeBackend
+    presenter.onResignKey = { [weak self] in self?.hide() }
+  }
+
+  /// Opens a fresh switcher for a show payload, or closes the switcher
+  /// when it is open, so its hotkey toggles it. Only this side knows when
+  /// the panel closed itself. A payload that doesn't decode opens nothing.
+  func show(json: String) {
+    if model != nil {
+      hide()
+      return
+    }
+    let payload: SwitcherPayload
+    do {
+      payload = try ContextSwitcherJSON.decode(SwitcherPayload.self, from: json)
+    } catch {
+      NSLog("Sugarglider: can't read the context switcher payload: %@", String(describing: error))
+      return
+    }
+    let model = ContextSwitcherModel(payload: payload, backend: makeBackend())
+    model.onClose = { [weak self, weak model] in
+      guard let self, let model, self.model === model else { return }
+      self.hide()
+    }
+    self.model = model
+    presenter.present(model, displayId: payload.displayId)
+  }
+
+  func hide() {
+    guard model != nil else { return }
+    model = nil
+    presenter.dismiss()
   }
 }

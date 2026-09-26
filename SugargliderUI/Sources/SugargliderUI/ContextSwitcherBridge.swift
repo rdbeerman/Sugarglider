@@ -64,11 +64,16 @@ final class RustContextSwitcherBackend: ContextSwitcherBackend {
 
 // MARK: - Rust to Swift
 
-/// Shows the context switcher (callable from Rust via FFI). `json` is the
-/// show payload described on `ContextSwitcherJSON`.
+/// Shows the context switcher, or closes it when it is open (callable from
+/// Rust via FFI). `json` is the show payload described on
+/// `ContextSwitcherJSON`. A NULL `json` is ignored.
 @_cdecl("sugarglider_show_context_switcher")
-public func showContextSwitcher(json: UnsafePointer<CChar>) {
-  let json = String(cString: json)
+public func showContextSwitcher(json: UnsafePointer<CChar>?) {
+  guard let pointer = json else {
+    NSLog("Sugarglider: the context switcher was shown without a payload")
+    return
+  }
+  let json = String(cString: pointer)
   DispatchQueue.main.async {
     ContextSwitcherController.shared.show(json: json)
   }

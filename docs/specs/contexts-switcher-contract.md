@@ -17,8 +17,10 @@ Rust to Swift, exported by SugargliderUI with `@_cdecl`:
 
 | Symbol | Signature | Does |
 |---|---|---|
-| `sugarglider_show_context_switcher` | `fn(json: *const c_char)` | Shows the panel with the show payload. The reactor calls it from its own thread when it handles `open_context_switcher`. Swift copies the string before it returns and shows the panel on the main queue. A call while the panel is open replaces it with a fresh panel (empty query, list view). A payload that doesn't decode is logged with `NSLog` and shows nothing. |
-| `sugarglider_hide_context_switcher` | `fn()` | Hides the panel if it is open. Safe to call at any time. |
+| `sugarglider_show_context_switcher` | `fn(json: *const c_char)` | Shows a fresh panel (empty query, list view) with the show payload. When the panel is open, it closes the panel instead, so the switcher's hotkey toggles it. The reactor calls it from its own thread every time it handles `open_context_switcher`. Swift copies the string before it returns and shows or closes the panel on the main queue. A NULL `json` is logged and ignored. A payload that doesn't decode is logged with `NSLog` and opens nothing. |
+| `sugarglider_hide_context_switcher` | `fn()` | Hides the panel if it is open. Safe to call at any time, from any thread, and more than once. |
+
+Rust doesn't track whether the panel is open. The panel closes itself on Esc, when it loses key status, and after a command succeeds, and Rust doesn't learn of it. So Rust calls show for every `open_context_switcher`, and Swift decides whether that opens or closes the panel. Rust calls show for nothing else.
 
 Swift to Rust, implemented by the Rust half:
 
@@ -258,4 +260,4 @@ The panel shows it inline and stays open. After a command succeeds, the panel cl
 ## Panel behavior that Rust relies on
 
 - Built-in entries: the panel never sends `add_window`, `move_window`, `edit`, `rename`, `set_number`, or `delete` for Unsorted or Everything (R29). It shows an inline message instead.
-- The panel is a non-activating panel, so opening it doesn't change the frontmost app. It closes when it loses key status, after a successful command, and on Esc from the list.
+- The panel is a non-activating panel, so opening it doesn't change the frontmost app. It closes when it loses key status, after a successful command, on Esc from the list, and on a second show.

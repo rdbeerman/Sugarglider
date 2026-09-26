@@ -26,11 +26,13 @@ import Foundation
 ///
 /// Rust to Swift, exported by SugargliderUI:
 ///
-/// - `sugarglider_show_context_switcher(json: *const c_char)` shows the
-///   panel with the show payload below. The reactor calls it from its own
-///   thread when it handles `open_context_switcher`. Swift copies the
-///   string before it returns and shows the panel on the main queue. A call
-///   while the panel is open replaces it with a fresh panel.
+/// - `sugarglider_show_context_switcher(json: *const c_char)` shows a
+///   fresh panel with the show payload below, or closes the panel when it
+///   is open, so the switcher's hotkey toggles it. The reactor calls it from
+///   its own thread for every `open_context_switcher`, and doesn't track
+///   whether the panel is open. Swift copies the string before it returns
+///   and acts on the main queue. A NULL `json`, or a payload that doesn't
+///   decode, opens nothing.
 /// - `sugarglider_hide_context_switcher()` hides the panel if it is open.
 ///
 /// Swift to Rust, looked up with `dlsym(RTLD_DEFAULT, …)` when the panel

@@ -138,3 +138,173 @@ final class ContextSwitcherPanelTests: XCTestCase {
     XCTAssertEqual(handled, [.commandN])
   }
 }
+
+/// The panel's settings (spec, "Switcher": the panel).
+@MainActor
+final class ContextSwitcherPanelSetupTests: XCTestCase {
+  func testThePanelTakesKeysWithoutBecomingMainOrHidingWithTheApp() {
+    let panel = ContextSwitcherPanel()
+    XCTAssertTrue(panel.canBecomeKey)
+    XCTAssertFalse(panel.canBecomeMain)
+    XCTAssertTrue(panel.isFloatingPanel)
+    XCTAssertFalse(panel.hidesOnDeactivate)
+    XCTAssertFalse(panel.becomesKeyOnlyIfNeeded)
+    XCTAssertFalse(panel.isReleasedWhenClosed)
+    XCTAssertTrue(panel.collectionBehavior.contains(.fullScreenAuxiliary))
+    XCTAssertFalse(panel.isVisible)
+  }
+
+  /// The panel centers on the screen with the payload's display id, or on
+  /// the main screen when no screen has it.
+  func testThePanelCentersOnThePayloadsScreen() {
+    let left = NSRect(x: -1920, y: 0, width: 1920, height: 1055)
+    let main = NSRect(x: 0, y: 25, width: 1512, height: 944)
+    let screens: [(displayId: UInt32?, visibleFrame: NSRect)] = [(1, main), (5, left)]
+    func frame(_ displayId: UInt32?, main: NSRect? = main) -> NSRect? {
+      ContextSwitcherPanelPresenter.visibleFrame(
+        displayId: displayId, screens: screens, main: main)
+    }
+    XCTAssertEqual(frame(5), left)
+    XCTAssertEqual(frame(1), main)
+    XCTAssertEqual(frame(9), main)
+    XCTAssertEqual(frame(nil), main)
+    XCTAssertEqual(frame(9, main: nil), main)
+    XCTAssertNil(
+      ContextSwitcherPanelPresenter.visibleFrame(displayId: 1, screens: [], main: nil))
+  }
+}
+
+/// Records what the controller puts on screen, instead of showing a panel.
+@MainActor
+final class FakePresenter: ContextSwitcherPresenter {
+  var onResignKey: () -> Void = {}
+  private(set) var presented: [(model: ContextSwitcherModel, displayId: UInt32?)] = []
+  private(set) var dismissed = 0
+
+  func present(_ model: ContextSwitcherModel, displayId: UInt32?) {
+    presented.append((model, displayId))
+  }
+
+  func dismiss() {
+    dismissed += 1
+  }
+}
+
+/// The controller's show, hide, and lose-focus logic, over a presenter that
+/// shows nothing.
+@MainActor
+final class ContextSwitcherControllerTests: XCTestCase {
+  private var presenter = FakePresenter()
+  private var backend = FakeBackend()
+  private var controller: ContextSwitcherController!
+
+  override func setUp() async throws {
+    try await super.setUp()
+    presenter = FakePresenter()
+    backend = FakeBackend()
+    controller = ContextSwitcherController(
+      presenter: presenter,
+      makeBackend: { [unowned self] in
+        self.backend
+      })
+  }
+
+  func testShowPresentsTheSwitcherOnThePayloadsScreen() throws {
+    controller.show(json: Fixtures.showPayload)
+    XCTAssertEqual(presenter.presented.count, 1)
+    XCTAssertEqual(presenter.presented.first?.displayId, 1)
+    XCTAssertEqual(presenter.presented.first?.model.payload, try Fixtures.payload())
+    XCTAssertTrue(presenter.presented.first?.model === controller.model)
+    XCTAssertEqual(presenter.dismissed, 0)
+  }
+
+  /// D8: showing while the switcher is open closes it, so the hotkey
+  /// toggles it. The next show opens a fresh switcher: an empty query and
+  /// the list.
+  func testASecondShowClosesTheSwitcherAndAThirdOpensAFreshOne() throws {
+    controller.show(json: Fixtures.showPayload)
+    let first = try XCTUnwrap(controller.model)
+    first.query = "cli"
+    first.handle(.commandN)
+    XCTAssertEqual(first.mode, .naming)
+
+    controller.show(json: Fixtures.showPayload)
+    XCTAssertNil(controller.model)
+    XCTAssertEqual(presenter.presented.count, 1)
+    XCTAssertEqual(presenter.dismissed, 1)
+
+    controller.show(json: Fixtures.showPayload)
+    let second = try XCTUnwrap(controller.model)
+    XCTAssertFalse(second === first)
+    XCTAssertEqual(second.query, "")
+    XCTAssertEqual(second.mode, .list)
+    XCTAssertEqual(presenter.presented.count, 2)
+  }
+
+  func testHidingAClosedSwitcherDoesNothing() {
+    controller.hide()
+    XCTAssertEqual(presenter.dismissed, 0)
+    controller.show(json: Fixtures.showPayload)
+    controller.hide()
+    controller.hide()
+    XCTAssertEqual(presenter.dismissed, 1)
+  }
+
+  /// The switcher closes when it loses key status.
+  func testLosingKeyStatusClosesTheSwitcher() {
+    controller.show(json: Fixtures.showPayload)
+    presenter.onResignKey()
+    XCTAssertNil(controller.model)
+    XCTAssertEqual(presenter.dismissed, 1)
+    presenter.onResignKey()
+    XCTAssertEqual(presenter.dismissed, 1)
+  }
+
+  /// Esc from the list and a command that Rust accepts close the switcher.
+  func testTheModelClosesTheSwitcher() throws {
+    controller.show(json: Fixtures.showPayload)
+    try XCTUnwrap(controller.model).handle(.escape)
+    XCTAssertNil(controller.model)
+    XCTAssertEqual(presenter.dismissed, 1)
+
+    controller.show(json: Fixtures.showPayload)
+    try XCTUnwrap(controller.model).handle(.enter)
+    XCTAssertEqual(backend.sent, [.switchTo(.named(Fixtures.clientWork))])
+    XCTAssertNil(controller.model)
+    XCTAssertEqual(presenter.dismissed, 2)
+  }
+
+  /// A switcher that was closed can't close the one opened after it.
+  func testAClosedSwitcherCantCloseTheNextOne() throws {
+    controller.show(json: Fixtures.showPayload)
+    let old = try XCTUnwrap(controller.model)
+    controller.hide()
+    controller.show(json: Fixtures.showPayload)
+    old.onClose()
+    XCTAssertNotNil(controller.model)
+    XCTAssertEqual(presenter.dismissed, 1)
+  }
+
+  /// S7: a payload that doesn't decode opens nothing, and a show while the
+  /// switcher is open closes it whatever the payload, so an open switcher
+  /// never keeps showing an old payload.
+  func testAPayloadThatDoesntDecodeOpensNothing() {
+    for json in ["", "{", #"{"contexts": 4}"#, #"{ "switch": "everything" }"#] {
+      controller.show(json: json)
+      XCTAssertNil(controller.model, json)
+    }
+    XCTAssertEqual(presenter.presented.count, 0)
+
+    controller.show(json: Fixtures.showPayload)
+    controller.show(json: "{")
+    XCTAssertNil(controller.model)
+    XCTAssertEqual(presenter.dismissed, 1)
+  }
+
+  /// S7: a NULL payload from Rust is ignored.
+  func testANullPayloadIsIgnored() {
+    showContextSwitcher(json: nil)
+    XCTAssertFalse(
+      (NSApp?.windows ?? []).contains { $0 is ContextSwitcherPanel && $0.isVisible })
+  }
+}
