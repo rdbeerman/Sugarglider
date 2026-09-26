@@ -32,7 +32,7 @@ pub(super) struct SwitchGuard {
     echoes: HashSet<WindowId>,
     /// Finder, when the switch activated it because no window could take focus,
     /// until its activation arrives.
-    finder: Option<pid_t>,
+    pub(super) finder: Option<pid_t>,
     /// When the switch started to wait.
     pub(super) since: Option<Instant>,
 }
@@ -245,12 +245,15 @@ impl Reactor {
         }
     }
 
-    /// The app became active.
-    pub(super) fn app_activated(&mut self, pid: pid_t) {
-        if self.switch_guard.finder == Some(pid) {
-            self.switch_guard.finder = None;
-            self.log_guard_end();
+    /// The app became active. Returns whether this ended the wait for Finder,
+    /// whose activation a switch asked for.
+    pub(super) fn app_activated(&mut self, pid: pid_t) -> bool {
+        if self.switch_guard.finder != Some(pid) {
+            return false;
         }
+        self.switch_guard.finder = None;
+        self.log_guard_end();
+        true
     }
 
     /// Stops waiting on a window that is gone.

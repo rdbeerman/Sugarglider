@@ -145,6 +145,8 @@ pub enum Event {
     ApplicationGloballyActivated(pid_t),
     ApplicationGloballyDeactivated(pid_t),
     ApplicationMainWindowChanged(pid_t, Option<WindowId>, Quiet),
+    /// An app the reactor asked to activate could not be made frontmost.
+    ActivateFailed(pid_t),
 
     WindowsDiscovered {
         pid: pid_t,
@@ -802,6 +804,12 @@ impl Reactor {
         let animation_focus_wids: Vec<WindowId> = Vec::new();
         let mut is_resize = false;
         let raised_window = self.main_window_tracker.handle_event(&event);
+        // An ApplicationActivated that ends a switch's wait for Finder is the
+        // switch's own activation, not the user's.
+        let ends_finder_wait = match &event {
+            Event::ApplicationActivated(pid, _) => self.switch_guard.finder == Some(*pid),
+            _ => false,
+        };
         match event {
             Event::ApplicationLaunched {
                 pid,
@@ -849,6 +857,11 @@ impl Reactor {
                 if quiet == Quiet::No {
                     self.app_still_running(pid);
                 }
+                self.app_activated(pid);
+            }
+            Event::ActivateFailed(pid) => {
+                // The app that no window could focus never took focus, so the
+                // wait for its activation ends.
                 self.app_activated(pid);
             }
             Event::ApplicationDeactivated(..)
@@ -1603,7 +1616,9 @@ impl Reactor {
             let spaces = self.screens.iter().flat_map(|screen| screen.space).collect();
             self.send_layout_event(LayoutEvent::WindowFocused(spaces, raised_window));
             self.update_active_screen();
-            self.focus_changed(raised_window);
+            if !ends_finder_wait {
+                self.focus_changed(raised_window);
+            }
         }
         if !self.in_drag {
             self.update_layout(&animation_focus_wids, is_resize);

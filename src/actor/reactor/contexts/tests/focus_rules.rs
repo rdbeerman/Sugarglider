@@ -699,7 +699,6 @@ fn r12_r16_the_apply_at_startup_moves_the_focus_off_the_window_it_parks() {
 /// activation, which ends the wait, so it doesn't switch back to C, the
 /// context of Finder's parked main window.
 #[test]
-#[ignore = "bug: Finder's own activation ends the wait and then counts as the user's focus, so an unquiet one switches back"]
 fn r12_step_6_r25_finders_own_activation_never_switches_back() {
     let TwoApps { mut s, c, .. } = two_apps();
     let finder = launch(&mut s, 9, finder_info(), vec![window_at(91, 900.)], &[wid(1)])[0];
@@ -718,4 +717,52 @@ fn r12_step_6_r25_finders_own_activation_never_switches_back() {
     s.reactor.handle_event(Event::ApplicationActivated(9, Quiet::No));
 
     assert_eq!(empty, s.reactor.contexts.active());
+}
+
+/// R12 step 6. Finder is already the frontmost app, so a switch that leaves
+/// no window to focus activates nothing, and nothing waits for an activation.
+#[test]
+fn r12_step_6_a_finder_that_is_already_frontmost_gets_no_activation() {
+    let mut s = Setup::new(1);
+    launch(&mut s, 9, finder_info(), vec![], &[wid(1)]);
+    let c = s.create("C", &[wid(1)]);
+    let d = s.create("D", &[]);
+    s.switch(c);
+    end_raises(&mut s);
+    focus_quietly(&mut s, wid(1));
+    let _raises = capture_raises(&mut s);
+    s.reactor.handle_event(Event::ApplicationGloballyActivated(9));
+
+    s.command(d);
+
+    let requests = s.apps.requests();
+    assert!(activations(&requests).is_empty(), "{requests:?}");
+    answer(&mut s, requests);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    assert_eq!(d, s.reactor.contexts.active());
+
+    activate(&mut s, 1, wid(1), Order::GloballyFirst);
+    assert_eq!(c, s.reactor.contexts.active());
+}
+
+/// R12 step 6, R25. The activation of Finder can fail. The switch stops
+/// waiting for it there and then, so focus from outside counts again.
+#[test]
+fn r12_step_6_a_failed_activation_of_finder_ends_the_wait() {
+    let TwoApps { mut s, c, .. } = two_apps();
+    launch(&mut s, 9, finder_info(), vec![window_at(91, 900.)], &[wid(1)]);
+    let empty = s.create("Empty", &[]);
+    let _raises = capture_raises(&mut s);
+
+    s.command(empty);
+
+    let requests = s.apps.requests();
+    assert_eq!(vec![Quiet::Yes], activations(&requests));
+    answer(&mut s, requests);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    s.reactor.handle_event(Event::ActivateFailed(9));
+    activate(&mut s, 1, wid(1), Order::GloballyFirst);
+
+    assert_eq!(c, s.reactor.contexts.active());
 }

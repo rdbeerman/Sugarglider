@@ -29,7 +29,7 @@ use accessibility_sys::{
     kAXWindowMovedNotification, kAXWindowResizedNotification, kAXWindowRole,
 };
 use objc2::rc::Retained;
-use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+use objc2_app_kit::NSRunningApplication;
 use objc2_core_foundation::{CFRetained, CFRunLoop, CFString, CGRect};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{
@@ -731,8 +731,19 @@ impl State {
                     quiet_window_change,
                     tx,
                 ));
-                if !self.running_app.activateWithOptions(NSApplicationActivationOptions::empty()) {
+                // Go through the window server, so cooperative activation
+                // can't refuse the request, as it can for
+                // NSRunningApplication's activation.
+                let wsid = main_window
+                    .and_then(|wid| self.window(wid).ok())
+                    .and_then(|window| WindowServerId::try_from(&*window.elem).ok());
+                let activated = match wsid {
+                    Some(wsid) => crate::sys::window_server::make_key_window(self.pid, wsid),
+                    None => crate::sys::window_server::make_front_process(self.pid),
+                };
+                if activated.is_err() {
                     warn!(?self.pid, "Failed to activate app");
+                    self.send_event(Event::ActivateFailed(self.pid));
                 }
             }
         }
