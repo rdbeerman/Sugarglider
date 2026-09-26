@@ -11,6 +11,8 @@ final class FakePreferencesBackend: PreferencesBackend {
   var config: PreferencesConfig
   var updated: [PreferencesConfig] = []
   var saved: [PreferencesConfig] = []
+  /// Thrown by the next saves while set.
+  var saveError: Error?
 
   init(_ config: PreferencesConfig = PreferencesConfig()) {
     self.config = config
@@ -25,6 +27,7 @@ final class FakePreferencesBackend: PreferencesBackend {
   }
 
   func saveConfigToFile(_ config: PreferencesConfig) throws {
+    if let saveError { throw saveError }
     saved.append(config)
   }
 }
@@ -44,5 +47,35 @@ final class PreferencesViewModelTests: XCTestCase {
     XCTAssertEqual(backend.saved.map(\.innerGap), [4])
     XCTAssertEqual(backend.saved.map(\.outerGap), [8])
     XCTAssertNil(model.lastError)
+  }
+
+  /// Rust refuses to save over a config file with an error. The window's
+  /// banner shows `lastError`: Rust's message once, without a second
+  /// "Failed to save config", until a save succeeds.
+  func testShowsWhySavingFailedUntilASaveSucceeds() {
+    let message = """
+      Failed to save config: /tmp/glide.toml has an error, so it was not changed.
+
+      error: could not parse config
+       --> /tmp/glide.toml:2:11
+        |
+      2 | animate = tru
+        |           ^^^ invalid boolean, expected `true`
+      """
+    let backend = FakePreferencesBackend()
+    backend.saveError = ConfigBridgeError.saveFailed(message)
+    let model = PreferencesViewModel(backend: backend)
+    XCTAssertNil(model.lastError)
+
+    model.saveToConfig()
+
+    XCTAssertEqual(model.lastError, message)
+    XCTAssertEqual(backend.saved.count, 0)
+
+    backend.saveError = nil
+    model.saveToConfig()
+
+    XCTAssertNil(model.lastError)
+    XCTAssertEqual(backend.saved.count, 1)
   }
 }

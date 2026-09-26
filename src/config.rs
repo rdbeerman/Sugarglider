@@ -477,7 +477,10 @@ impl Config {
             }
         };
         file.read_to_string(&mut buf)?;
-        Self::parse(&buf).map_err(|e| anyhow::anyhow!("{}", format_toml_error(e, &buf, &path)))
+        Self::parse(&buf).map_err(|e| {
+            let renderer = annotate_snippets::Renderer::styled();
+            anyhow::anyhow!("{}", format_toml_error(e, &buf, &path, renderer))
+        })
     }
 
     pub fn default() -> Config {
@@ -491,8 +494,13 @@ impl Config {
     }
 }
 
-fn format_toml_error(error: SpannedError, input: &str, path: &Path) -> String {
-    use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
+fn format_toml_error(
+    error: SpannedError,
+    input: &str,
+    path: &Path,
+    renderer: annotate_snippets::Renderer,
+) -> String {
+    use annotate_snippets::{AnnotationKind, Level, Snippet};
 
     let message = error.message;
     let Some(span) = error.span else {
@@ -505,7 +513,6 @@ fn format_toml_error(error: SpannedError, input: &str, path: &Path) -> String {
 
     let report = Level::ERROR.primary_title("could not parse config").element(snippet);
 
-    let renderer = Renderer::styled();
     format!("{}", renderer.render(&[report]))
 }
 
@@ -537,7 +544,8 @@ impl From<ValidationError> for SpannedError {
 ///
 /// This function reads the existing config file (if present), updates the
 /// relevant settings, and writes it back. It preserves user comments and
-/// formatting where possible.
+/// formatting where possible. A config file with an error is left unchanged,
+/// and the error says what is wrong.
 pub fn write_preferences_to_file(
     prefs: &crate::ui::preferences_json::PreferencesJson,
 ) -> anyhow::Result<PathBuf> {
@@ -555,16 +563,27 @@ fn write_preferences_to_path(
     use std::fs;
     use std::io::Write;
 
+    use annotate_snippets::Renderer;
     use toml_edit::{DocumentMut, value};
 
-    // Load existing config or create empty document
-    let existing = if path.exists() {
-        fs::read_to_string(&path)?
-    } else {
-        String::new()
+    let existing = match fs::read_to_string(path) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
     };
-
-    let mut doc: DocumentMut = existing.parse().unwrap_or_default();
+    let has_error = |error: String| {
+        anyhow::anyhow!(
+            "{} has an error, so it was not changed.\n\n{error}",
+            path.display()
+        )
+    };
+    // toml_edit reads TOML 1.0 and the config reader TOML 1.1, so a file can
+    // pass one and fail the other.
+    let current_config = Config::parse(&existing)
+        .map_err(|e| has_error(format_toml_error(e, &existing, path, Renderer::plain())))?;
+    let mut doc = existing
+        .parse::<DocumentMut>()
+        .map_err(|e| has_error(e.to_string().trim_end().to_owned()))?;
 
     // Ensure [settings] table exists
     if !doc.contains_key("settings") {
@@ -642,7 +661,6 @@ fn write_preferences_to_path(
         // This ensures we have serializations for all standard commands (from defaults)
         // plus any custom commands like `exec` (from the loaded config).
         let default_config = Config::default();
-        let current_config = Config::load(Some(path)).unwrap_or_else(|_| Config::default());
 
         let mut command_serializations: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
@@ -1525,6 +1543,39 @@ mod tests {
             bound_to("Alt + KeyT"),
             WmCommand::Wm(WmCmd::Exec(ExecCmd::String(cmd))) if cmd == "open -a Terminal"
         ));
+    }
+
+    /// A config file with an error stays as it is, and the error says what
+    /// is wrong without terminal colors.
+    #[test]
+    fn preferences_never_overwrite_a_config_file_with_an_error() {
+        let files = [
+            // Not TOML.
+            ("[settings]\nanimate = tru\n", "could not parse config"),
+            // Not a setting.
+            ("[settings]\nanimates = false\n", "could not parse config"),
+            // Not a key.
+            ("[keys]\n\"Alt + Nope\" = \"debug\"\n", "Could not parse hotkey"),
+            // TOML 1.1, which toml_edit can't edit.
+            (
+                "[settings]\nexperimental = { scroll = { enable = true, } }\n",
+                "TOML parse error",
+            ),
+        ];
+        let prefs: PreferencesJson = serde_json::from_str(PREFERENCES_FROM_SWIFT).unwrap();
+        for (file, message) in files {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("glide.toml");
+            std::fs::write(&path, file).unwrap();
+
+            let error = write_preferences_to_path(&prefs, &path).unwrap_err().to_string();
+
+            assert_eq!(file, std::fs::read_to_string(&path).unwrap());
+            assert_eq!(1, std::fs::read_dir(dir.path()).unwrap().count(), "{file}");
+            assert!(error.contains(message), "{error}");
+            assert!(error.contains("has an error, so it was not changed"), "{error}");
+            assert!(!error.contains('\u{1b}'), "{error}");
+        }
     }
 
     fn leaf_keys(prefix: &str, table: &toml::Table, keys: &mut Vec<String>) {

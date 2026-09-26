@@ -140,7 +140,8 @@ public enum ConfigBridgeError: LocalizedError {
         switch self {
         case .loadFailed(let msg): return "Failed to load config: \(msg)"
         case .updateFailed(let msg): return "Failed to update config: \(msg)"
-        case .saveFailed(let msg): return "Failed to save config: \(msg)"
+        // Rust's message says that saving failed.
+        case .saveFailed(let msg): return msg
         case .encodingFailed(let msg): return "Failed to encode config: \(msg)"
         case .decodingFailed(let msg): return "Failed to decode config: \(msg)"
         }

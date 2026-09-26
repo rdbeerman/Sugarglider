@@ -43,24 +43,60 @@ public struct PreferencesView: View {
 
             Divider()
 
-            // Detail pane
-            Group {
-                switch selectedSection {
-                case .general:
-                    GeneralPane(viewModel: viewModel)
-                case .layouts:
-                    LayoutPane(viewModel: viewModel)
-                case .hotkeys:
-                    HotkeysPane(viewModel: viewModel)
-                case .appRules:
-                    AppRulesPane(viewModel: viewModel)
-                case .about:
-                    AboutPane()
+            VStack(spacing: 0) {
+                if let error = viewModel.lastError {
+                    PreferencesErrorBanner(message: error) {
+                        viewModel.lastError = nil
+                    }
+                    Divider()
                 }
+
+                // Detail pane
+                Group {
+                    switch selectedSection {
+                    case .general:
+                        GeneralPane(viewModel: viewModel)
+                    case .layouts:
+                        LayoutPane(viewModel: viewModel)
+                    case .hotkeys:
+                        HotkeysPane(viewModel: viewModel)
+                    case .appRules:
+                        AppRulesPane(viewModel: viewModel)
+                    case .about:
+                        AboutPane()
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(width: 650, height: 620)
+    }
+}
+
+/// Why the last change was not applied or saved. The message is monospaced
+/// so that the markers under a config file error line up with the text.
+struct PreferencesErrorBanner: View {
+    let message: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundColor(.orange)
+            Text(message)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+        }
+        .padding(12)
+        .background(Color.orange.opacity(0.12))
     }
 }
 
