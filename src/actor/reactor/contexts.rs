@@ -25,6 +25,10 @@ use crate::sys::screen::SpaceId;
 /// Why a context command does nothing while a quit waits for parked windows.
 const QUITTING: &str = "Sugarglider is quitting";
 
+/// Why a switch or a new context does nothing while no screen shows a Space
+/// that Sugarglider manages.
+const NO_MANAGED_SPACE: &str = "No Space is managed right now";
+
 /// A visible screen, with its Space and size, and the context it shows.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ShownSpace {
@@ -414,13 +418,25 @@ impl Reactor {
 
     /// Runs a context command, or returns why it can't run. The command
     /// names its context as the user wrote it, and it is resolved here,
-    /// against the reactor's own state.
+    /// against the reactor's own state. A switch or a new context does
+    /// nothing while no Space is managed, because it would apply to no
+    /// Space now and change what shows when a Space is managed again.
     pub(super) fn run_context_command(&mut self, command: ContextCommand) -> Result<(), String> {
         if !self.contexts_enabled() {
             return Err(CONTEXTS_OFF.to_string());
         }
         if self.pending_exit.is_some() {
             return Err(QUITTING.to_string());
+        }
+        let switches = matches!(
+            command,
+            ContextCommand::SwitchContext(_)
+                | ContextCommand::ShowEverything
+                | ContextCommand::PreviousContext
+                | ContextCommand::CreateContext(_)
+        );
+        if switches && self.screens.iter().all(|screen| screen.space.is_none()) {
+            return Err(NO_MANAGED_SPACE.to_string());
         }
         match command {
             ContextCommand::SwitchContext(reference) => {

@@ -699,6 +699,90 @@ pub(super) mod tests {
         assert_eq!(Some(5), s.reactor.contexts.by_name("Eleventh").unwrap().number);
     }
 
+    /// A window server snapshot that lists app 1's windows at their frames.
+    fn listed(s: &Setup, idxs: &[u32]) -> WindowsOnScreen {
+        WindowsOnScreen::new(
+            idxs.iter()
+                .map(|&idx| WindowServerInfo {
+                    id: WindowServerId::new(idx),
+                    pid: 1,
+                    layer: 0,
+                    frame: s.apps.windows[&wid(idx)].frame,
+                })
+                .collect(),
+        )
+    }
+
+    /// M5c. While no screen shows a managed Space, as at the login window,
+    /// `create` makes no context and says why. So the next Space change
+    /// parks nothing.
+    #[test]
+    fn a_new_context_is_refused_while_no_space_is_managed() {
+        let mut s = Setup::new(2);
+        let all = listed(&s, &[1, 2]);
+        s.reactor.handle_event(Event::SpaceChanged(vec![None], all.clone()));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let unmanaged = s.reactor.published_contexts.clone().unwrap();
+        assert!(unmanaged.screens.is_empty());
+
+        let (reply, create) =
+            send_to_server(&unmanaged, 1, ContextCommand::CreateContext("Work".into()));
+        assert_eq!(Response::Success, reply);
+        run_sent(&mut s, create);
+
+        assert_eq!(
+            Response::Error("No Space is managed right now".into()),
+            result_of(&s, 1)
+        );
+        assert!(s.reactor.contexts.contexts().is_empty());
+        assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+        s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], all));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert!(s.parked().is_empty());
+        assert!(s.reactor.contexts.contexts().is_empty());
+    }
+
+    /// R33. After `sugarglider pause`, which shows every window and then
+    /// leaves no Space managed, a switch, Show Everything, and the previous
+    /// context do nothing and say why. The active context stays, so resuming
+    /// shows what showed before the pause.
+    #[test]
+    fn a_switch_is_refused_while_no_space_is_managed() {
+        let mut s = Setup::new(2);
+        let work = s.reactor.contexts.create("Work").unwrap();
+        let desc = s.reactor.window_desc(wid(1)).unwrap();
+        s.reactor.contexts.add_window(work, &desc).unwrap();
+        s.run(ContextCommand::SwitchContext(ContextRef::Id(work)));
+        s.run(ContextCommand::ShowEverything);
+        assert!(s.parked().is_empty());
+        let all = listed(&s, &[1, 2]);
+        s.reactor.handle_event(Event::ShowEverythingOn(vec![space()]));
+        s.reactor.handle_event(Event::SpaceChanged(vec![None], all.clone()));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let paused = s.reactor.published_contexts.clone().unwrap();
+
+        for (request, command) in [
+            (1, ContextCommand::SwitchContext(ContextRef::Name("Work".into()))),
+            (2, ContextCommand::ShowEverything),
+            (3, ContextCommand::PreviousContext),
+        ] {
+            let (_, sent) = send_to_server(&paused, request, command);
+            run_sent(&mut s, sent);
+            assert_eq!(
+                Response::Error("No Space is managed right now".into()),
+                result_of(&s, request)
+            );
+        }
+
+        assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+        s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], all));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert!(s.parked().is_empty());
+        s.run(ContextCommand::PreviousContext);
+        assert_eq!(ContextKey::Named(work), s.reactor.contexts.active());
+        assert_eq!(vec![wid(2)], s.parked());
+    }
+
     /// M5c, I3. The switch after a create names the new context in another
     /// case and with an accent. The reactor resolves it when it runs it.
     #[test]

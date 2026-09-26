@@ -616,6 +616,25 @@ mod tests {
         assert_eq!((1, "", format!("{reason}\n")), (ran.status, &*ran.out, ran.err));
     }
 
+    /// A switch or a new context while no Space is managed prints the
+    /// reactor's reason and exits with status 1.
+    #[test]
+    fn a_command_while_no_space_is_managed_fails() {
+        let reason = "No Space is managed right now";
+        for args in [
+            &["switch", "Comms"][..],
+            &["create", "Work"],
+            &["everything"],
+        ] {
+            let ran = run_with_results(args, vec![Response::Error(reason.into())]);
+            assert_eq!(
+                (1, "", format!("{reason}\n")),
+                (ran.status, &*ran.out, ran.err),
+                "{args:?}"
+            );
+        }
+    }
+
     /// A command whose result doesn't come within about a second says that
     /// Sugarglider did not confirm it, and exits with status 1.
     #[test]
