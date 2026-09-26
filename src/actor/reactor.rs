@@ -10,6 +10,7 @@
 mod animation;
 mod contexts;
 mod main_window;
+mod membership;
 mod parking;
 mod quit;
 mod replay;
@@ -720,6 +721,11 @@ impl Reactor {
                 // Don't force layout on startup - windows may already be in
                 // correct positions from a previous run. Layout will be
                 // enforced when something actually changes.
+                if self.contexts_in_use() {
+                    // The windows open at launch have rejoined their contexts,
+                    // and the ones that must not show are parked.
+                    self.apply_again();
+                }
             }
             Event::ApplicationTerminated(pid) => {
                 if let Some(app) = self.apps.get_mut(&pid) {
@@ -756,7 +762,10 @@ impl Reactor {
                 if let Some(wsid) = window.sys_id {
                     self.window_ids.insert(wsid, wid);
                 }
-                self.windows.insert(wid, window.clone().into());
+                let first_seen = self.windows.insert(wid, window.clone().into()).is_none();
+                if first_seen {
+                    self.windows_seen(&[wid]);
+                }
                 if mouse_state == MouseState::Down {
                     self.in_drag = true;
                     // Suppress updates while left button is pressed in case
@@ -1558,7 +1567,11 @@ impl Reactor {
         //
         // TODO: Notice when returning from the login screen and ask again for
         // undiscovered windows.
-        let new_wids: Vec<WindowId> = new.iter().map(|&(wid, _)| wid).collect();
+        let first_seen: Vec<WindowId> = new
+            .iter()
+            .map(|&(wid, _)| wid)
+            .filter(|wid| !self.windows.contains_key(wid))
+            .collect();
         self.window_ids
             .extend(new.iter().flat_map(|(wid, info)| info.sys_id.map(|wsid| (wsid, *wid))));
         self.windows.extend(new.into_iter().map(|(wid, info)| (wid, info.into())));
@@ -1586,16 +1599,16 @@ impl Reactor {
             self.visible_windows.retain(|wsid| !self.hidden_windows.contains(wsid));
         }
 
-        // The windows found for the first time rejoin their contexts before
-        // the layout sees them. Windows parked before a restart go back first,
-        // so the layout sees them at their frames from before parking.
-        let rejoined = self.rejoin_windows(&new_wids);
+        // The membership of the windows found for the first time is decided
+        // before the layout sees them. Windows parked before a restart go
+        // back first, so the layout sees them at their frames from before
+        // parking. The windows open at launch are parked, if they must not
+        // show, when startup completes.
+        self.windows_seen(&first_seen);
         self.restore_from_journal(pid);
         self.send_visible_windows_to_layout(pid);
-        // The active context is applied again, so that it shows the windows
-        // that rejoined it and parks the ones that must not show.
-        if rejoined && let Some(response) = self.show_visible_spaces() {
-            self.handle_layout_response(response);
+        if self.startup_complete {
+            self.park_what_must_not_show(pid);
         }
     }
 

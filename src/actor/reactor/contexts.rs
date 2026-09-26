@@ -23,7 +23,7 @@ use crate::sys::screen::SpaceId;
 
 /// A visible screen, with its Space and size, and the context it shows.
 #[derive(Clone, Copy, Debug)]
-struct ShownSpace {
+pub(super) struct ShownSpace {
     screen: usize,
     space: SpaceId,
     size: CGSize,
@@ -101,7 +101,7 @@ impl Reactor {
 
     /// The visible screens and the contexts they show when `active` is the
     /// active context.
-    fn shown_spaces(&self, active: ContextKey) -> Vec<ShownSpace> {
+    pub(super) fn shown_spaces(&self, active: ContextKey) -> Vec<ShownSpace> {
         self.screens
             .iter()
             .enumerate()
@@ -169,7 +169,7 @@ impl Reactor {
     /// parked window on a screen that shows a Space Sugarglider doesn't
     /// manage, so that the plan puts it back when it must show. The other
     /// windows on such a screen are left out.
-    fn switch_input(&self, spaces: &[ShownSpace]) -> SwitchInput {
+    pub(super) fn switch_input(&self, spaces: &[ShownSpace]) -> SwitchInput {
         let mut input = SwitchInput {
             screens: spaces
                 .iter()
@@ -412,6 +412,8 @@ impl Reactor {
             info!("Contexts are on");
             if self.contexts_unread {
                 self.read_contexts(SystemTime::now());
+            } else {
+                self.rejoin_every_window();
             }
             if !self.contexts_in_use() {
                 return;
@@ -456,7 +458,7 @@ impl Reactor {
     }
 
     /// The window as member records describe it.
-    fn window_desc(&self, wid: WindowId) -> Option<WindowDesc> {
+    pub(super) fn window_desc(&self, wid: WindowId) -> Option<WindowDesc> {
         let window = self.windows.get(&wid)?;
         let app = self.apps.get(&wid.pid);
         Some(WindowDesc {
@@ -556,6 +558,13 @@ impl Reactor {
                 self.contexts = empty_contexts_after(self.layout.context_ids().max());
             }
         }
+        self.rejoin_every_window();
+    }
+
+    /// Has the windows of the running apps rejoin the contexts whose records
+    /// they match, as at launch (R38). Windows found while contexts were off
+    /// have no membership until then.
+    fn rejoin_every_window(&mut self) {
         let mut wids: Vec<WindowId> = self
             .windows
             .keys()
@@ -563,7 +572,9 @@ impl Reactor {
             .filter(|wid| self.apps.contains_key(&wid.pid))
             .collect();
         wids.sort();
-        self.rejoin_windows(&wids);
+        if self.rejoin_windows(&wids) {
+            self.save_contexts();
+        }
     }
 }
 
@@ -594,6 +605,8 @@ mod tests {
     use crate::sys::event::MouseState;
     use crate::sys::screen::{CoordinateConverter, SpaceId};
     use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
+
+    mod membership;
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
@@ -1201,46 +1214,26 @@ mod tests {
         assert!(s.reactor.layout.context_ids().all(|id| ContextKey::Named(id) == c));
     }
 
-    /// R16.
+    /// R16. Window 3 comes back from being minimized while the journal
+    /// can't be written, so nothing parks it.
     #[test]
     fn r16_switching_to_the_active_context_parks_windows_that_drifted_in() {
-        let mut s = Setup::new(2);
+        let mut s = Setup::new(3);
+        let unminimized = s.frame(wid(3));
+        report_visible(&mut s, &[wid(1), wid(2)]);
         let c = s.create("C", &[wid(1)]);
         s.switch(c);
         assert_eq!(vec![wid(2)], s.parked());
-        // A new window of the app shows up. Nothing parks it.
-        let new = WindowInfo {
-            frame: rect(300., 100., 50., 50.),
-            ..make_window(3)
-        };
-        s.apps.windows.insert(
-            wid(3),
-            WindowState {
-                frame: new.frame,
-                ..Default::default()
-            },
-        );
-        s.reactor.handle_event(Event::WindowCreated(wid(3), new, MouseState::Up));
-        s.reactor.handle_event(Event::WindowsOnScreenUpdated {
-            pid: Some(1),
-            on_screen: WindowsOnScreen::new(
-                (1..=3)
-                    .map(|idx| WindowServerInfo {
-                        id: WindowServerId::new(idx),
-                        pid: 1,
-                        layer: 0,
-                        frame: s.frame(wid(idx)),
-                    })
-                    .collect(),
-            ),
-        });
-        s.apps.simulate_until_quiet(&mut s.reactor);
+        let failing = FailingWrites::start(s.dir.path());
+        report_visible(&mut s, &[wid(1), wid(2), wid(3)]);
+        drop(failing);
         assert_eq!(vec![wid(2)], s.parked());
+        assert_eq!(unminimized, s.frame(wid(3)));
 
         s.switch(c);
 
         assert_eq!(vec![wid(2), wid(3)], s.parked());
-        assert_eq!(corner(CGSize::new(50., 50.)), s.frame(wid(3)));
+        assert_eq!(corner(unminimized.size), s.frame(wid(3)));
         assert_eq!(vec![(wid(1), screen())], s.tiles());
     }
 
@@ -3402,10 +3395,11 @@ mod tests {
         assert_eq!(vec![(wid(1), screen())], s.tiles());
     }
 
-    /// L4. Under a context, a window that isn't a member and becomes visible,
-    /// here by being unminimized, gets no tile, and the members keep theirs.
+    /// L4, R39. Under a context, a window that isn't a member and becomes
+    /// visible, here by being unminimized, gets no tile and is parked, and
+    /// the members keep theirs.
     #[test]
-    fn l4_a_non_member_that_becomes_visible_under_a_context_gets_no_tile() {
+    fn l4_r39_a_non_member_that_becomes_visible_under_a_context_is_parked() {
         let mut s = Setup::new(3);
         // Window 3 is minimized.
         report_visible(&mut s, &[wid(1), wid(2)]);
@@ -3422,7 +3416,9 @@ mod tests {
 
         assert_eq!(in_c, s.tiles());
         assert_eq!(in_c, s.frames(&[wid(1), wid(2)]));
-        assert_eq!(rect(800., 0., 400., 1000.), s.frame(wid(3)));
+        assert_eq!(vec![wid(3)], s.parked());
+        assert_eq!(corner(CGSize::new(400., 1000.)), s.frame(wid(3)));
+        assert_eq!(vec![entry(3, rect(800., 0., 400., 1000.))], s.journal_on_disk());
     }
 
     /// L5, H4. A window list taken before a switch's frames landed, and a
@@ -3513,9 +3509,9 @@ mod tests {
         let snapshot = on_screen(&s, &on_space2);
         s.reactor.handle_event(Event::SpaceChanged(vec![Some(space2)], snapshot));
         let requests = s.apps.requests();
-        drop(failing);
         answer(&mut s, requests);
         s.apps.simulate_until_quiet(&mut s.reactor);
+        drop(failing);
 
         assert_eq!(vec![(wid(3), screen())], s.tiles_on(space2, screen()));
         assert_eq!(screen(), s.frame(wid(3)));
