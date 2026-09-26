@@ -48,16 +48,16 @@ impl Reactor {
     /// The journal entries of all the windows are written first. If that
     /// write fails, no window is parked. Windows that are already parked, that
     /// have no window server id, or that are on no screen are left where they
-    /// are.
+    /// are. A window listed more than once is parked once.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "only tests park windows until context switching")
     )]
     pub(super) fn park_windows(&mut self, wids: &[WindowId]) -> io::Result<()> {
         let mut entries = vec![];
-        let mut parking = vec![];
+        let mut parking: Vec<(WindowId, CGRect, CGRect)> = vec![];
         for &wid in wids {
-            if self.parked.contains_key(&wid) {
+            if self.parked.contains_key(&wid) || parking.iter().any(|&(other, ..)| other == wid) {
                 continue;
             }
             let Some(window) = self.windows.get(&wid) else { continue };
@@ -892,7 +892,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bug: a window listed twice in one batch gets two park writes and two entries"]
     fn r30_a_window_listed_twice_in_one_batch_is_parked_once() {
         let mut s = Setup::new(2);
         let tile = s.frame(wid(1));
