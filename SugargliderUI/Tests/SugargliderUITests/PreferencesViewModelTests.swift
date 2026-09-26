@@ -13,13 +13,16 @@ final class FakePreferencesBackend: PreferencesBackend {
   var saved: [PreferencesConfig] = []
   /// Thrown by the next saves while set.
   var saveError: Error?
+  /// Thrown by the next loads while set.
+  var loadError: Error?
 
   init(_ config: PreferencesConfig = PreferencesConfig()) {
     self.config = config
   }
 
   func loadConfig() throws -> PreferencesConfig {
-    config
+    if let loadError { throw loadError }
+    return config
   }
 
   func updateConfig(_ config: PreferencesConfig) throws {
@@ -132,6 +135,28 @@ final class PreferencesViewModelTests: XCTestCase {
     XCTAssertEqual(model.hotkeys.map(\.key), ["⌥Z", "⌥H"])
     XCTAssertEqual(backend.saved.count, 0)
     XCTAssertNotNil(model.lastError)
+  }
+
+  /// A failed initial load disables saving: the window shows the defaults
+  /// and an empty key list, and neither may reach the running app or the
+  /// file.
+  func testDoesNotSaveWhenTheInitialLoadFailed() {
+    let backend = FakePreferencesBackend(
+      PreferencesConfig(animate: false, outerGap: 8, hotkeys: [
+        HotkeyBinding(
+          key: "⌥Z", command: #""toggle_global_enabled""#, description: "Toggle tiling globally",
+          category: "System")
+      ]))
+    backend.loadError = ConfigBridgeError.loadFailed("No config available from backend")
+    let model = PreferencesViewModel(backend: backend)
+    XCTAssertEqual(
+      model.lastError, "Failed to load config: No config available from backend")
+
+    model.showMenuBarIcon = false
+    model.saveToConfig()
+
+    XCTAssertTrue(backend.updated.isEmpty)
+    XCTAssertTrue(backend.saved.isEmpty)
   }
 
   /// A window rule condition that the App Rules pane doesn't show survives

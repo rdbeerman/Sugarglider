@@ -104,6 +104,10 @@ public class PreferencesViewModel: ObservableObject {
     private let backend: PreferencesBackend
     private var cancellables = Set<AnyCancellable>()
     private var isLoading = false
+    /// Set when the initial load failed. Saving stays off until a load
+    /// succeeds, so the defaults the window shows can't replace the running
+    /// config.
+    private var loadFailed = false
 
     public convenience init() {
         self.init(backend: ConfigBridge.shared)
@@ -170,10 +174,12 @@ public class PreferencesViewModel: ObservableObject {
 
         do {
             let config = try backend.loadConfig()
+            loadFailed = false
             applyConfig(config)
         } catch {
+            loadFailed = true
+            lastError = error.localizedDescription
             print("Failed to load config: \(error)")
-            // Use defaults - they're already set
         }
     }
 
@@ -246,6 +252,12 @@ public class PreferencesViewModel: ObservableObject {
     // MARK: - Config Saving
 
     public func saveToConfig() {
+        guard !loadFailed else {
+            // The window's values are defaults and its key list is empty,
+            // because the initial load failed. Saving either would replace
+            // the running config and the file with them.
+            return
+        }
         let config = buildConfig()
 
         do {
