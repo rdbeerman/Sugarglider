@@ -6,11 +6,11 @@
 
 use std::io;
 
-use objc2_core_foundation::CGRect;
+use objc2_core_foundation::{CGRect, CGSize};
 use tracing::{debug, info};
 
-use super::Reactor;
 use super::animation::Animation;
+use super::{Reactor, fit_frame_to_screen};
 use crate::actor::app::{WindowId, pid_t};
 use crate::actor::parked_journal::JournalEntry;
 use crate::collections::HashSet;
@@ -130,10 +130,32 @@ impl Reactor {
                 self.resizing_window = None;
             }
             if !laid_out.contains(wid) {
+                let current = self.windows.get(wid).map_or(frame, |window| window.frame_monotonic);
+                let frame = self.on_a_screen(frame, current);
                 self.pending_frame_overrides.insert(*wid, frame);
             }
         }
         self.update_layout(&[], true);
+    }
+
+    /// `frame`, or, if `frame` is on no screen, `frame` moved onto the screen
+    /// that `current` is on, or else onto the main screen. The size stays
+    /// where the screen is large enough.
+    fn on_a_screen(&self, frame: CGRect, current: CGRect) -> CGRect {
+        if self.best_screen_idx_for_window(&frame).is_some() {
+            return frame;
+        }
+        let idx = self.best_screen_idx_for_window(&current).unwrap_or(0);
+        let Some(screen) = self.screens.get(idx) else {
+            return frame;
+        };
+        let moved = fit_frame_to_screen(frame, CGSize::new(0.0, 0.0), screen.frame);
+        debug!(
+            ?frame,
+            ?moved,
+            "Moving a frame that is on no screen onto a screen"
+        );
+        moved
     }
 
     /// The windows that the active layouts of the visible Spaces give a frame.
@@ -256,7 +278,8 @@ impl Reactor {
                 continue;
             };
             self.journal.mark_restored(pid, entry.window_server_id);
-            writes.push((wid, entry.frame.into()));
+            let frame = self.on_a_screen(entry.frame.into(), self.windows[&wid].frame_monotonic);
+            writes.push((wid, frame));
         }
         if !writes.is_empty() {
             info!(
@@ -1820,5 +1843,58 @@ mod tests {
         assert_eq!(corner, s.reactor.windows[&wid(1)].frame_monotonic);
         s.reactor.unpark_windows(&[wid(1)]);
         assert_eq!(vec![tiles[0]], frame_writes(&s.apps.requests(), wid(1)));
+    }
+
+    #[test]
+    fn r34_a_window_parked_on_a_display_that_is_gone_goes_back_onto_a_screen() {
+        let on_the_gone_display = rect(1100., 100., 400., 400.);
+        let mut s = Setup::launching(vec![entry(1, 11, on_the_gone_display)]);
+
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![window_at(11, rect(999., 999., 400., 400.))]));
+
+        let wid = WindowId::new(1, 1);
+        let writes = frame_writes(&s.apps.requests(), wid);
+        assert_eq!(Some(&rect(600., 100., 400., 400.)), writes.first(), "{writes:?}");
+        assert_eq!(vec![(wid, screen())], s.tiles());
+    }
+
+    #[test]
+    fn h3_a_floating_window_whose_display_is_gone_goes_back_onto_a_screen() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let main = rect(0., 0., 1000., 1000.);
+        let right = rect(1000., 0., 1000., 1000.);
+        let displays = |frames: Vec<CGRect>| Event::ScreenParametersChanged {
+            bounds: frames.clone(),
+            spaces: (1..=frames.len() as u64).map(|id| Some(SpaceId::new(id))).collect(),
+            scale_factors: vec![1.0; frames.len()],
+            frames,
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        };
+        reactor.handle_event(displays(vec![main, right]));
+        let floating = rect(1200., 100., 300., 300.);
+        let window = WindowInfo {
+            frame: floating,
+            is_resizable: false,
+            ..make_window(1)
+        };
+        reactor.handle_events(apps.make_app(1, vec![window]));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!(floating, apps.windows[&wid(1)].frame);
+        reactor.park_windows(&[wid(1)]).unwrap();
+        apps.simulate_until_quiet(&mut reactor);
+
+        // The display on the right is unplugged.
+        reactor.handle_event(displays(vec![main]));
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.unpark_windows(&[wid(1)]);
+
+        assert_eq!(
+            vec![rect(700., 100., 300., 300.)],
+            frame_writes(&apps.requests(), wid(1))
+        );
     }
 }
