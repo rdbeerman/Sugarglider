@@ -128,6 +128,12 @@ pub enum ContextError {
     NoSuchContext,
     #[error("No such member record")]
     NoSuchRecord,
+    #[error("No context has the number {0}")]
+    NoContextNumbered(u8),
+    #[error("Give the name or the number of a context")]
+    NoQuery,
+    #[error("No context matches \"{0}\"")]
+    NoMatch(String),
 }
 
 pub const EVERYTHING_NAME: &str = "Everything";
@@ -695,6 +701,50 @@ pub fn rank(
             .then_with(|| contexts.last_used(*b_key).cmp(&contexts.last_used(*a_key)))
     });
     ranked
+}
+
+/// Names a context in a command: by its number, its id, or its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Query<'a> {
+    Number(u8),
+    Id(ContextId),
+    Name(&'a str),
+}
+
+/// The entry that a command's query names.
+///
+/// A number or an id names the context that has it. A name names the
+/// context with that name, ignoring case and accents. Everything and
+/// Unsorted match only their exact names, and Unsorted only while it is
+/// listed: `lists_unsorted` is true and a context exists (R28, R29). Any
+/// other name takes the best match of the switcher's ranking among the named
+/// contexts.
+pub fn resolve(
+    query: Query<'_>,
+    contexts: &Contexts,
+    lists_unsorted: bool,
+) -> Result<ContextKey, ContextError> {
+    match query {
+        Query::Number(number) => contexts
+            .by_number(number)
+            .map(|context| ContextKey::Named(context.id))
+            .ok_or(ContextError::NoContextNumbered(number)),
+        Query::Id(id) => contexts
+            .get(id)
+            .map(|context| ContextKey::Named(context.id))
+            .ok_or(ContextError::NoSuchContext),
+        Query::Name(name) if name.trim().is_empty() => Err(ContextError::NoQuery),
+        Query::Name(name) => {
+            let lists_unsorted = lists_unsorted && !contexts.contexts.is_empty();
+            rank(name, contexts, lists_unsorted)
+                .into_iter()
+                .find(|&(key, found)| {
+                    matches!(key, ContextKey::Named(_)) || found == NameMatch::Exact
+                })
+                .map(|(key, _)| key)
+                .ok_or_else(|| ContextError::NoMatch(name.trim().to_string()))
+        }
+    }
 }
 
 /// Matches a folded query against a folded name.
@@ -4602,5 +4652,119 @@ mod tests {
             ranked_names("", &cx, true),
             vec!["C", "Unsorted", "B", "A", "Everything"]
         );
+    }
+
+    /// Comms (1, used last), Client work (2), and Relax (no number), and
+    /// the id of a deleted context.
+    fn three_to_resolve() -> (Contexts, [ContextId; 3], ContextId) {
+        let mut cx = Contexts::new();
+        let comms = cx.create("Comms").unwrap();
+        let client = cx.create("Client work").unwrap();
+        let relax = cx.create("Relax").unwrap();
+        let gone = cx.create("Gone").unwrap();
+        cx.delete(gone).unwrap();
+        cx.set_number(relax, None).unwrap();
+        cx.switch_to(named(comms)).unwrap();
+        (cx, [comms, client, relax], gone)
+    }
+
+    /// Commands and dispatch, R4, R29. What each form of query names, with
+    /// Unsorted listed. A number or an id names its context. A name names
+    /// a context by its exact name, ignoring case and accents, or else by
+    /// the switcher's ranking among the named contexts. The built-in
+    /// entries match only their exact names.
+    #[test]
+    fn resolve_takes_numbers_ids_exact_names_and_ranked_names() {
+        let (cx, [comms, client, relax], gone) = three_to_resolve();
+        let no_match = |name: &str| Err(ContextError::NoMatch(name.to_string()));
+        let table: Vec<(Query, Result<ContextKey, ContextError>)> = vec![
+            (Query::Number(1), Ok(named(comms))),
+            (Query::Number(2), Ok(named(client))),
+            (Query::Number(3), Err(ContextError::NoContextNumbered(3))),
+            (Query::Number(0), Err(ContextError::NoContextNumbered(0))),
+            (Query::Number(9), Err(ContextError::NoContextNumbered(9))),
+            (Query::Id(relax), Ok(named(relax))),
+            (Query::Id(gone), Err(ContextError::NoSuchContext)),
+            (Query::Name("Comms"), Ok(named(comms))),
+            (Query::Name("  COMMS  "), Ok(named(comms))),
+            (Query::Name("cómms"), Ok(named(comms))),
+            (Query::Name("Client work"), Ok(named(client))),
+            (Query::Name("cli"), Ok(named(client))),
+            (Query::Name("cw"), Ok(named(client))),
+            (Query::Name("work"), Ok(named(client))),
+            (Query::Name("rlx"), Ok(named(relax))),
+            (Query::Name("Everything"), Ok(ContextKey::Everything)),
+            (Query::Name("ÉVERYTHING"), Ok(ContextKey::Everything)),
+            (Query::Name(" unsorted "), Ok(ContextKey::Unsorted)),
+            (Query::Name("uns"), no_match("uns")),
+            (Query::Name("every"), no_match("every")),
+            (Query::Name("Sugarglider"), no_match("Sugarglider")),
+            (Query::Name(" 7 "), no_match("7")),
+            (Query::Name("--"), no_match("--")),
+            (Query::Name(""), Err(ContextError::NoQuery)),
+            (Query::Name(" \t "), Err(ContextError::NoQuery)),
+        ];
+        for (query, expected) in table {
+            assert_eq!(expected, resolve(query, &cx, true), "{query:?}");
+        }
+        assert_eq!(
+            "No context matches \"uns\"",
+            resolve(Query::Name("uns"), &cx, true).unwrap_err().to_string()
+        );
+        assert_eq!(
+            "No context has the number 3",
+            resolve(Query::Number(3), &cx, true).unwrap_err().to_string()
+        );
+    }
+
+    /// Commands and dispatch, R19. A partial name takes the named context
+    /// it matches, even when a built-in entry that it also starts was used
+    /// more recently. A partial name that only a built-in entry matches
+    /// names nothing.
+    #[test]
+    fn resolve_takes_a_named_context_over_a_more_recently_used_built_in() {
+        let mut cx = Contexts::new();
+        let unicorn = cx.create("Unicorn").unwrap();
+        let email = cx.create("Email").unwrap();
+        for key in [
+            named(unicorn),
+            named(email),
+            ContextKey::Unsorted,
+            ContextKey::Everything,
+        ] {
+            cx.switch_to(key).unwrap();
+        }
+
+        assert_eq!(Ok(named(unicorn)), resolve(Query::Name("un"), &cx, true));
+        assert_eq!(Ok(named(email)), resolve(Query::Name("e"), &cx, true));
+        for partial in ["ev", "every", "unsort", "uns"] {
+            assert_eq!(
+                Err(ContextError::NoMatch(partial.to_string())),
+                resolve(Query::Name(partial), &cx, true),
+                "{partial}"
+            );
+        }
+    }
+
+    /// R28, R29. Unsorted's name names it only while it is listed, and
+    /// never before the first context exists. Everything's name always
+    /// names Everything.
+    #[test]
+    fn resolve_names_unsorted_only_while_it_is_listed_and_a_context_exists() {
+        let none = Contexts::new();
+        let (cx, ..) = three_to_resolve();
+        let unsorted = Query::Name("Unsorted");
+        let no_match = Err(ContextError::NoMatch("Unsorted".to_string()));
+
+        assert_eq!(no_match, resolve(unsorted, &none, true));
+        assert_eq!(no_match, resolve(unsorted, &none, false));
+        assert_eq!(no_match, resolve(unsorted, &cx, false));
+        assert_eq!(Ok(ContextKey::Unsorted), resolve(unsorted, &cx, true));
+        for (contexts, listed) in [(&none, false), (&none, true), (&cx, false)] {
+            assert_eq!(
+                Ok(ContextKey::Everything),
+                resolve(Query::Name("everything"), contexts, listed)
+            );
+        }
     }
 }

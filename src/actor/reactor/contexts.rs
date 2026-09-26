@@ -16,8 +16,8 @@ use crate::actor::app::{WindowId, pid_t};
 use crate::actor::contexts_store::{ContextsStore, Loaded, empty_contexts_after};
 use crate::actor::layout::{ActiveContext, EventResponse, LayoutEvent};
 use crate::model::contexts::{
-    ContextError, ContextId, ContextKey, Contexts, MatchPass, NameMatch, SwitchInput, SwitchPlan,
-    SwitchScreen, SwitchWindow, WindowDesc, plan_switch, rank,
+    ContextError, ContextId, ContextKey, Contexts, MatchPass, SwitchInput, SwitchPlan,
+    SwitchScreen, SwitchWindow, WindowDesc, plan_switch, resolve,
 };
 use crate::sys::screen::SpaceId;
 
@@ -401,8 +401,8 @@ impl Reactor {
     pub(super) fn handle_context_command(&mut self, command: ContextCommand) {
         match command {
             ContextCommand::SwitchContext(reference) => match self.resolve(&reference) {
-                Some(key) => self.switch_context(key),
-                None => warn!(?reference, "No context matches"),
+                Ok(key) => self.switch_context(key),
+                Err(err) => warn!(?reference, "{err}"),
             },
             ContextCommand::ShowEverything => self.switch_context(ContextKey::Everything),
             ContextCommand::PreviousContext => match self.contexts.previous() {
@@ -426,30 +426,15 @@ impl Reactor {
     /// The named context that a command names.
     pub(super) fn resolve_named(&self, reference: &ContextRef) -> Option<ContextId> {
         match self.resolve(reference) {
-            Some(ContextKey::Named(id)) => Some(id),
+            Ok(ContextKey::Named(id)) => Some(id),
             _ => None,
         }
     }
 
-    /// The context that a command names. A name takes the best match of the
-    /// switcher's ranking among the named contexts. Everything and Unsorted
-    /// match only their exact names, and Unsorted only while it is listed.
-    fn resolve(&self, reference: &ContextRef) -> Option<ContextKey> {
-        match reference {
-            ContextRef::Number(number) => {
-                self.contexts.by_number(*number).map(|context| ContextKey::Named(context.id))
-            }
-            ContextRef::Id(id) => {
-                self.contexts.get(*id).map(|context| ContextKey::Named(context.id))
-            }
-            ContextRef::Name(name) if name.trim().is_empty() => None,
-            ContextRef::Name(name) => rank(name, &self.contexts, self.lists_unsorted())
-                .into_iter()
-                .find(|&(key, found)| {
-                    matches!(key, ContextKey::Named(_)) || found == NameMatch::Exact
-                })
-                .map(|(key, _)| key),
-        }
+    /// The entry that a command names, as `model::contexts::resolve` finds
+    /// it.
+    fn resolve(&self, reference: &ContextRef) -> Result<ContextKey, ContextError> {
+        resolve(reference.query(), &self.contexts, self.lists_unsorted())
     }
 
     /// Whether Unsorted is listed among the contexts to switch to: some

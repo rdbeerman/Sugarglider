@@ -57,7 +57,7 @@ use crate::collections::{HashMap, HashSet};
 use crate::config::Config;
 use crate::log::{self, MetricsCommand};
 use crate::model::NodeId;
-use crate::model::contexts::{ContextId, Contexts};
+use crate::model::contexts::{ContextId, Contexts, Query};
 use crate::sys::app::Process;
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
@@ -293,6 +293,17 @@ pub enum ContextRef {
     Number(u8),
     Name(String),
     Id(ContextId),
+}
+
+impl ContextRef {
+    /// The reference as the contexts model resolves it.
+    pub fn query(&self) -> Query<'_> {
+        match self {
+            ContextRef::Number(number) => Query::Number(*number),
+            ContextRef::Name(name) => Query::Name(name),
+            ContextRef::Id(id) => Query::Id(*id),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
