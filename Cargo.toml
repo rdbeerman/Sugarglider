@@ -56,6 +56,7 @@ swift-ui = []
 exec_cmd = []
 
 [dependencies]
+arc-swap = "1.9.2"
 accessibility = { version = "0.4.0", git = "https://github.com/tmandry/accessibility", branch = "objc2-migration" }
 accessibility-sys = { version = "0.3.0", git = "https://github.com/tmandry/accessibility", branch = "objc2-migration" }
 anyhow = "1.0.83"

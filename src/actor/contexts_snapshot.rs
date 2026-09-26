@@ -12,8 +12,9 @@
 //! but an id has a default: a reader fills in the fields that a writer of
 //! another version left out, and skips the fields it doesn't know.
 
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use serde::{Deserialize, Serialize};
 
 use crate::actor::app::WindowId;
@@ -387,24 +388,19 @@ pub fn app_name(record: &MemberRecord) -> String {
         .to_string()
 }
 
-static PUBLISHED: OnceLock<RwLock<Arc<ContextsSnapshot>>> = OnceLock::new();
+static PUBLISHED: ArcSwapOption<ContextsSnapshot> = ArcSwapOption::const_empty();
 
 /// Makes `snapshot` the one that [`published`] returns. The reactor calls
 /// this after every change.
 pub fn publish(snapshot: Arc<ContextsSnapshot>) {
-    let mut snapshot = Some(snapshot);
-    let lock = PUBLISHED.get_or_init(|| RwLock::new(snapshot.take().expect("not taken yet")));
-    if let Some(snapshot) = snapshot {
-        *lock.write().unwrap_or_else(PoisonError::into_inner) = snapshot;
-    }
+    PUBLISHED.store(Some(snapshot));
 }
 
 /// The snapshot the reactor published last, or `None` before the first.
-/// The message server calls this on the main thread, so it never panics.
+/// The message server and switcher call this on the main thread. Loading an
+/// Arc does not wait for a reactor publication in progress.
 pub fn published() -> Option<Arc<ContextsSnapshot>> {
-    PUBLISHED
-        .get()
-        .map(|lock| lock.read().unwrap_or_else(PoisonError::into_inner).clone())
+    PUBLISHED.load_full()
 }
 
 #[cfg(test)]
@@ -831,5 +827,28 @@ mod tests {
         assert_eq!(Some(first), published());
         publish(second.clone());
         assert_eq!(Some(second), published());
+    }
+
+    /// A rank or run request must always get a snapshot after the first
+    /// publication, including while the reactor replaces that snapshot.
+    #[test]
+    fn concurrent_replacement_never_makes_a_published_snapshot_unavailable() {
+        let slot = ArcSwapOption::<ContextsSnapshot>::empty();
+        let first = Arc::new(snapshot(&three(), 1));
+        let second = Arc::new(ContextsSnapshot::off());
+        slot.store(Some(first.clone()));
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for i in 0..10_000 {
+                    let next = if i % 2 == 0 { &second } else { &first };
+                    slot.store(Some(next.clone()));
+                }
+            });
+            for _ in 0..10_000 {
+                let loaded = slot.load_full().expect("a snapshot was already published");
+                assert!(Arc::ptr_eq(&loaded, &first) || Arc::ptr_eq(&loaded, &second));
+            }
+        });
     }
 }
