@@ -2770,6 +2770,33 @@ pub mod tests {
         assert_eq!(recorded, frame_writes(replayed));
     }
 
+    /// The launch state line keeps the active context, whichever it is.
+    #[test]
+    fn the_launch_state_line_keeps_every_active_context() {
+        use crate::model::contexts::{ContextKey, Contexts};
+
+        let mut contexts = Contexts::new();
+        let id = contexts.create("C").unwrap();
+        for key in [
+            ContextKey::Everything,
+            ContextKey::Unsorted,
+            ContextKey::Named(id),
+        ] {
+            contexts.switch_to(key).unwrap();
+            let state = LaunchState {
+                journal: vec![],
+                contexts: Some(contexts.clone()),
+            };
+            let line = ron::ser::to_string(&state).unwrap();
+            let read: LaunchState = ron::de::from_str(&line).unwrap();
+            assert_eq!(
+                Some(key),
+                read.contexts.map(|contexts| contexts.active()),
+                "{line}"
+            );
+        }
+    }
+
     #[test]
     fn it_selects_the_main_window_on_space_enable() {
         let mut apps = Apps::new();
