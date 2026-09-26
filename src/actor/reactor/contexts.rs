@@ -334,6 +334,8 @@ impl Reactor {
         self.resizing_window = None;
         self.title_bar_drag = None;
         let added = std::mem::take(&mut self.added_since_switch);
+        let contexts = self.contexts.clone();
+        self.rejoin_for_switch(target);
         match self.apply(Apply::Switch(target)) {
             Ok((plan, response)) => {
                 self.save_contexts();
@@ -358,6 +360,7 @@ impl Reactor {
             }
             Err(err) => {
                 self.added_since_switch = added;
+                self.contexts = contexts;
                 error!(
                     ?target,
                     "Could not write the parked-window journal, so the context stays: {err}"
@@ -553,6 +556,32 @@ impl Reactor {
             info!(rejoined, "Windows rejoined their contexts");
         }
         rejoined > 0
+    }
+
+    /// Matches the windows of the running apps against the empty member
+    /// records, as a switch to `target` does: a window that matches no
+    /// record by its window server id or its title, and is in no context,
+    /// can fill an empty record of the target for its app.
+    fn rejoin_for_switch(&mut self, target: ContextKey) {
+        let own_pid = std::process::id() as pid_t;
+        let mut wids: Vec<WindowId> = self
+            .windows
+            .keys()
+            .copied()
+            .filter(|wid| wid.pid != own_pid && self.apps.contains_key(&wid.pid))
+            .filter(|&wid| {
+                self.layout_window_info(wid)
+                    .is_some_and(|info| !self.layout.is_untracked(&info))
+            })
+            .collect();
+        wids.sort();
+        let windows: Vec<WindowDesc> =
+            wids.iter().filter_map(|&wid| self.window_desc(wid)).collect();
+        let matches = self.contexts.rejoin_all(&windows, MatchPass::Switch { target });
+        let rejoined = matches.iter().filter(|found| !found.is_empty()).count();
+        if rejoined > 0 {
+            info!(rejoined, ?target, "Windows filled empty records for the switch");
+        }
     }
 
     /// Sets `store` as the place the contexts are read from and saved to,

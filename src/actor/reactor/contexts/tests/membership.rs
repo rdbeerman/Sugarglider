@@ -937,3 +937,53 @@ fn r38_startup_with_a_window_list_that_names_no_known_window_parks_nothing() {
     assert_eq!(vec![wid(2)], s.parked());
     assert_eq!(vec![(wid(1), screen())], s.tiles());
 }
+
+/// R22 step 4. A switch to C fills C's empty record of app 2 with app 2's
+/// window that is in no context, although its title matches nothing. When
+/// the journal can't be written, the switch stops and the record stays
+/// empty.
+#[test]
+fn r22_a_switch_fills_the_targets_empty_records_with_a_window_of_the_app() {
+    let mut s = Setup::new(2);
+    let c = s.create("C", &[wid(1)]);
+    let gone = WindowId::new(7, 9);
+    let desc = WindowDesc {
+        wid: gone,
+        bundle_id: Some("com.testapp2".into()),
+        app_name: Some("TestApp2".into()),
+        title: "Compose".into(),
+        window_server_id: None,
+    };
+    s.reactor.contexts.add_window(id_of(c), &desc).unwrap();
+    s.reactor.contexts.window_closed(gone);
+    s.reactor.contexts.app_terminated(7);
+    let window = WindowInfo {
+        title: "Inbox".to_string().into(),
+        sys_id: Some(WindowServerId::new(21)),
+        frame: rect(700., 100., 50., 50.),
+        ..make_window(1)
+    };
+    s.reactor.handle_events(s.apps.make_app(2, vec![window]));
+    let inbox = WindowId::new(2, 1);
+    report_visible(&mut s, &[wid(1), wid(2), inbox]);
+    assert!(s.reactor.contexts.is_unsorted(inbox));
+
+    let failing = FailingWrites::start(s.dir.path());
+    s.switch(c);
+    drop(failing);
+    assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+    assert!(s.reactor.contexts.is_unsorted(inbox));
+
+    s.switch(c);
+
+    assert_eq!(
+        vec![
+            ("Window1".to_string(), RecordLink::Live(wid(1))),
+            ("Inbox".to_string(), RecordLink::Live(inbox)),
+        ],
+        records(&s, c)
+    );
+    assert_eq!(vec![wid(2)], s.parked());
+    let tiled: Vec<WindowId> = s.tiles().into_iter().map(|(wid, _)| wid).collect();
+    assert_eq!(vec![wid(1), inbox], tiled);
+}
