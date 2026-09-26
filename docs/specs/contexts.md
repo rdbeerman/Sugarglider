@@ -297,10 +297,14 @@ sugarglider context move <query>         # moves the focused window
 sugarglider context remove               # removes the focused window from the active context
 sugarglider context rename <query> <new name>
 sugarglider context delete <query>
+sugarglider context number <query> <1-9>
+sugarglider context pin
+sugarglider context forget <query> <record>
 ```
 
 - `<query>` is a number or a name. The reactor resolves it with `model::contexts::resolve`: a number from 1 to 9 or an id names that context, and any other name matches exactly or by the switcher's ranking among the named contexts. A name made of digits, such as "2024", names the context by its number unless `--name` says it is a name. Everything and Unsorted match only their exact names, and Unsorted only while it is listed, so an empty Unsorted is never offered (I3).
 - `create` makes a context whose members are the tracked windows on the visible Spaces. Parked windows are left out, and a pinned window gets no record, because it is a member of every context already (R3). The new context becomes the active context.
+- `pin` pins or unpins the focused window. `forget` removes a gone window's member record from a named context. Pass the context as `<query>` and the zero-based `record` value from that context's `members` array in `list --json`. An open window's record cannot be forgotten; remove its window instead. The command reads the current snapshot first, then the reactor checks the record's app and title again before removing it. If the list changed, list the contexts again and use the new index.
 - Human-readable output goes to stdout. `--json` prints the snapshot shape below, whose top-level `active` names the active context.
 - On failure (no match, server not running, feature off) the command prints the reason to stderr and exits with status 1. A switch or a new context while no screen shows a managed Space, as when Sugarglider is paused or at the login window, fails with "No Space is managed right now". A command that changes something waits about a second for the reactor's result (I3), and exits 1 when the reactor reports a failure or doesn't confirm in time.
 
@@ -312,8 +316,13 @@ sugarglider context delete <query>
   "active": "Comms",
   "screens": [{ "id": 1, "active": "Comms" }],
   "contexts": [
-    { "name": "Comms", "number": 1, "active": true, "apps": ["WhatsApp", "Microsoft Teams"], "windows": 2 },
-    { "name": "Relax", "number": 2, "active": false, "apps": ["WhatsApp", "Google Chrome"], "windows": 2 }
+    { "name": "Comms", "number": 1, "active": true, "apps": ["WhatsApp", "Microsoft Teams"], "windows": 2,
+      "members": [
+        { "record": 0, "app": "WhatsApp", "title": "WhatsApp", "window": { "pid": 903, "idx": 9201 } },
+        { "record": 1, "app": "Microsoft Teams", "title": "Team", "window": { "pid": 904, "idx": 9202 } },
+        { "record": 2, "app": "Mail", "title": "Inbox", "window": null }
+      ] },
+    { "name": "Relax", "number": 2, "active": false, "apps": ["WhatsApp", "Google Chrome"], "windows": 2, "members": [] }
   ],
   "unsorted": 3
 }
@@ -661,7 +670,7 @@ M1 to M5c give a usable feature in global scope with a command line. The menu ba
 ### M6. Full command line and Raycast
 
 - The other `sugarglider context` subcommands and `contrib/raycast/switch-context.sh`.
-- A subcommand that removes a member record whose window is gone (`Contexts::remove_record`, R23). This spec doesn't name it yet.
+- `context forget <query> <record>` removes a gone window's member record from a named context. The record index comes from `context list --json` (`Contexts::remove_record`, R23).
 
 ### M7. Menu bar
 
