@@ -26,3 +26,6 @@ xcuserdata/
 # IDE
 .idea/
 .vscode/
+
+# Snapshot test output
+*.ron.new
