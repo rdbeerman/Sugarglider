@@ -10,7 +10,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,9 @@ use crate::collections::HashSet;
 use crate::sys::window_server::WindowServerId;
 
 const VERSION: u32 = 1;
+
+/// How long `retry_failed_write` waits after one try before it tries again.
+const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A parked window and the frame it had before it was parked.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -86,6 +89,8 @@ pub struct ParkedJournal {
     unrestored: HashSet<(pid_t, WindowServerId)>,
     /// Whether the file is behind `entries` because a write failed.
     behind: bool,
+    /// When `retry_failed_write` last tried to write.
+    last_retry: Option<Instant>,
 }
 
 impl ParkedJournal {
@@ -124,6 +129,7 @@ impl ParkedJournal {
             entries,
             unrestored,
             behind: false,
+            last_retry: None,
         }
     }
 
@@ -134,6 +140,7 @@ impl ParkedJournal {
             entries: vec![],
             unrestored: HashSet::default(),
             behind: false,
+            last_retry: None,
         }
     }
 
@@ -194,11 +201,17 @@ impl ParkedJournal {
         self.unrestored.remove(&(pid, wsid));
     }
 
-    /// Writes the journal again if the last write failed.
-    pub fn retry_failed_write(&mut self) {
-        if !self.behind {
+    /// Writes the journal again if the last write failed, at most once a
+    /// second. `now` is the current time.
+    pub fn retry_failed_write(&mut self, now: Instant) {
+        if !self.behind
+            || self
+                .last_retry
+                .is_some_and(|last| now.saturating_duration_since(last) < RETRY_INTERVAL)
+        {
             return;
         }
+        self.last_retry = Some(now);
         match self.write(&self.entries) {
             Ok(()) => {
                 info!(path = ?self.path, "Wrote the parked-window journal after a failed write");
@@ -294,7 +307,7 @@ impl Drop for FailingWrites {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use pretty_assertions::assert_eq;
@@ -609,16 +622,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut journal = ParkedJournal::open(journal_path(&dir), now());
         journal.record(vec![entry(1, 10), entry(2, 20)]).unwrap();
+        let start = Instant::now();
         let failing = FailingWrites::start(dir.path());
         journal.remove_window(1, WindowServerId::new(10));
-        journal.retry_failed_write();
+        journal.retry_failed_write(start);
         drop(failing);
         assert_eq!(
             &[entry(1, 10), entry(2, 20)],
             ParkedJournal::open(journal_path(&dir), now()).entries()
         );
 
-        journal.retry_failed_write();
+        journal.retry_failed_write(start + Duration::from_secs(1));
 
         assert_eq!(
             &[entry(2, 20)],
@@ -626,7 +640,26 @@ mod tests {
         );
         // Nothing is left to write.
         fs::remove_file(journal_path(&dir)).unwrap();
-        journal.retry_failed_write();
+        journal.retry_failed_write(start + Duration::from_secs(5));
         assert!(file_names(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn r31_a_failed_write_is_retried_at_most_once_a_second() {
+        let dir = TempDir::new().unwrap();
+        let mut journal = ParkedJournal::open(journal_path(&dir), now());
+        journal.record(vec![entry(1, 10), entry(2, 20)]).unwrap();
+        let start = Instant::now();
+        let failing = FailingWrites::start(dir.path());
+        journal.remove_window(1, WindowServerId::new(10));
+        journal.retry_failed_write(start);
+        drop(failing);
+        let on_disk = || ParkedJournal::open(journal_path(&dir), now()).entries().to_vec();
+
+        journal.retry_failed_write(start + Duration::from_millis(999));
+        assert_eq!(vec![entry(1, 10), entry(2, 20)], on_disk());
+
+        journal.retry_failed_write(start + Duration::from_millis(1000));
+        assert_eq!(vec![entry(2, 20)], on_disk());
     }
 }

@@ -587,7 +587,7 @@ impl Reactor {
     fn handle_event(&mut self, event: Event) {
         self.record.on_event(&event);
         self.log_event(&event);
-        self.journal.retry_failed_write();
+        self.journal.retry_failed_write(Instant::now());
         let animation_focus_wids: Vec<WindowId> = Vec::new();
         let mut is_resize = false;
         let raised_window = self.main_window_tracker.handle_event(&event);
