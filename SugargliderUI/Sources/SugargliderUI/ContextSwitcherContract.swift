@@ -104,8 +104,9 @@ import Foundation
 ///   names of the context's open member windows, in member order; the panel
 ///   shows the first three. `windows` counts those open windows. `members`
 ///   lists every member record in the model's order: `record` is the
-///   record's index in that list, and `window` is its open window, or null
-///   when the window is gone (the record is empty or pending, R23).
+///   record's index in that list, `app` is its app name (the bundle id when
+///   the name is unknown), and `window` is its open window, or null when the
+///   window is gone (the record is empty or pending, R23).
 /// - `unsorted`: the number of unsorted windows (R3, R29) and whether
 ///   Unsorted is active.
 /// - `everything`: whether Everything is active, and the binding that runs
@@ -117,7 +118,8 @@ import Foundation
 ///   windows. `contexts` lists the named contexts that hold the window.
 ///   `pinned` says whether it is pinned (R3).
 ///
-/// Exactly one of the `active` flags is true.
+/// Exactly one of the `active` flags is true. A key whose value can be null
+/// may also be missing.
 ///
 /// Rank result
 /// -----------
@@ -221,8 +223,10 @@ import Foundation
 /// ------------
 ///
 /// `sugarglider_run_context_command` returns NULL on success, or a message
-/// such as `A context named "Comms" already exists`, which the panel shows
-/// inline.
+/// such as `A context named "Comms" already exists`. The panel shows the
+/// message inline and stays open. After a command succeeds, the panel
+/// closes. The panel never sends a command that needs a named context for
+/// Unsorted or Everything (R29).
 enum ContextSwitcherJSON {
   static func decoder() -> JSONDecoder {
     JSONDecoder()
