@@ -2223,11 +2223,12 @@ mod tests {
 
     /// `switch_context` by number, by name with the switcher's ranking, and
     /// by id. Equal matches go to the most recently used context (R19). The
-    /// reserved names name the built-in entries. A reference that names no
-    /// context changes nothing.
+    /// reserved names name Everything, and Unsorted while it has a window.
+    /// A reference that names no context changes nothing.
     #[test]
     fn switch_context_resolves_numbers_ranked_names_reserved_names_and_ids() {
-        let mut s = Setup::new(3);
+        // Window 4 is in no context.
+        let mut s = Setup::new(4);
         let comms = s.create("Comms", &[wid(1)]);
         let community = s.create("Community", &[wid(2)]);
         let client = s.create("Client work", &[wid(3)]);
@@ -2251,7 +2252,7 @@ mod tests {
         assert_eq!(client, run(&mut s, name("clïent")));
         assert_eq!(client, run(&mut s, name("CW")));
         assert_eq!(comms, run(&mut s, ContextRef::Id(id_of(comms))));
-        assert_eq!(vec![wid(2), wid(3)], s.parked());
+        assert_eq!(vec![wid(2), wid(3), wid(4)], s.parked());
 
         let unknown_id: ContextId = serde_json::from_value(serde_json::json!(99)).unwrap();
         for reference in [
@@ -2273,6 +2274,8 @@ mod tests {
         assert!(s.parked().is_empty());
         assert_eq!(ContextKey::Unsorted, run(&mut s, name(" unsorted ")));
         assert_eq!(vec![wid(1), wid(2), wid(3)], s.parked());
+        assert_eq!(vec![(wid(4), screen())], s.tiles());
+        assert_eq!(screen(), s.frame(wid(4)));
     }
 
     /// R18, R6. Deleting the active context keeps the context used before it
