@@ -47,14 +47,9 @@ pub struct CommandResult {
     pub error: Option<String>,
 }
 
-/// Which screens a switch changes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Scope {
-    /// A switch changes every screen.
-    #[default]
-    Global,
-}
+/// Which screens a switch changes. The model owns the type; the snapshot
+/// publishes it for the command line and the switcher.
+pub use crate::model::contexts::Scope;
 
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "ContextKey")]
@@ -71,9 +66,12 @@ pub struct ContextsSnapshot {
     /// Whether contexts are on. When they are off, nothing else is filled in.
     pub enabled: bool,
     pub scope: Scope,
-    /// The active context.
+    /// The global context, or the focused screen's context in per-screen scope.
     #[serde(with = "ContextKeyDef")]
     pub active: ContextKey,
+    /// The display id of the focused screen, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focused_screen: Option<u32>,
     /// What each visible screen shows, main screen first.
     pub screens: Vec<ScreenContext>,
     /// Every named context, in the model's order.
@@ -89,10 +87,7 @@ pub struct ContextsSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScreenContext {
-    /// The screen's position in the reactor's list of screens, from 1 for the
-    /// main screen. It changes when displays are added, removed, or
-    /// rearranged. Per-screen scope (M9) may name screens by display id
-    /// instead.
+    /// The display id, stable across rearrangements of the screens.
     pub id: u32,
     /// The active context, or Everything while the screen's Space shows every
     /// window, for example during a quit.
@@ -187,6 +182,7 @@ impl ContextsSnapshot {
             enabled: false,
             scope: Scope::Global,
             active: ContextKey::Everything,
+            focused_screen: None,
             screens: Vec::new(),
             contexts: Vec::new(),
             unsorted: UnsortedSummary::default(),
@@ -196,14 +192,21 @@ impl ContextsSnapshot {
     }
 
     /// The snapshot of `contexts`, with the facts that only the reactor
-    /// knows: what each visible screen shows, and how many windows are
-    /// unsorted. Unsorted is listed while that number isn't 0.
-    pub fn new(contexts: &Contexts, screens: Vec<ScreenContext>, unsorted_windows: usize) -> Self {
+    /// knows: the scope the config chose, what each visible screen shows, and
+    /// how many windows are unsorted. Unsorted is listed while that number
+    /// isn't 0.
+    pub fn new(
+        contexts: &Contexts,
+        scope: Scope,
+        screens: Vec<ScreenContext>,
+        unsorted_windows: usize,
+    ) -> Self {
         let summary = |context| ContextSummary::new(context, contexts.pinned());
         ContextsSnapshot {
             enabled: true,
-            scope: Scope::Global,
+            scope,
             active: contexts.active(),
+            focused_screen: None,
             screens,
             contexts: contexts.contexts().iter().map(summary).collect(),
             unsorted: UnsortedSummary {
@@ -232,13 +235,18 @@ impl ContextsSnapshot {
         }
     }
 
-    /// What the managed screens show: the first screen's entry that isn't
-    /// Everything, or Everything while every screen shows it. `None` while
-    /// no screen shows a managed Space, and while contexts are off. The
-    /// status title and the menu's checkmark follow it.
+    /// What the managed screens show. In per-screen scope this is the
+    /// focused screen's entry. `None` while that screen shows no managed
+    /// Space, or contexts are off.
     pub fn shown(&self) -> Option<ContextKey> {
         if !self.enabled || self.screens.is_empty() {
             return None;
+        }
+        if self.scope == Scope::PerScreen {
+            return self.focused_screen.map_or_else(
+                || self.screens.first().map(|screen| screen.shows),
+                |id| self.screens.iter().find(|screen| screen.id == id).map(|screen| screen.shows),
+            );
         }
         let mut shown = self.screens.iter().map(|screen| screen.shows);
         let context = shown.find(|key| *key != ContextKey::Everything);
@@ -427,7 +435,7 @@ mod tests {
             id: 1,
             shows: contexts.active(),
         }];
-        ContextsSnapshot::new(contexts, screens, unsorted_windows)
+        ContextsSnapshot::new(contexts, Scope::Global, screens, unsorted_windows)
     }
 
     /// Comms (1), Community (2), and Client work (3), none of them used.
@@ -661,6 +669,30 @@ mod tests {
         }
     }
 
+    /// In per-screen scope the status and menu follow the focused display,
+    /// including when it shows Everything.
+    #[test]
+    fn per_screen_shown_entry_follows_the_focused_display_id() {
+        let contexts = three();
+        let comms = named(&contexts, "Comms");
+        let mut snapshot = snapshot(&contexts, 0);
+        snapshot.scope = Scope::PerScreen;
+        snapshot.screens = vec![
+            ScreenContext { id: 17, shows: comms },
+            ScreenContext {
+                id: 42,
+                shows: ContextKey::Everything,
+            },
+        ];
+
+        snapshot.focused_screen = Some(42);
+        assert_eq!(Some(ContextKey::Everything), snapshot.shown());
+        snapshot.focused_screen = Some(17);
+        assert_eq!(Some(comms), snapshot.shown());
+        snapshot.focused_screen = Some(99);
+        assert_eq!(None, snapshot.shown());
+    }
+
     #[test]
     fn names_of_entries() {
         let contexts = three();
@@ -760,7 +792,7 @@ mod tests {
             unsorted: (listed: true, windows: 1, last_used: 4, titles: ["Notes"]),
             everything: (last_used: 0),
             results: [(request: 9, error: None, finished_at: 12)],
-            focused_screen: 1,
+            future_screen: 1,
         )"#;
 
         let snapshot: ContextsSnapshot = ron::de::from_str(newer).unwrap();

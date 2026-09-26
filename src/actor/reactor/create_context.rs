@@ -122,6 +122,7 @@ pub(super) mod tests {
 
     pub fn screens(frames: Vec<CGRect>, spaces: Vec<Option<SpaceId>>) -> Event {
         Event::ScreenParametersChanged {
+            ids: vec![],
             bounds: frames.clone(),
             scale_factors: vec![1.0; frames.len()],
             frames,

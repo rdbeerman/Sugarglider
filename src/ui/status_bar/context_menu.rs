@@ -252,7 +252,7 @@ mod tests {
     use crate::actor::app::WindowId;
     use crate::actor::contexts_snapshot::ScreenContext;
     use crate::actor::wm_controller::WmCmd;
-    use crate::model::contexts::{Contexts, WindowDesc};
+    use crate::model::contexts::{Contexts, Scope, WindowDesc};
 
     /// Comms (1), Relax (2), and Build (3), with `active` active and
     /// `unsorted` unsorted windows.
@@ -268,7 +268,7 @@ mod tests {
         };
         contexts.switch_to(key).unwrap();
         let screens = vec![ScreenContext { id: 1, shows: key }];
-        ContextsSnapshot::new(&contexts, screens, unsorted)
+        ContextsSnapshot::new(&contexts, Scope::Global, screens, unsorted)
     }
 
     fn id(snapshot: &ContextsSnapshot, name: &str) -> ContextId {
@@ -490,7 +490,7 @@ mod tests {
             id: 1,
             shows: ContextKey::Everything,
         }];
-        let snapshot = ContextsSnapshot::new(&contexts, screens, 0);
+        let snapshot = ContextsSnapshot::new(&contexts, Scope::Global, screens, 0);
 
         let entries = context_menu(&snapshot, &ContextMenuKeys::default(), all);
 
@@ -522,7 +522,7 @@ mod tests {
         for name in ["Comms", "cöntext 3", "Context 4"] {
             contexts.create(name).unwrap();
         }
-        let snapshot = ContextsSnapshot::new(&contexts, Vec::new(), 0);
+        let snapshot = ContextsSnapshot::new(&contexts, Scope::Global, Vec::new(), 0);
 
         assert_eq!("Context 5", new_context_name(&snapshot));
         assert_eq!("Context 1", new_context_name(&ContextsSnapshot::off()));
@@ -616,7 +616,7 @@ mod tests {
             id: 1,
             shows: contexts.active(),
         }];
-        ContextsSnapshot::new(contexts, screens, unsorted)
+        ContextsSnapshot::new(contexts, Scope::Global, screens, unsorted)
     }
 
     /// The check that the status menu makes: whether the action's command
@@ -750,7 +750,7 @@ mod tests {
             id: 1,
             shows: ContextKey::Everything,
         }];
-        let everything_shown = ContextsSnapshot::new(&contexts, screens, 0);
+        let everything_shown = ContextsSnapshot::new(&contexts, Scope::Global, screens, 0);
 
         let entries = context_menu(&everything_shown, &keys(), all);
 

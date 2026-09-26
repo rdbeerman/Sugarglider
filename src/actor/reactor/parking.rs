@@ -556,6 +556,7 @@ mod tests {
             reactor.journal =
                 ParkedJournal::open(dir.path().join("parked.json"), SystemTime::now());
             reactor.handle_event(Event::ScreenParametersChanged {
+                ids: vec![],
                 frames: vec![screen],
                 bounds: vec![screen],
                 spaces: vec![Some(space())],
@@ -667,6 +668,7 @@ mod tests {
         let above_visible = rect(0., -1055., 1920., 1055.);
         let above_bounds = rect(0., -1080., 1920., 1080.);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![main_visible, above_visible],
             bounds: vec![main_bounds, above_bounds],
             spaces: vec![Some(space()), None],
@@ -1051,6 +1053,7 @@ mod tests {
         let right_visible = rect(1000., 25., 1000., 975.);
         let right_bounds = rect(1000., 0., 1000., 1000.);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![main_visible, right_visible],
             bounds: vec![main_bounds, right_bounds],
             spaces: vec![Some(space()), Some(SpaceId::new(2))],
@@ -2122,6 +2125,7 @@ mod tests {
     /// Space n.
     fn displays(frames: Vec<CGRect>) -> Event {
         Event::ScreenParametersChanged {
+            ids: vec![],
             bounds: frames.clone(),
             spaces: (1..=frames.len() as u64).map(|id| Some(SpaceId::new(id))).collect(),
             scale_factors: vec![1.0; frames.len()],
@@ -2173,6 +2177,7 @@ mod tests {
         let right = rect(1000., 0., 1000., 1000.);
         let visible = |bounds: CGRect| rect(bounds.origin.x, 25., 1000., 975.);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![visible(middle), visible(left), visible(right)],
             bounds: vec![middle, left, right],
             spaces: vec![

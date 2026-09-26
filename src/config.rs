@@ -25,6 +25,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::actor::wm_controller::WmCommand;
 use crate::model::LayoutKind;
+use crate::model::contexts::Scope;
 use crate::ui::preferences_json::{WindowRuleJson, command_json};
 
 pub fn data_dir() -> PathBuf {
@@ -221,6 +222,9 @@ pub struct Experimental {
 pub struct ContextsConfig {
     /// Named window sets that the user switches between.
     pub enable: bool,
+    /// "global": a switch changes every screen. "per_screen": only the
+    /// focused screen, and the target's members come along (R7, R8, R11).
+    pub scope: Scope,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
@@ -1119,13 +1123,21 @@ mod tests {
         );
     }
 
-    /// R28.
+    /// R28, M9. Contexts are off by default and choose global scope; the
+    /// scope key is read and rejects values that aren't a scope.
     #[test]
     fn contexts_are_off_by_default_and_turn_on_with_their_flag() {
         assert!(!Config::default().settings.experimental.contexts.enable);
+        assert_eq!(
+            Scope::Global,
+            Config::default().settings.experimental.contexts.scope
+        );
         let config = Config::parse("settings.experimental.contexts.enable = true").unwrap();
         assert!(config.settings.experimental.contexts.enable);
-        assert!(Config::parse("settings.experimental.contexts.scope = \"global\"").is_err());
+        let scoped =
+            Config::parse("settings.experimental.contexts.scope = \"per_screen\"").unwrap();
+        assert_eq!(Scope::PerScreen, scoped.settings.experimental.contexts.scope);
+        assert!(Config::parse("settings.experimental.contexts.scope = \"sometimes\"").is_err());
     }
 
     #[test]

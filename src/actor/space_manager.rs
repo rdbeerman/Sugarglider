@@ -128,11 +128,12 @@ impl SpaceManager {
                 converter,
                 on_screen,
             } => {
-                self.cur_screen_id = ids;
+                self.cur_screen_id = ids.clone();
                 self.handle_space_changed(&spaces);
                 self.reactor_tx.send(reactor::Event::ScreenParametersChanged {
                     frames: frames.clone(),
                     bounds,
+                    ids,
                     spaces: self.active_spaces(),
                     converter,
                     scale_factors,
