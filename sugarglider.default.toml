@@ -61,7 +61,7 @@ size_share.overflow = "reject"
 # config. You can disable this by adding an empty `[keys]` section to your
 # config file.
 #
-# Individual key bindings can be disabled by setting the key to "disabled".
+# Individual key bindings can be disabled by setting the key to "disable".
 default_keys = false
 
 [keys]
