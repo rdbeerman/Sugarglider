@@ -2718,14 +2718,13 @@ impl LayoutManager {
     }
 
     /// Deletes every layout of each named context for which `keep` returns
-    /// false. Unsorted's layouts stay.
+    /// false. Unsorted's layouts stay. A Space whose active context is deleted
+    /// shows Everything until the next `SpaceExposed`.
     pub fn retain_context_layouts(&mut self, mut keep: impl FnMut(ContextId) -> bool) {
-        let removed: Vec<_> = self
-            .context_layouts
-            .keys()
-            .copied()
-            .filter(|&(_, key)| matches!(key, ContextKey::Named(id) if !keep(id)))
-            .collect();
+        let mut deleted = |key: ContextKey| matches!(key, ContextKey::Named(id) if !keep(id));
+        self.active_contexts.retain(|_, key| !deleted(*key));
+        let removed: Vec<_> =
+            self.context_layouts.keys().copied().filter(|&(_, key)| deleted(key)).collect();
         for key in removed {
             let Some(mapping) = self.context_layouts.remove(&key) else {
                 continue;
@@ -5248,7 +5247,7 @@ mod tests {
 
         // C was active on space 1, so the space shows Everything's layout.
         let everything = mgr.layout_mapping[&space1].active_layout();
-        assert_eq!(1, count_errors(|| assert_eq!(everything, mgr.layout(space1))));
+        assert_eq!(0, count_errors(|| assert_eq!(everything, mgr.layout(space1))));
 
         switch(&mut mgr, space1, screen1.size, d, &all);
         assert_eq!(d_frames, mgr.layout_sorted(space1, screen1));
@@ -5789,10 +5788,9 @@ mod tests {
         );
     }
 
-    /// R6, L2. After the active context is deleted, each lookup of its Space
-    /// logs one error and uses Everything's layout. Other Spaces and the
-    /// windows' other layouts are untouched. Showing Unsorted ends the
-    /// errors.
+    /// R6, L2. After the active context is deleted, its Space uses
+    /// Everything's layout without logging an error until Unsorted shows.
+    /// Other Spaces and the windows' other layouts are untouched.
     #[test]
     fn deleting_the_active_context_falls_back_to_everything_until_unsorted_shows() {
         let mut mgr = LayoutManager::new_for_test();
@@ -5840,7 +5838,7 @@ mod tests {
         );
 
         let mut frames = vec![];
-        assert_eq!(1, count_errors(|| frames = mgr.layout_sorted(space1, screen)));
+        assert_eq!(0, count_errors(|| frames = mgr.layout_sorted(space1, screen)));
         assert_eq!(side_by_side, frames);
         assert_eq!(0, count_errors(|| frames = mgr.layout_sorted(space2, screen)));
         assert_eq!(d2_frames, frames);
@@ -5851,7 +5849,12 @@ mod tests {
             key: ContextKey::Unsorted,
             members: [w(2)].into_iter().collect(),
         };
-        _ = mgr.handle_event(LayoutEvent::SpaceExposed(space1, screen.size, unsorted));
+        assert_eq!(
+            0,
+            count_errors(|| {
+                _ = mgr.handle_event(LayoutEvent::SpaceExposed(space1, screen.size, unsorted));
+            })
+        );
         assert_eq!(0, count_errors(|| frames = mgr.layout_sorted(space1, screen)));
         assert_eq!(vec![(w(2), rect(0, 0, 120, 120))], frames);
 
