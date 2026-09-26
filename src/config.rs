@@ -945,6 +945,63 @@ mod tests {
         assert_eq!(ContextCommand::PreviousContext, command("Ctrl + Alt + Tab"));
     }
 
+    /// Key bindings. The default config ships the context bindings of the
+    /// spec commented out, so none is bound, and the shipped lines parse
+    /// once uncommented. `open_context_switcher` is left out of the parse
+    /// until the switcher's command exists.
+    #[test]
+    fn the_default_config_ships_the_context_bindings_commented_out() {
+        use crate::actor::reactor::{ContextCommand, ContextRef};
+
+        let shipped = [
+            r#"# "Ctrl + Alt + Space" = "open_context_switcher""#,
+            r#"# "Ctrl + Alt + 0" = "show_everything""#,
+            r#"# "Ctrl + Alt + 1" = { switch_context = 1 }"#,
+            r#"# "Ctrl + Alt + 2" = { switch_context = 2 }"#,
+            "# ... through 9",
+            r#"# "Ctrl + Alt + Tab" = "previous_context""#,
+        ]
+        .join("\n");
+        assert!(include_str!("../sugarglider.default.toml").contains(&shipped));
+        let context_bindings = |config: &Config| -> Vec<(String, ContextCommand)> {
+            let mut bindings: Vec<_> = config
+                .keys
+                .iter()
+                .filter_map(|(hotkey, cmd)| match cmd {
+                    WmCommand::ReactorCommand(ReactorCommand::Context(cmd)) => {
+                        Some((hotkey.to_string(), cmd.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            bindings.sort_by(|a, b| a.0.cmp(&b.0));
+            bindings
+        };
+        assert!(context_bindings(&Config::default()).is_empty());
+
+        let uncommented: Vec<&str> = shipped
+            .lines()
+            .filter(|line| line.starts_with("# \"") && !line.contains("open_context_switcher"))
+            .map(|line| &line[2..])
+            .collect();
+        let config = Config::parse(&format!("[keys]\n{}", uncommented.join("\n"))).unwrap();
+        assert_eq!(
+            vec![
+                ("Ctrl + Alt + Digit0".to_string(), ContextCommand::ShowEverything),
+                (
+                    "Ctrl + Alt + Digit1".to_string(),
+                    ContextCommand::SwitchContext(ContextRef::Number(1))
+                ),
+                (
+                    "Ctrl + Alt + Digit2".to_string(),
+                    ContextCommand::SwitchContext(ContextRef::Number(2))
+                ),
+                ("Ctrl + Alt + Tab".to_string(), ContextCommand::PreviousContext),
+            ],
+            context_bindings(&config)
+        );
+    }
+
     /// R28.
     #[test]
     fn contexts_are_off_by_default_and_turn_on_with_their_flag() {
