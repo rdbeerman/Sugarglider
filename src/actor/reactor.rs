@@ -356,6 +356,8 @@ pub struct Reactor {
     frame_attempts: HashMap<WindowId, FrameAttempt>,
     record: Record,
     raise_manager_tx: raise::Sender,
+    /// The sequence id of the last raise request.
+    raise_sequence: u64,
     animation_tx: Option<animation::Sender>,
     mouse_tx: Option<mouse::Sender>,
     status_tx: Option<status::Sender>,
@@ -604,6 +606,7 @@ impl Reactor {
             frame_attempts: HashMap::default(),
             record,
             raise_manager_tx,
+            raise_sequence: 0,
             animation_tx: None,
             mouse_tx: None,
             status_tx: None,
@@ -1806,8 +1809,10 @@ impl Reactor {
         }
     }
 
-    fn handle_layout_response(&mut self, response: layout::EventResponse) {
-        self.handle_layout_response_with_context(response, ResponseContext::default());
+    /// Handles the layout's response, and returns the sequence id of the
+    /// raise request it made, if any.
+    fn handle_layout_response(&mut self, response: layout::EventResponse) -> Option<u64> {
+        self.handle_layout_response_with_context(response, ResponseContext::default())
     }
 
     fn handle_layout_response_with_context(
@@ -1817,7 +1822,7 @@ impl Reactor {
             visible_window_order,
             from_mouse,
         }: ResponseContext,
-    ) {
+    ) -> Option<u64> {
         if let Some(visible_window_order) = visible_window_order {
             response = self.filter_response(response, &visible_window_order);
         }
@@ -1837,7 +1842,7 @@ impl Reactor {
             }
         }
         if raise_windows.is_empty() && focus_window.is_none() {
-            return;
+            return None;
         }
 
         let mut app_handles = HashMap::default();
@@ -1867,13 +1872,17 @@ impl Reactor {
             (wid, warp)
         });
 
+        self.raise_sequence += 1;
+        let sequence_id = self.raise_sequence;
         let msg = raise::Event::RaiseRequest(RaiseRequest {
             raise_windows: windows_by_app_and_screen.into_values().collect(),
             focus_window: focus_window_with_warp,
             app_handles,
+            sequence_id,
         });
 
         _ = self.raise_manager_tx.send((Span::current(), msg));
+        Some(sequence_id)
     }
 
     fn filter_response(
@@ -2971,9 +2980,7 @@ pub mod tests {
         let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
         match msg {
             raise::Event::RaiseRequest(RaiseRequest {
-                raise_windows,
-                focus_window,
-                app_handles: _,
+                raise_windows, focus_window, ..
             }) => {
                 assert_eq!(raise_windows, vec![desired]);
                 assert!(focus_window.is_none());
@@ -3547,9 +3554,7 @@ pub mod tests {
         let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
         match msg {
             raise::Event::RaiseRequest(RaiseRequest {
-                raise_windows,
-                focus_window,
-                app_handles: _,
+                raise_windows, focus_window, ..
             }) => {
                 let raise_windows: HashSet<Vec<WindowId>> = raise_windows.into_iter().collect();
                 let expected = [

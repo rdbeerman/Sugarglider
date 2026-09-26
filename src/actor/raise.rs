@@ -46,6 +46,9 @@ pub struct RaiseRequest {
     /// The window to raise and focus last.
     pub focus_window: Option<(WindowId, Option<CGPoint>)>,
     pub app_handles: HashMap<i32, AppThreadHandle>,
+    /// The id of the request's sequence, which the reactor chooses. The
+    /// events of the sequence carry it. Ids increase with each request.
+    pub sequence_id: u64,
 }
 
 impl RaiseRequest {
@@ -61,7 +64,6 @@ pub struct RaiseManager {
     active_sequence: Option<ActiveSequence>,
     /// Queued sequences waiting to be processed
     queued_sequences: VecDeque<RaiseRequest>,
-    next_sequence_id: u64,
     mouse_tx: Option<mouse::Sender>,
 }
 
@@ -141,7 +143,6 @@ impl RaiseManager {
         Self {
             active_sequence: None,
             queued_sequences: VecDeque::new(),
-            next_sequence_id: 1,
             mouse_tx: None,
         }
     }
@@ -154,11 +155,14 @@ impl RaiseManager {
                     request.raise_windows.len()
                 );
 
-                // Drop duplicate requests that have no effect.
-                if self.queued_sequences.back().is_some_and(|last| last.matches(&request)) {
-                    debug!("Dropping raise request identical to the queued one");
-                } else {
-                    self.queued_sequences.push_back(request);
+                // A request identical to the queued one takes its place, so
+                // that the sequence runs once, with the newer id.
+                match self.queued_sequences.back_mut() {
+                    Some(last) if last.matches(&request) => {
+                        debug!("Replacing the queued raise request with an identical one");
+                        *last = request;
+                    }
+                    _ => self.queued_sequences.push_back(request),
                 }
             }
             Event::RaiseCompleted { window_id, sequence_id } => {
@@ -239,11 +243,9 @@ impl RaiseManager {
             raise_windows,
             focus_window,
             app_handles,
+            sequence_id,
         }: RaiseRequest,
     ) {
-        let sequence_id = self.next_sequence_id;
-        self.next_sequence_id += 1;
-
         // Send all raise requests with completion notification
         let mut pending_raises = HashSet::default();
         let raise_token = CancellationToken::new();
@@ -379,11 +381,13 @@ mod tests {
         raise_windows: Vec<WindowId>,
         focus_window: Option<(WindowId, Option<CGPoint>)>,
         app_handles: HashMap<i32, AppThreadHandle>,
+        sequence_id: u64,
     ) -> Event {
         Event::RaiseRequest(RaiseRequest {
             raise_windows: raise_windows.into_iter().map(|w| vec![w]).collect(),
             focus_window,
             app_handles,
+            sequence_id,
         })
     }
 
@@ -445,6 +449,7 @@ mod tests {
                 vec![WindowId::new(1, 1), WindowId::new(1, 2)],
                 Some((WindowId::new(1, 3), None)),
                 app_handles,
+                1,
             );
 
             // Handle the message synchronously
@@ -468,6 +473,7 @@ mod tests {
                 vec![WindowId::new(1, 1), WindowId::new(1, 2)],
                 Some((WindowId::new(1, 3), None)),
                 app_handles,
+                1,
             );
 
             raise_manager.handle_message(layout_msg);
@@ -502,7 +508,8 @@ mod tests {
             let mut raise_manager = RaiseManager::new();
             let (app_handles, _app_rx) = create_test_app_handles();
 
-            let layout_msg = create_layout_response(vec![WindowId::new(1, 1)], None, app_handles);
+            let layout_msg =
+                create_layout_response(vec![WindowId::new(1, 1)], None, app_handles, 1);
 
             raise_manager.handle_message(layout_msg);
 
@@ -534,6 +541,7 @@ mod tests {
                 vec![WindowId::new(1, 1), WindowId::new(1, 2)],
                 Some((WindowId::new(1, 3), Some(CGPoint::new(100.0, 200.0)))),
                 app_handles,
+                1,
             );
 
             raise_manager.handle_message(layout_msg);
@@ -591,6 +599,7 @@ mod tests {
                 vec![WindowId::new(1, 1), WindowId::new(1, 2)],
                 Some((WindowId::new(1, 3), None)),
                 app_handles,
+                1,
             );
 
             raise_manager.handle_message(layout_msg);
@@ -633,6 +642,7 @@ mod tests {
                 vec![WindowId::new(1, 1)],
                 Some((WindowId::new(1, 2), None)),
                 app_handles,
+                1,
             );
             raise_manager.handle_message(layout_msg);
 
@@ -675,17 +685,18 @@ mod tests {
         Executor::run(async {
             let mut raise_manager = RaiseManager::new();
             let (app_handles, _app_rx) = create_test_app_handles();
-            let request = || {
+            let request = |sequence_id| {
                 create_layout_response(
                     vec![WindowId::new(1, 1), WindowId::new(1, 2)],
                     Some((WindowId::new(1, 3), None)),
                     app_handles.clone(),
+                    sequence_id,
                 )
             };
 
             // The first becomes active; the rest would pile up behind it.
-            for _ in 0..10 {
-                raise_manager.handle_message(request());
+            for sequence_id in 1..=10 {
+                raise_manager.handle_message(request(sequence_id));
             }
 
             assert_eq!(raise_manager.active_sequence.as_ref().unwrap().sequence_id, 1);
@@ -696,6 +707,9 @@ mod tests {
                     Some(WindowId::new(1, 3))
                 )]
             );
+            // The queued sequence has the newest id, so that events with the
+            // id of the last request arrive.
+            assert_eq!(10, raise_manager.queued_sequences[0].sequence_id);
         });
     }
 
@@ -710,11 +724,13 @@ mod tests {
                 vec![WindowId::new(1, 1)],
                 Some((WindowId::new(1, 2), None)),
                 app_handles.clone(),
+                1,
             );
             let msg2 = create_layout_response(
                 vec![WindowId::new(1, 3)],
                 Some((WindowId::new(1, 4), None)),
                 app_handles.clone(),
+                2,
             );
 
             raise_manager.handle_message(msg1);
@@ -794,6 +810,7 @@ mod tests {
                 vec![WindowId::new(1, 1)],
                 Some((WindowId::new(1, 2), None)),
                 app_handles.clone(),
+                1,
             );
             raise_manager.handle_message(msg);
 
@@ -829,6 +846,7 @@ mod tests {
                 vec![WindowId::new(1, 1)],
                 Some((WindowId::new(1, 2), None)),
                 app_handles.clone(),
+                1,
             );
             raise_manager.handle_message(msg);
             _ = collect_requests(&mut app_rx);
@@ -858,16 +876,19 @@ mod tests {
                 vec![WindowId::new(1, 1)],
                 Some((WindowId::new(1, 2), None)),
                 app_handles.clone(),
+                1,
             );
             let msg2 = create_layout_response(
                 vec![],
                 Some((WindowId::new(1, 3), None)),
                 app_handles.clone(),
+                2,
             );
             let msg3 = create_layout_response(
                 vec![WindowId::new(1, 4)],
                 Some((WindowId::new(1, 5), None)),
                 app_handles.clone(),
+                3,
             );
 
             // Queue all three sequences
@@ -968,6 +989,7 @@ mod tests {
                 raise_windows: batched_windows,
                 focus_window: Some((WindowId::new(1, 7), None)),
                 app_handles,
+                sequence_id: 1,
             });
 
             // Handle the batched raise request
