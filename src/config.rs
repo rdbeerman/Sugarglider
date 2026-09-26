@@ -658,11 +658,13 @@ fn write_preferences_to_path(
         doc.remove("window_rules");
     }
 
-    // Update [keys] section
-    if !prefs.hotkeys.is_empty() {
+    // Update [keys] section, only when a binding changed. No bindings at all
+    // means that the window has none to show, not that the user removed them.
+    let bindings = prefs.bindings();
+    if !bindings.is_empty() && sorted_bindings(&bindings) != sorted_bindings(&current_config.keys) {
         let file_keys = keys_in_file(&existing)?;
         let default_keys = current_config.settings.default_keys;
-        let entries = keys_entries(&prefs.bindings(), default_keys, &file_keys);
+        let entries = keys_entries(&bindings, default_keys, &file_keys);
         set_keys_table(&mut doc, &file_keys, entries);
     }
 
@@ -687,9 +689,20 @@ fn keys_in_file(file: &str) -> anyhow::Result<FxHashMap<String, serde_json::Valu
     keys.collect()
 }
 
+/// Key bindings as sorted pairs of a key and a command, for comparison.
+fn sorted_bindings(bindings: &[(Hotkey, WmCommand)]) -> Vec<(String, String)> {
+    let mut bindings: Vec<_> = bindings
+        .iter()
+        .map(|(hotkey, cmd)| (hotkey.to_string(), command_json(cmd).to_string()))
+        .collect();
+    bindings.sort();
+    bindings
+}
+
 /// The `[keys]` entries that bind `bindings`, as JSON. With `default_keys`,
-/// each default key that isn't bound is disabled. A key that `file_keys`
-/// disables stays disabled unless it is bound.
+/// the default bindings are left out, and each default key that isn't bound
+/// is disabled. A key that `file_keys` disables stays disabled unless it is
+/// bound.
 fn keys_entries(
     bindings: &[(Hotkey, WmCommand)],
     default_keys: bool,
@@ -697,22 +710,26 @@ fn keys_entries(
 ) -> Vec<(Hotkey, serde_json::Value)> {
     let disable = serde_json::to_value(Disabled::Disable).unwrap();
     let is_bound = |hotkey: &Hotkey| bindings.iter().any(|(bound, _)| bound == hotkey);
+    let defaults: Vec<(Hotkey, serde_json::Value)> = if default_keys {
+        let defaults = Config::default().keys;
+        defaults.iter().map(|(hotkey, cmd)| (*hotkey, command_json(cmd))).collect()
+    } else {
+        Vec::new()
+    };
 
     let mut entries: Vec<(Hotkey, serde_json::Value)> = Vec::new();
     for (hotkey, cmd) in bindings {
         // A key bound twice keeps the last binding, as in a TOML table.
         entries.retain(|(entry, _)| entry != hotkey);
-        entries.push((*hotkey, command_json(cmd)));
+        let binding = (*hotkey, command_json(cmd));
+        if !defaults.contains(&binding) {
+            entries.push(binding);
+        }
     }
     let disabled_in_file = file_keys
         .iter()
         .filter(|(_, value)| **value == disable)
         .filter_map(|(key, _)| Hotkey::from_str(key).ok());
-    let defaults = if default_keys {
-        Config::default().keys
-    } else {
-        Vec::new()
-    };
     for hotkey in disabled_in_file.chain(defaults.iter().map(|(hotkey, _)| *hotkey)) {
         if !is_bound(&hotkey) && !entries.iter().any(|(entry, _)| *entry == hotkey) {
             entries.push((hotkey, disable.clone()));
@@ -1510,17 +1527,6 @@ mod tests {
         }
     }
 
-    /// Key bindings as sorted pairs of a hotkey and a command.
-    fn sorted_bindings(config: &Config) -> Vec<(String, String)> {
-        let mut bindings: Vec<_> = config
-            .keys
-            .iter()
-            .map(|(hotkey, cmd)| (hotkey.to_string(), command_json(cmd).to_string()))
-            .collect();
-        bindings.sort();
-        bindings
-    }
-
     /// The Preferences window's JSON for `config`, as Swift sends it back.
     fn preferences_for(config: &Config) -> PreferencesJson {
         let json = serde_json::to_string(&PreferencesJson::from_config(config)).unwrap();
@@ -1572,10 +1578,10 @@ mod tests {
         rebind(&mut prefs, "⌃⌥⇧H", "⌃⌥⇧Y");
 
         let running = prefs.apply_to_config(&config);
-        assert_eq!(sorted_bindings(&expected), sorted_bindings(&running));
+        assert_eq!(sorted_bindings(&expected.keys), sorted_bindings(&running.keys));
         write_preferences_to_path(&prefs, &path).unwrap();
         let saved = Config::load(Some(&path)).unwrap();
-        assert_eq!(sorted_bindings(&expected), sorted_bindings(&saved));
+        assert_eq!(sorted_bindings(&expected.keys), sorted_bindings(&saved.keys));
 
         // The window keeps its bindings for the next change.
         rebind(&mut prefs, "⌥W", "⌥R");
@@ -1591,10 +1597,10 @@ mod tests {
         .unwrap();
 
         let running = prefs.apply_to_config(&running);
-        assert_eq!(sorted_bindings(&expected), sorted_bindings(&running));
+        assert_eq!(sorted_bindings(&expected.keys), sorted_bindings(&running.keys));
         write_preferences_to_path(&prefs, &path).unwrap();
         let saved = Config::load(Some(&path)).unwrap();
-        assert_eq!(sorted_bindings(&expected), sorted_bindings(&saved));
+        assert_eq!(sorted_bindings(&expected.keys), sorted_bindings(&saved.keys));
     }
 
     /// With `default_keys = true`, the "disable" entries and their comments
@@ -1625,7 +1631,11 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).unwrap();
         let saved = Config::load(Some(&path)).unwrap();
-        assert_eq!(sorted_bindings(&config), sorted_bindings(&saved), "{written}");
+        assert_eq!(
+            sorted_bindings(&config.keys),
+            sorted_bindings(&saved.keys),
+            "{written}"
+        );
         for line in disabled {
             assert!(written.contains(line), "{written}");
         }
@@ -1636,10 +1646,141 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         let saved = Config::load(Some(&path)).unwrap();
         let running = prefs.apply_to_config(&config);
-        assert_eq!(sorted_bindings(&running), sorted_bindings(&saved), "{written}");
+        assert_eq!(
+            sorted_bindings(&running.keys),
+            sorted_bindings(&saved.keys),
+            "{written}"
+        );
         assert!(!saved.keys.iter().any(|(hotkey, _)| [alt_s, alt_t].contains(hotkey)));
         for line in disabled {
             assert!(written.contains(line), "{written}");
+        }
+    }
+
+    /// Every default binding comes back unchanged through the Preferences
+    /// window's JSON, so a save that changes no binding finds none changed.
+    #[test]
+    fn default_bindings_survive_the_preferences_json() {
+        let config = Config::default();
+        let prefs = preferences_for(&config);
+        assert_eq!(config.keys.len(), prefs.hotkeys.len());
+        assert_eq!(sorted_bindings(&config.keys), sorted_bindings(&prefs.bindings()));
+    }
+
+    /// The `[keys]` table of a saved file, with each key parsed and each
+    /// value as JSON.
+    fn saved_keys(written: &str) -> Vec<(String, String)> {
+        let table: toml::Table = toml::from_str(written).unwrap();
+        let mut keys: Vec<_> = table["keys"]
+            .as_table()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| {
+                let hotkey = Hotkey::from_str(key).unwrap().to_string();
+                (hotkey, serde_json::to_value(value).unwrap().to_string())
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Changing only a setting leaves the key bindings of the file alone,
+    /// so a file without `[keys]` gets none.
+    #[test]
+    fn preferences_add_no_keys_when_no_binding_changed() {
+        let files = [
+            None,
+            Some("[settings]\nanimate = true\n"),
+            Some("[settings]\ndefault_keys = true\n"),
+        ];
+        for file in files {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("glide.toml");
+            if let Some(file) = file {
+                std::fs::write(&path, file).unwrap();
+            }
+            let config = Config::parse(file.unwrap_or_default()).unwrap();
+
+            let mut prefs = preferences_for(&config);
+            prefs.animate = false;
+            write_preferences_to_path(&prefs, &path).unwrap();
+
+            let written = std::fs::read_to_string(&path).unwrap();
+            let table: toml::Table = toml::from_str(&written).unwrap();
+            assert!(!table.contains_key("keys"), "{written}");
+            let saved = Config::load(Some(&path)).unwrap();
+            assert!(!saved.settings.animate);
+            assert_eq!(sorted_bindings(&config.keys), sorted_bindings(&saved.keys));
+        }
+    }
+
+    /// With `default_keys = true`, `[keys]` holds only what differs from the
+    /// defaults: a moved default binding on its new key, and "disable" on
+    /// its old key. Moving it back empties the table.
+    #[test]
+    fn preferences_save_only_changed_bindings_with_default_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(&path, "[settings]\ndefault_keys = true\n").unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+
+        let mut prefs = preferences_for(&config);
+        rebind(&mut prefs, "⌥S", "⌥G");
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            vec![
+                ("Alt + KeyG".to_string(), r#"{"group":"vertical"}"#.to_string()),
+                ("Alt + KeyS".to_string(), r#""disable""#.to_string()),
+            ],
+            saved_keys(&written),
+            "{written}"
+        );
+        let saved = Config::load(Some(&path)).unwrap();
+        let running = prefs.apply_to_config(&config);
+        assert_eq!(sorted_bindings(&running.keys), sorted_bindings(&saved.keys));
+
+        rebind(&mut prefs, "⌥G", "⌥S");
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(Vec::<(String, String)>::new(), saved_keys(&written), "{written}");
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(sorted_bindings(&config.keys), sorted_bindings(&saved.keys));
+    }
+
+    /// With `default_keys = false`, `[keys]` holds every binding once one
+    /// changes, and an entry that stays keeps its comment. A file without
+    /// `[keys]` has the default bindings, which it then holds.
+    #[test]
+    fn preferences_save_every_binding_without_default_keys() {
+        let files = [
+            (
+                "[settings]\ndefault_keys = false\n\n[keys]\n# Terminal\n\
+                 \"Alt + Q\" = { exec = \"open -a Terminal\" }\n\"Alt + W\" = \"debug\"\n",
+                ("⌥W", "⌥E"),
+            ),
+            ("[settings]\nanimate = true\n", ("⌥S", "⌥G")),
+        ];
+        for (file, (from, to)) in files {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("glide.toml");
+            std::fs::write(&path, file).unwrap();
+            let config = Config::load(Some(&path)).unwrap();
+
+            let mut prefs = preferences_for(&config);
+            rebind(&mut prefs, from, to);
+            write_preferences_to_path(&prefs, &path).unwrap();
+
+            let written = std::fs::read_to_string(&path).unwrap();
+            let running = prefs.apply_to_config(&config);
+            assert_eq!(sorted_bindings(&running.keys), saved_keys(&written), "{written}");
+            let saved = Config::load(Some(&path)).unwrap();
+            assert_eq!(sorted_bindings(&running.keys), sorted_bindings(&saved.keys));
+            for comment in file.lines().filter(|line| line.starts_with('#')) {
+                assert!(written.contains(comment), "{written}");
+            }
         }
     }
 
