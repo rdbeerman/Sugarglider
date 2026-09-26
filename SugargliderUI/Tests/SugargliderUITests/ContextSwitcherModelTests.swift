@@ -624,6 +624,31 @@ final class ContextSwitcherModelTests: XCTestCase {
     XCTAssertEqual(closed, 1)
   }
 
+  /// The edit view checks a window on screen when one of the context's
+  /// records has it. The records are the only membership in the payload.
+  func testEditChecksTheWindowsThatTheContextsRecordsHave() throws {
+    var payload = try Fixtures.payload()
+    payload.contexts[1].members = [
+      SwitcherMember(record: 0, app: "Slack", title: "general", window: Fixtures.slack)
+    ]
+    let model = try makeModel(payload)
+    model.handle(.commandE)
+    XCTAssertEqual(model.mode, .edit(Fixtures.clientWork))
+    XCTAssertEqual(
+      model.checklist.map(\.source),
+      [Fixtures.ghostty, Fixtures.chrome, Fixtures.whatsApp, Fixtures.finder, Fixtures.slack]
+        .map { .window($0) }
+    )
+    XCTAssertEqual(model.checklist.map(\.checked), [false, false, false, false, true])
+
+    model.toggleItem(at: 4)
+    model.handle(.enter)
+    XCTAssertEqual(
+      backend.sent,
+      [.edit(context: Fixtures.clientWork, add: [], remove: [Fixtures.slack], removeRecords: [])]
+    )
+  }
+
   func testEditWithoutChangesClosesWithoutACommand() throws {
     let model = try makeModel()
     model.handle(.commandE)

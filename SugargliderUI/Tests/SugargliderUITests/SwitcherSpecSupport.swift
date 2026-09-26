@@ -33,16 +33,9 @@ enum SpecPayload {
     _ id: SwitcherWindowId,
     _ title: String,
     _ app: String,
-    in contexts: [UInt32] = [],
     pinned: Bool = false
   ) -> SwitcherWindow {
-    SwitcherWindow(
-      id: id,
-      title: title,
-      app: app,
-      contexts: contexts.map { SwitcherContextId(id: $0) },
-      pinned: pinned
-    )
+    SwitcherWindow(id: id, title: title, app: app, pinned: pinned)
   }
 
   /// A payload for the first time: no named context, Everything active.

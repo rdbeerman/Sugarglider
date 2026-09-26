@@ -521,8 +521,9 @@ final class ContextSwitcherModel: ObservableObject {
 
   private func startEdit(_ context: SwitcherContext) {
     let onScreen = Set(payload.windows.map(\.id))
+    let members = Set(context.members.compactMap(\.window))
     var items = payload.windows.map { window in
-      let member = window.contexts.contains(context.contextId)
+      let member = members.contains(window.id)
       return SwitcherChecklistItem(
         source: .window(window.id),
         title: window.title,

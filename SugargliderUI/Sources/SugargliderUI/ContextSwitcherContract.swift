@@ -83,15 +83,15 @@ import Foundation
 ///   "everything": { "active": false, "hotkey": "⌃⌥0" },
 ///   "windows": [
 ///     { "id": { "pid": 640, "idx": 8812 }, "title": "~/src/sugarglider",
-///       "app": "Ghostty", "contexts": [{ "id": 1 }], "pinned": false },
+///       "app": "Ghostty", "pinned": false },
 ///     { "id": { "pid": 812, "idx": 9123 }, "title": "Docs",
-///       "app": "Google Chrome", "contexts": [{ "id": 1 }], "pinned": false },
+///       "app": "Google Chrome", "pinned": false },
 ///     { "id": { "pid": 903, "idx": 9201 }, "title": "WhatsApp",
-///       "app": "WhatsApp", "contexts": [], "pinned": true },
+///       "app": "WhatsApp", "pinned": true },
 ///     { "id": { "pid": 977, "idx": 9310 }, "title": "Downloads",
-///       "app": "Finder", "contexts": [], "pinned": false },
+///       "app": "Finder", "pinned": false },
 ///     { "id": { "pid": 988, "idx": 9402 }, "title": "general",
-///       "app": "Slack", "contexts": [], "pinned": false }
+///       "app": "Slack", "pinned": false }
 ///   ]
 /// }
 /// ```
@@ -119,8 +119,8 @@ import Foundation
 ///   These are the tracked windows that show now on the visible Spaces (the
 ///   focused screen in `per_screen` scope), including the target window.
 ///   They leave out parked windows, Sugarglider's own windows, and untracked
-///   windows. `contexts` lists the named contexts that hold the window.
-///   `pinned` says whether it is pinned (R3).
+///   windows. `pinned` says whether it is pinned (R3). Which contexts hold
+///   a window is only in `contexts[].members`.
 ///
 /// Exactly one of the `active` flags is true. A key whose value can be null
 /// may also be missing.
@@ -400,7 +400,6 @@ struct SwitcherWindow: Codable, Equatable, Sendable {
   var id: SwitcherWindowId
   var title: String
   var app: String
-  var contexts: [SwitcherContextId]
   var pinned: Bool
 }
 

@@ -53,9 +53,9 @@ final class SwitcherChecklistSpecTests: SwitcherSpecTestCase {
       unsorted: SwitcherUnsorted(windows: 1, active: false),
       everything: SwitcherEverything(active: false, hotkey: "⌃⌥0"),
       windows: [
-        SpecPayload.window(whatsApp, "WhatsApp", "WhatsApp", in: [2, 3]),
-        SpecPayload.window(mail, "Inbox", "Mail", in: [2]),
-        SpecPayload.window(safari, "News", "Safari", in: [3]),
+        SpecPayload.window(whatsApp, "WhatsApp", "WhatsApp"),
+        SpecPayload.window(mail, "Inbox", "Mail"),
+        SpecPayload.window(safari, "News", "Safari"),
         SpecPayload.window(terminal, "zsh", "Terminal"),
       ]
     )
@@ -187,7 +187,7 @@ final class SwitcherChecklistSpecTests: SwitcherSpecTestCase {
         "everything": { "active": false },
         "windows": [
           { "id": { "pid": 650, "idx": 7001 }, "title": "Inbox", "app": "Mail",
-            "contexts": [{ "id": 5 }], "pinned": false }
+            "pinned": false }
         ]
       }
       """

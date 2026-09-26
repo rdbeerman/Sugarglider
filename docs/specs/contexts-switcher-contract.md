@@ -71,15 +71,15 @@ The reactor logs failures that come later, for example a failed journal write (R
   "everything": { "active": false, "hotkey": "⌃⌥0" },
   "windows": [
     { "id": { "pid": 640, "idx": 8812 }, "title": "~/src/sugarglider",
-      "app": "Ghostty", "contexts": [{ "id": 1 }], "pinned": false },
+      "app": "Ghostty", "pinned": false },
     { "id": { "pid": 812, "idx": 9123 }, "title": "Docs",
-      "app": "Google Chrome", "contexts": [{ "id": 1 }], "pinned": false },
+      "app": "Google Chrome", "pinned": false },
     { "id": { "pid": 903, "idx": 9201 }, "title": "WhatsApp",
-      "app": "WhatsApp", "contexts": [], "pinned": true },
+      "app": "WhatsApp", "pinned": true },
     { "id": { "pid": 977, "idx": 9310 }, "title": "Downloads",
-      "app": "Finder", "contexts": [], "pinned": false },
+      "app": "Finder", "pinned": false },
     { "id": { "pid": 988, "idx": 9402 }, "title": "general",
-      "app": "Slack", "contexts": [], "pinned": false }
+      "app": "Slack", "pinned": false }
   ]
 }
 ```
@@ -110,10 +110,11 @@ In this example the Zed window (record 1) is open but not on screen (another Spa
 | `windows` | array | The windows on screen that the create and edit views list: the tracked windows that show now on the visible Spaces (the focused screen in `per_screen` scope), including the target window. Leave out parked windows, Sugarglider's own windows, and untracked windows. |
 | `windows[].id` | window | The window. |
 | `windows[].title`, `windows[].app` | string | Its title and app name. |
-| `windows[].contexts` | array of `{"id": N}` | The named contexts that hold the window. |
 | `windows[].pinned` | bool | Whether it is pinned (R3). |
 
 Exactly one of the `active` flags is true. Keys whose type says "or null" may also be missing.
+
+Which contexts hold a window is only in `contexts[].members`: a window is a member of a context when one of the context's records has it as `window`. The edit view checks a window on screen by that rule.
 
 ## Rank result
 
