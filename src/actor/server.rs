@@ -210,7 +210,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::actor::contexts_snapshot::ScreenContext;
+    use crate::actor::contexts_snapshot::{
+        ContextSummary, EverythingSummary, Scope, ScreenContext, UnsortedSummary,
+    };
     use crate::actor::reactor::ContextRef;
     use crate::model::contexts::{ContextId, ContextKey, Contexts};
 
@@ -417,6 +419,387 @@ mod tests {
             let (response, sent) = answer_context_request(request, None);
             assert_eq!(None, sent);
             assert!(matches!(response, Response::Error(_)), "{response:?}");
+        }
+    }
+
+    /// The requests of Sugarglider before contexts, as an older client sends
+    /// them and an older server reads them.
+    #[derive(Serialize, Deserialize, Debug)]
+    enum RequestBeforeContexts {
+        Ping(String),
+        UpdateConfig(Config),
+        Service(ServiceRequestBeforeContexts),
+        SetEnabled(bool),
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    enum ServiceRequestBeforeContexts {
+        Install,
+        Uninstall,
+    }
+
+    /// The replies of Sugarglider before contexts.
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    enum ResponseBeforeContexts {
+        Pong(String),
+        Success,
+        Error(String),
+    }
+
+    /// A name with a quote, a backslash, a newline, and letters outside
+    /// ASCII.
+    const ODD_NAME: &str = "Say \"hi\" \\ to Café ☕\nnow";
+
+    fn context_id(id: u32) -> ContextId {
+        serde_json::from_value(serde_json::json!(id)).unwrap()
+    }
+
+    /// A context request for each form of every command.
+    fn every_context_request() -> Vec<ContextRequest> {
+        vec![
+            ContextRequest::List,
+            ContextRequest::Current,
+            run(switch(ContextRef::Number(1))),
+            run(switch(ContextRef::Number(9))),
+            run(switch(name("Client work"))),
+            run(switch(name(ODD_NAME))),
+            run(switch(name(""))),
+            run(switch(name("Id(7)"))),
+            run(switch(ContextRef::Id(context_id(7)))),
+            run(ContextCommand::ShowEverything),
+            run(ContextCommand::PreviousContext),
+            run(ContextCommand::CreateContext("Client work".into())),
+            run(ContextCommand::CreateContext(ODD_NAME.into())),
+            run(ContextCommand::CreateContext(String::new())),
+        ]
+    }
+
+    /// I2. Every request survives the RON round trip, names that need
+    /// escaping included. A name that looks like a tagged id stays a name.
+    #[test]
+    fn every_request_survives_a_ron_round_trip() {
+        let mut requests = vec![
+            Request::Ping(ODD_NAME.into()),
+            Request::Service(ServiceRequest::Install),
+            Request::Service(ServiceRequest::Uninstall),
+            Request::SetEnabled(true),
+            Request::SetEnabled(false),
+        ];
+        requests.extend(every_context_request().into_iter().map(Request::Context));
+        for request in requests {
+            let text = ron::ser::to_string(&request).unwrap();
+            let back: Request = ron::de::from_str(&text).unwrap();
+            assert_eq!(format!("{request:?}"), format!("{back:?}"), "{text}");
+        }
+        assert_eq!(
+            run(switch(name("Id(7)"))),
+            read("Context(Run(switch_context(\"Id(7)\")))")
+        );
+
+        let config = Config::default();
+        let text = ron::ser::to_string(&Request::UpdateConfig(Config::default())).unwrap();
+        let Request::UpdateConfig(back) = ron::de::from_str(&text).unwrap() else {
+            panic!("{text}")
+        };
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::to_value(&back).unwrap()
+        );
+    }
+
+    /// A snapshot with every kind of entry on some screen, a context without
+    /// a number, and names that need escaping.
+    fn snapshot_of_every_kind() -> ContextsSnapshot {
+        ContextsSnapshot {
+            enabled: true,
+            scope: Scope::Global,
+            active: ContextKey::Named(context_id(2)),
+            screens: vec![
+                ScreenContext {
+                    id: 1,
+                    shows: ContextKey::Named(context_id(2)),
+                },
+                ScreenContext {
+                    id: 2,
+                    shows: ContextKey::Everything,
+                },
+                ScreenContext {
+                    id: 4,
+                    shows: ContextKey::Unsorted,
+                },
+            ],
+            contexts: vec![
+                ContextSummary {
+                    id: context_id(1),
+                    name: ODD_NAME.into(),
+                    number: None,
+                    last_used: 0,
+                    apps: vec![],
+                    windows: 0,
+                },
+                ContextSummary {
+                    id: context_id(2),
+                    name: "Café".into(),
+                    number: Some(9),
+                    last_used: 7,
+                    apps: vec!["Zed".into(), "Microsoft Teams (work or school)".into()],
+                    windows: 3,
+                },
+            ],
+            unsorted: UnsortedSummary { windows: 4, last_used: 6 },
+            everything: EverythingSummary { last_used: 5 },
+        }
+    }
+
+    /// I2. Every reply survives the RON round trip, including a snapshot
+    /// with each kind of entry.
+    #[test]
+    fn every_response_survives_a_ron_round_trip() {
+        let (_, snapshot) = contexts();
+        let mut everything = snapshot.clone();
+        everything.active = ContextKey::Everything;
+        everything.screens[0].shows = ContextKey::Everything;
+        for response in [
+            Response::Pong(ODD_NAME.into()),
+            Response::Success,
+            Response::Error(ODD_NAME.into()),
+            Response::Contexts(snapshot_of_every_kind()),
+            Response::Contexts(snapshot.current()),
+            Response::Contexts(everything.current()),
+            Response::Contexts(ContextsSnapshot::off()),
+        ] {
+            let text = ron::ser::to_string(&response).unwrap();
+            assert_eq!(response, ron::de::from_str::<Response>(&text).unwrap(), "{text}");
+        }
+    }
+
+    /// I2. A client from before contexts writes the requests it shares with
+    /// this server exactly as this server's client does, and reads this
+    /// server's replies to them. It pings, pauses, and sends a config.
+    #[test]
+    fn an_older_client_is_answered_as_before() {
+        use RequestBeforeContexts as Old;
+        for (old, new) in [
+            (Old::Ping(ODD_NAME.into()), Request::Ping(ODD_NAME.into())),
+            (
+                Old::Service(ServiceRequestBeforeContexts::Install),
+                Request::Service(ServiceRequest::Install),
+            ),
+            (
+                Old::Service(ServiceRequestBeforeContexts::Uninstall),
+                Request::Service(ServiceRequest::Uninstall),
+            ),
+            (Old::SetEnabled(true), Request::SetEnabled(true)),
+            (Old::SetEnabled(false), Request::SetEnabled(false)),
+        ] {
+            let text = ron::ser::to_string(&old).unwrap();
+            assert_eq!(text, ron::ser::to_string(&new).unwrap());
+            let read: Request = ron::de::from_str(&text).unwrap();
+            assert_eq!(format!("{new:?}"), format!("{read:?}"));
+        }
+        for (old, new) in [
+            (
+                ResponseBeforeContexts::Pong("olleh".into()),
+                Response::Pong("olleh".into()),
+            ),
+            (ResponseBeforeContexts::Success, Response::Success),
+            (
+                ResponseBeforeContexts::Error("No".into()),
+                Response::Error("No".into()),
+            ),
+        ] {
+            assert_eq!(
+                ron::ser::to_string(&old).unwrap(),
+                ron::ser::to_string(&new).unwrap()
+            );
+        }
+
+        let (wm_tx, mut wm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = State {
+            wm_tx,
+            contexts: Box::new(|| None),
+        };
+        let mut send = |request: Old| -> ResponseBeforeContexts {
+            let message = ron::ser::to_string(&request).unwrap();
+            let reply = state.handle_message(0, message.as_bytes());
+            ron::de::from_bytes(&reply).unwrap()
+        };
+        assert_eq!(
+            ResponseBeforeContexts::Pong("olleh".into()),
+            send(Old::Ping("hello".into()))
+        );
+        assert_eq!(ResponseBeforeContexts::Success, send(Old::SetEnabled(false)));
+        assert_eq!(
+            ResponseBeforeContexts::Success,
+            send(Old::UpdateConfig(Config::default()))
+        );
+        let (_, event) = wm_rx.try_recv().unwrap();
+        assert!(
+            matches!(
+                event,
+                wm_controller::WmEvent::Command(wm_controller::WmCommand::Wm(
+                    wm_controller::WmCmd::SetGlobalEnabled(false)
+                ))
+            ),
+            "{event:?}"
+        );
+        let (_, event) = wm_rx.try_recv().unwrap();
+        assert!(
+            matches!(event, wm_controller::WmEvent::ConfigUpdated(_)),
+            "{event:?}"
+        );
+        assert!(wm_rx.try_recv().is_err());
+    }
+
+    /// I4. A server from before contexts can't read any context request, so
+    /// it replies with nothing.
+    #[test]
+    fn an_older_server_cannot_read_a_context_request() {
+        for request in every_context_request() {
+            let text = ron::ser::to_string(&Request::Context(request)).unwrap();
+            assert!(
+                ron::de::from_str::<RequestBeforeContexts>(&text).is_err(),
+                "{text}"
+            );
+        }
+    }
+
+    /// I3. The server reads context requests in RON and replies in RON.
+    /// `List` and `Current` reply from the snapshot, and `Run` sends one
+    /// command. A message it can't read gets an empty reply and sends
+    /// nothing.
+    #[test]
+    fn the_server_answers_context_requests_in_ron() {
+        let (contexts, snapshot) = contexts();
+        let published = Arc::new(snapshot.clone());
+        let (wm_tx, mut wm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = State {
+            wm_tx,
+            contexts: Box::new(move || Some(published.clone())),
+        };
+        let mut send = |message: &[u8]| state.handle_message(0, message);
+        let reply = |bytes: Vec<u8>| ron::de::from_bytes::<Response>(&bytes).unwrap();
+
+        assert_eq!(
+            Response::Contexts(snapshot.clone()),
+            reply(send(b"Context(List)"))
+        );
+        assert_eq!(
+            Response::Contexts(snapshot.current()),
+            reply(send(b"Context(Current)"))
+        );
+        assert_eq!(
+            Response::Error("No context has the number 5".into()),
+            reply(send(b"Context(Run(switch_context(5)))"))
+        );
+        assert_eq!(
+            Response::Success,
+            reply(send(b"Context(Run(switch_context(\"cli\")))"))
+        );
+        for unreadable in [
+            &b"Context(Delete)"[..],
+            b"Context(Run(delete_context(1)))",
+            b"Context(Run(switch_context(300)))",
+            b"",
+            b"\xff\xfe",
+        ] {
+            assert!(send(unreadable).is_empty(), "{}", AsciiEscaped(unreadable));
+        }
+
+        let (_, event) = wm_rx.try_recv().unwrap();
+        let wm_controller::WmEvent::Command(wm_controller::WmCommand::ReactorCommand(
+            reactor::Command::Context(command),
+        )) = event
+        else {
+            panic!("{event:?}");
+        };
+        assert_eq!(switch(ContextRef::Id(id(&contexts, "Client work"))), command);
+        assert!(wm_rx.try_recv().is_err());
+    }
+
+    /// Comms (1, active), Client work (2), and Relax (no number), with 2
+    /// unsorted windows, and the id of a deleted context.
+    fn three_contexts() -> (Contexts, ContextsSnapshot, ContextId) {
+        let mut contexts = Contexts::new();
+        let comms = contexts.create("Comms").unwrap();
+        contexts.create("Client work").unwrap();
+        let relax = contexts.create("Relax").unwrap();
+        let gone = contexts.create("Gone").unwrap();
+        contexts.delete(gone).unwrap();
+        contexts.set_number(relax, None).unwrap();
+        contexts.switch_to(ContextKey::Named(comms)).unwrap();
+        let screens = vec![ScreenContext {
+            id: 1,
+            shows: ContextKey::Named(comms),
+        }];
+        let snapshot = ContextsSnapshot::new(&contexts, screens, 2);
+        (contexts, snapshot, gone)
+    }
+
+    /// I3, R4, R29. How the server resolves each form of reference against
+    /// the snapshot, and which names it refuses for a new context. A name
+    /// that matches nothing goes to the reactor as it is, and every other
+    /// failed lookup fails at once.
+    #[test]
+    fn run_resolves_each_form_of_reference_as_this_table_gives() {
+        let (contexts, snapshot, gone) = three_contexts();
+        let comms = switch(ContextRef::Id(id(&contexts, "Comms")));
+        let client = switch(ContextRef::Id(id(&contexts, "Client work")));
+        let relax = switch(ContextRef::Id(id(&contexts, "Relax")));
+        let unsorted = switch(name("Unsorted"));
+        let everything = ContextCommand::ShowEverything;
+        let create = |name: &str| ContextCommand::CreateContext(name.to_string());
+        let no_name = "Give the name or the number of a context";
+        let taken = "A context named \"Comms\" already exists";
+        let table: Vec<(ContextCommand, Result<ContextCommand, &str>)> = vec![
+            (switch(ContextRef::Number(1)), Ok(comms.clone())),
+            (switch(ContextRef::Number(2)), Ok(client.clone())),
+            (switch(ContextRef::Number(3)), Err("No context has the number 3")),
+            (switch(ContextRef::Number(0)), Err("No context has the number 0")),
+            (switch(ContextRef::Number(9)), Err("No context has the number 9")),
+            (switch(ContextRef::Id(id(&contexts, "Relax"))), Ok(relax.clone())),
+            (switch(ContextRef::Id(gone)), Err("No such context")),
+            (switch(name("Comms")), Ok(comms.clone())),
+            (switch(name("  COMMS  ")), Ok(comms.clone())),
+            (switch(name("cómms")), Ok(comms.clone())),
+            (switch(name("Client work")), Ok(client.clone())),
+            (switch(name("cli")), Ok(client.clone())),
+            (switch(name("cw")), Ok(client.clone())),
+            (switch(name("work")), Ok(client.clone())),
+            (switch(name("rlx")), Ok(relax.clone())),
+            (switch(name("Everything")), Ok(everything.clone())),
+            (switch(name("ÉVERYTHING")), Ok(everything.clone())),
+            (switch(name("Unsorted")), Ok(unsorted.clone())),
+            (switch(name("uns")), Ok(unsorted.clone())),
+            (switch(name("Sugarglider")), Ok(switch(name("Sugarglider")))),
+            (switch(name("7")), Ok(switch(name("7")))),
+            (switch(name("--")), Ok(switch(name("--")))),
+            (switch(name("")), Err(no_name)),
+            (switch(name(" \t ")), Err(no_name)),
+            (everything.clone(), Ok(everything.clone())),
+            (
+                ContextCommand::PreviousContext,
+                Ok(ContextCommand::PreviousContext),
+            ),
+            (create("Work"), Ok(create("Work"))),
+            (create(ODD_NAME), Ok(create(ODD_NAME))),
+            (create("comms"), Err(taken)),
+            (create(" Cómms "), Err(taken)),
+            (create("everything"), Err("\"everything\" is a reserved name")),
+            (create(" UNSORTED "), Err("\"UNSORTED\" is a reserved name")),
+            (create(""), Err("A context name can't be empty")),
+            (create(" \t "), Err("A context name can't be empty")),
+        ];
+        for (command, expected) in table {
+            let expected = match expected {
+                Ok(sent) => (Response::Success, Some(sent)),
+                Err(reason) => (Response::Error(reason.to_string()), None),
+            };
+            assert_eq!(
+                expected,
+                answer_context_request(run(command.clone()), Some(&snapshot)),
+                "{command:?}"
+            );
         }
     }
 }
