@@ -3846,4 +3846,117 @@ mod tests {
                 .filter(|id| !id.is_null())
         );
     }
+
+    /// R12, R31. A switch that parks nothing needs no journal write, so it
+    /// goes ahead when the journal can't be written. The windows come back,
+    /// and the journal on disk loses their entries at the first retry after
+    /// it can be written again. Retries come at most once a second.
+    #[test]
+    fn r31_a_switch_to_everything_goes_ahead_when_the_journal_cannot_be_written() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let everything = s.frames(&all);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        let journal = s.journal_on_disk();
+        assert_eq!(
+            vec![
+                entry(2, rect(400., 0., 400., 1000.)),
+                entry(3, rect(800., 0., 400., 1000.)),
+            ],
+            journal
+        );
+
+        let failing = FailingWrites::start(s.dir.path());
+        s.switch(ContextKey::Everything);
+        drop(failing);
+
+        assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+        assert_eq!(everything, s.frames(&all));
+        assert_eq!(everything, s.tiles());
+        assert!(s.parked().is_empty());
+        assert!(s.reactor.journal.entries().is_empty());
+        assert_eq!(journal, s.journal_on_disk());
+        s.reactor.journal.retry_failed_write(Instant::now() + Duration::from_secs(1));
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    /// R32, R31. A window that closes, and an app that ends, while the quit
+    /// waits for them don't hold it up.
+    #[test]
+    fn r32_a_window_or_app_that_goes_away_during_the_quit_does_not_hold_it_up() {
+        let mut s = Setup::new(3);
+        let other = WindowId::new(2, 1);
+        let window = WindowInfo {
+            sys_id: Some(WindowServerId::new(21)),
+            ..make_window(4)
+        };
+        s.reactor.handle_events(s.apps.make_app(2, vec![window]));
+        report_visible(&mut s, &[wid(1), wid(2), wid(3), other]);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        assert_eq!(vec![wid(2), wid(3), other], s.parked());
+        let exits = catch_exits(&mut s);
+
+        save_and_exit(&mut s);
+        let requests = s.apps.requests();
+        let (window_3, _): (Vec<Request>, Vec<Request>) = requests.into_iter().partition(
+            |request| matches!(request, Request::SetWindowFrame(target, ..) if *target == wid(3)),
+        );
+        answer(&mut s, window_3);
+        assert!(exits.lock().unwrap().is_empty());
+        s.close(wid(2));
+        assert!(exits.lock().unwrap().is_empty());
+        s.reactor.handle_event(Event::ApplicationThreadTerminated(2));
+
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert!(s.journal_on_disk().is_empty());
+        assert_eq!(c, s.saved_active());
+    }
+
+    /// R10, R7, L2, H1. A display added while a context is active shows the
+    /// context in the same event: its member there gets a tile in the
+    /// context's new layout for that Space, and the window there that isn't
+    /// a member is parked in a corner of the new display.
+    #[test]
+    fn r10_a_display_added_under_a_context_shows_the_context_there_at_once() {
+        let mut s = Setup::on(vec![screen()], vec![Some(space())]);
+        let at = |idx: usize, x: f64| WindowInfo {
+            frame: rect(x, 100., 50., 50.),
+            ..make_window(idx)
+        };
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![at(1, 100.), at(2, 1300.), at(3, 1400.)]));
+        s.reactor.handle_event(Event::StartupComplete);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+        let c = s.create("C", &[wid(1), wid(2)]);
+        s.switch(c);
+        // Window 3 is on no screen, so there is nowhere to park it.
+        assert!(s.parked().is_empty());
+        let space2 = SpaceId::new(2);
+
+        let all = [wid(1), wid(2), wid(3)];
+        let event = displays(
+            &s,
+            vec![screen(), right()],
+            vec![Some(space()), Some(space2)],
+            &all,
+        );
+        s.reactor.handle_event(event);
+
+        let requests = s.apps.requests();
+        assert_eq!(vec![right()], frame_writes(&requests, wid(2)));
+        assert_eq!(
+            vec![rect(2399., 999., 50., 50.)],
+            frame_writes(&requests, wid(3))
+        );
+        answer(&mut s, requests);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![(wid(1), screen())], s.tiles_on(space(), screen()));
+        assert_eq!(vec![(wid(2), right())], s.tiles_on(space2, right()));
+        assert_eq!(right(), s.frame(wid(2)));
+        assert_eq!(vec![wid(3)], s.parked());
+        assert_eq!(vec![entry(3, rect(1400., 100., 50., 50.))], s.journal_on_disk());
+    }
 }
