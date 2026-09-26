@@ -12,7 +12,7 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 use crate::actor::app::{WindowId, pid_t};
-use crate::collections::HashMap;
+use crate::collections::{HashMap, HashSet};
 use crate::sys::window_server::WindowServerId;
 
 /// Identifies a named context. Ids are never reused.
@@ -567,10 +567,13 @@ fn word_starts(text: &str) -> impl Iterator<Item = usize> {
 /// When window matching runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatchPass {
-    /// A window appeared. Steps 1 to 3 run.
+    /// Windows appeared, or the reactor found them at launch. Steps 1 to 3
+    /// run.
     Arrival,
-    /// A switch is in progress. Steps 1 to 4 run.
-    Switch,
+    /// A switch to `target` is in progress. Steps 1 to 3 run for every
+    /// record. Step 4 runs only for the records of `target`, and not at all
+    /// when `target` is Everything or Unsorted.
+    Switch { target: ContextKey },
 }
 
 /// The step at which a window matched a member record, in the order the
@@ -603,68 +606,105 @@ pub struct RecordMatch {
     pub step: MatchStep,
 }
 
-/// Finds the empty member records that a window matches.
+/// Finds the empty member records that windows match.
 ///
-/// The steps run in order. Each context, and the pinned list, gives at most
-/// one record, from the earliest step that matches in it. Steps 3 and 4 run
-/// only when steps 1 and 2 match nothing and the window belongs to no
-/// context, so they never take a window that belongs to another context.
-/// Step 4 runs only during a switch. Pending records match nothing.
-pub fn match_window(window: &WindowDesc, contexts: &Contexts, pass: MatchPass) -> Vec<RecordMatch> {
-    let slots = contexts
+/// Each step runs for every window before the next step starts, so a weak
+/// match never takes a record that another window matches at an earlier
+/// step. Within a step, each record takes the first window in `windows` that
+/// it accepts. A record takes at most one window, and a window takes at most
+/// one record from each context and from the pinned list.
+///
+/// Every step needs the same app. Steps 2 and 3 need a title that isn't
+/// blank. Steps 3 and 4 take only windows that are in no context and not
+/// pinned, and that matched nothing at an earlier step, so they never take a
+/// window that belongs to another context. Step 4 runs only during a switch,
+/// for the target's records. Pending records match nothing. Each window must
+/// appear once in `windows`.
+///
+/// Returns the matches of each window, in the order of `windows`. A window's
+/// matches are in step order, and within a step in the order of the
+/// contexts, with the pinned list last.
+pub fn match_windows(
+    windows: &[WindowDesc],
+    contexts: &Contexts,
+    pass: MatchPass,
+) -> Vec<Vec<RecordMatch>> {
+    let slots: Vec<(Slot, &[MemberRecord])> = contexts
         .contexts
         .iter()
-        .map(|c| (Slot::Context(c.id), &c.members))
-        .chain(std::iter::once((Slot::Pinned, &contexts.pinned)));
-    let candidates: Vec<(Slot, &Vec<MemberRecord>)> = slots
-        .filter(|(_, records)| !records.iter().any(|m| m.window() == Some(window.wid)))
+        .map(|c| (Slot::Context(c.id), c.members.as_slice()))
+        .chain(std::iter::once((Slot::Pinned, contexts.pinned.as_slice())))
         .collect();
-    let is_member = contexts.is_pinned(window.wid) || !contexts.contexts_of(window.wid).is_empty();
-
-    let mut matches = Vec::new();
-    for step in [MatchStep::WindowServerId, MatchStep::ExactTitle] {
-        match_step(window, &candidates, step, &mut matches);
-    }
-    if !matches.is_empty() || is_member {
-        return matches;
-    }
-    match_step(window, &candidates, MatchStep::SimilarTitle, &mut matches);
-    if matches.is_empty() && pass == MatchPass::Switch {
-        match_step(window, &candidates, MatchStep::SameApp, &mut matches);
+    let mut matches: Vec<Vec<RecordMatch>> = vec![Vec::new(); windows.len()];
+    let mut taken: HashSet<(Slot, usize)> = HashSet::default();
+    for step in [
+        MatchStep::WindowServerId,
+        MatchStep::ExactTitle,
+        MatchStep::SimilarTitle,
+        MatchStep::SameApp,
+    ] {
+        let open: Vec<bool> = windows
+            .iter()
+            .zip(&matches)
+            .map(|(window, found)| match step {
+                MatchStep::WindowServerId | MatchStep::ExactTitle => true,
+                MatchStep::SimilarTitle | MatchStep::SameApp => {
+                    found.is_empty() && contexts.is_unsorted(window.wid)
+                }
+            })
+            .collect();
+        for &(slot, records) in &slots {
+            if step == MatchStep::SameApp
+                && !matches!(pass, MatchPass::Switch { target: ContextKey::Named(id) }
+                    if slot == Slot::Context(id))
+            {
+                continue;
+            }
+            for (index, record) in records.iter().enumerate() {
+                if record.link != RecordLink::Empty || taken.contains(&(slot, index)) {
+                    continue;
+                }
+                let found = (0..windows.len()).find(|&i| {
+                    open[i]
+                        && !matches[i].iter().any(|m| m.slot == slot)
+                        && !records.iter().any(|m| m.window() == Some(windows[i].wid))
+                        && accepts(step, record, &windows[i])
+                });
+                if let Some(i) = found {
+                    matches[i].push(RecordMatch { slot, index, step });
+                    taken.insert((slot, index));
+                }
+            }
+        }
     }
     matches
 }
 
-fn match_step(
-    window: &WindowDesc,
-    candidates: &[(Slot, &Vec<MemberRecord>)],
-    step: MatchStep,
-    matches: &mut Vec<RecordMatch>,
-) {
-    for (slot, records) in candidates {
-        if matches.iter().any(|m| m.slot == *slot) {
-            continue;
+/// [`match_windows`] for one window.
+pub fn match_window(window: &WindowDesc, contexts: &Contexts, pass: MatchPass) -> Vec<RecordMatch> {
+    match_windows(std::slice::from_ref(window), contexts, pass)
+        .pop()
+        .unwrap_or_default()
+}
+
+/// Whether a member record accepts a window at a step.
+fn accepts(step: MatchStep, record: &MemberRecord, window: &WindowDesc) -> bool {
+    same_app(record, window)
+        && match step {
+            MatchStep::WindowServerId => {
+                window.window_server_id.is_some()
+                    && record.window_server_id == window.window_server_id
+            }
+            MatchStep::ExactTitle => {
+                !record.title.trim().is_empty() && record.title == window.title
+            }
+            MatchStep::SimilarTitle => {
+                !record.title.trim().is_empty()
+                    && !window.title.trim().is_empty()
+                    && similar_titles(&record.title, &window.title)
+            }
+            MatchStep::SameApp => true,
         }
-        let found = records.iter().position(|record| {
-            record.link == RecordLink::Empty
-                && match step {
-                    MatchStep::WindowServerId => {
-                        window.window_server_id.is_some()
-                            && record.window_server_id == window.window_server_id
-                    }
-                    MatchStep::ExactTitle => {
-                        same_app(record, window) && record.title == window.title
-                    }
-                    MatchStep::SimilarTitle => {
-                        same_app(record, window) && similar_titles(&record.title, &window.title)
-                    }
-                    MatchStep::SameApp => same_app(record, window),
-                }
-        });
-        if let Some(index) = found {
-            matches.push(RecordMatch { slot: *slot, index, step });
-        }
-    }
 }
 
 /// Compares bundle ids when both are known, and app names otherwise.
@@ -677,7 +717,7 @@ fn same_app(record: &MemberRecord, window: &WindowDesc) -> bool {
 
 /// Whether two window titles are similar: after folding, both have at least
 /// 4 characters, and one contains the other or they share a prefix of at
-/// least min(12, two-thirds of the shorter title).
+/// least min(12, two-thirds of the shorter title), rounded down.
 pub fn similar_titles(a: &str, b: &str) -> bool {
     let a = fold(a);
     let b = fold(b);
@@ -691,7 +731,7 @@ pub fn similar_titles(a: &str, b: &str) -> bool {
     }
     let shorter = a_len.min(b_len);
     let prefix = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
-    prefix >= 12 || prefix * 3 >= shorter * 2
+    prefix >= (shorter * 2 / 3).min(12)
 }
 
 /// What happened to a window that appeared.
@@ -729,39 +769,96 @@ impl Contexts {
             .chain(self.pinned.iter_mut())
     }
 
-    /// Matches a window against the member records and binds it to the
-    /// records it matches. The records take the window's current details.
-    pub fn rejoin(&mut self, window: &WindowDesc, pass: MatchPass) -> Vec<RecordMatch> {
-        let matches = match_window(window, self, pass);
-        for m in &matches {
-            self.slot_records_mut(m.slot)[m.index] = MemberRecord::for_window(window);
+    /// Matches windows against the member records together (see
+    /// [`match_windows`]) and binds each window to the records it matches.
+    /// The records take the window's current details. Returns the matches of
+    /// each window, in the order of `windows`.
+    ///
+    /// Windows that the reactor finds before `StartupComplete` were open
+    /// before Sugarglider started. They come here with
+    /// [`MatchPass::Arrival`], not to [`Contexts::windows_appeared`], so the
+    /// ones that match nothing stay unsorted.
+    pub fn rejoin_all(&mut self, windows: &[WindowDesc], pass: MatchPass) -> Vec<Vec<RecordMatch>> {
+        let matches = match_windows(windows, self, pass);
+        for (window, found) in windows.iter().zip(&matches) {
+            for m in found {
+                self.slot_records_mut(m.slot)[m.index] = MemberRecord::for_window(window);
+            }
         }
         matches
     }
 
-    /// Decides the membership of a window that just appeared on a screen
-    /// that shows `screen_active`.
+    /// [`Contexts::rejoin_all`] for one window.
+    pub fn rejoin(&mut self, window: &WindowDesc, pass: MatchPass) -> Vec<RecordMatch> {
+        self.rejoin_all(std::slice::from_ref(window), pass).pop().unwrap_or_default()
+    }
+
+    /// Decides the membership of windows that appeared on a screen that
+    /// shows `screen_active`, and returns what happened to each, in the
+    /// order of `windows`.
     ///
-    /// A window that matches member records rejoins their contexts and does
-    /// not join the active context. Otherwise it joins the active context,
-    /// or stays unsorted under Everything and Unsorted. Call this once per
-    /// window, when it first appears; a repeated call can't tell an unsorted
-    /// window from a new one.
+    /// The windows are matched together (see [`match_windows`]). A window
+    /// that matches member records rejoins their contexts and does not join
+    /// the active context. Otherwise it joins the active context, or stays
+    /// unsorted under Everything and Unsorted.
+    ///
+    /// Pass only windows that the reactor sees for the first time after
+    /// `StartupComplete`. The reactor keeps the set of windows it has seen,
+    /// because this can't tell an unsorted window that comes back, for
+    /// example from being minimized, from a new one: both would join the
+    /// active context. Windows found before `StartupComplete` go to
+    /// [`Contexts::rejoin_all`].
+    pub fn windows_appeared(
+        &mut self,
+        windows: &[WindowDesc],
+        screen_active: ContextKey,
+    ) -> Vec<Arrival> {
+        let unsorted: Vec<bool> = windows.iter().map(|w| self.is_unsorted(w.wid)).collect();
+        let new: Vec<WindowDesc> = windows
+            .iter()
+            .zip(&unsorted)
+            .filter(|(_, unsorted)| **unsorted)
+            .map(|(window, _)| window.clone())
+            .collect();
+        let mut matches = self.rejoin_all(&new, MatchPass::Arrival).into_iter();
+        let mut arrivals = Vec::with_capacity(windows.len());
+        for (window, unsorted) in windows.iter().zip(unsorted) {
+            let arrival = if !unsorted {
+                Arrival::AlreadyMember
+            } else {
+                let found = matches.next().unwrap_or_default();
+                if !found.is_empty() {
+                    Arrival::Rejoined(found)
+                } else if let ContextKey::Named(id) = screen_active
+                    && let Ok(context) = self.get_mut(id)
+                {
+                    context.members.push(MemberRecord::for_window(window));
+                    Arrival::Joined(id)
+                } else {
+                    Arrival::Unsorted
+                }
+            };
+            arrivals.push(arrival);
+        }
+        arrivals
+    }
+
+    /// [`Contexts::windows_appeared`] for one window.
     pub fn window_appeared(&mut self, window: &WindowDesc, screen_active: ContextKey) -> Arrival {
-        if !self.is_unsorted(window.wid) {
-            return Arrival::AlreadyMember;
+        self.windows_appeared(std::slice::from_ref(window), screen_active)
+            .pop()
+            .expect("one arrival per window")
+    }
+
+    /// Forgets the window server ids of the records that have no live
+    /// window. Window server ids are valid within one login session, so the
+    /// actor calls this when it loads `contexts.json` in a new one.
+    pub fn forget_window_server_ids(&mut self) {
+        for record in self.records_mut() {
+            if record.window().is_none() {
+                record.window_server_id = None;
+            }
         }
-        let matches = self.rejoin(window, MatchPass::Arrival);
-        if !matches.is_empty() {
-            return Arrival::Rejoined(matches);
-        }
-        if let ContextKey::Named(id) = screen_active
-            && let Ok(context) = self.get_mut(id)
-        {
-            context.members.push(MemberRecord::for_window(window));
-            return Arrival::Joined(id);
-        }
-        Arrival::Unsorted
     }
 
     /// Updates the records of an open window with its new title.
@@ -1517,9 +1614,12 @@ mod tests {
 
     #[test]
     fn r22_step_1_matches_window_server_id() {
-        let (cx, ids) =
-            with_records(&[("A", vec![empty_record("Other", "Unrelated", Some(1001))])]);
+        let (cx, ids) = with_records(&[
+            ("A", vec![empty_record("App", "Unrelated", Some(1001))]),
+            ("B", vec![empty_record("Other", "Unrelated", Some(1001))]),
+        ]);
         let w = window(1, 1, "App", "Title");
+        // B's record has the same window server id but another app.
         assert_eq!(
             steps(&match_window(&w, &cx, MatchPass::Arrival)),
             vec![(Slot::Context(ids[0]), MatchStep::WindowServerId)]
@@ -1555,9 +1655,10 @@ mod tests {
     fn r22_step_4_only_runs_during_a_switch() {
         let (cx, ids) = with_records(&[("A", vec![empty_record("App", "Something", None)])]);
         let w = window(1, 1, "App", "Different");
+        let to_a = MatchPass::Switch { target: named(ids[0]) };
         assert!(match_window(&w, &cx, MatchPass::Arrival).is_empty());
         assert_eq!(
-            steps(&match_window(&w, &cx, MatchPass::Switch)),
+            steps(&match_window(&w, &cx, to_a)),
             vec![(Slot::Context(ids[0]), MatchStep::SameApp)]
         );
     }
@@ -1575,7 +1676,7 @@ mod tests {
             ("B", vec![empty_record("App", "Inbox – Mail", None)]),
         ]);
         let w = window(1, 1, "App", "Inbox");
-        let matches = match_window(&w, &cx, MatchPass::Switch);
+        let matches = match_window(&w, &cx, MatchPass::Switch { target: named(ids[1]) });
         // A's exact record wins; B's similar record isn't taken because the
         // window now belongs to A.
         assert_eq!(
@@ -1628,15 +1729,16 @@ mod tests {
             ),
         ]);
         let w = window(1, 1, "App", "Inbox");
+        let to_b = MatchPass::Switch { target: named(ids[1]) };
         cx.add_window(ids[0], &w).unwrap();
         assert!(match_window(&w, &cx, MatchPass::Arrival).is_empty());
-        assert!(match_window(&w, &cx, MatchPass::Switch).is_empty());
+        assert!(match_window(&w, &cx, to_b).is_empty());
         // A pinned window belongs to every context.
         cx.remove_window(ids[0], w.wid).unwrap();
         cx.pin(&w);
-        assert!(match_window(&w, &cx, MatchPass::Switch).is_empty());
+        assert!(match_window(&w, &cx, to_b).is_empty());
         cx.unpin(w.wid);
-        assert_eq!(match_window(&w, &cx, MatchPass::Switch).len(), 1);
+        assert_eq!(match_window(&w, &cx, to_b).len(), 1);
     }
 
     #[test]
@@ -1644,9 +1746,10 @@ mod tests {
         let (mut cx, ids) = with_records(&[("A", vec![empty_record("App", "Title", None)])]);
         let first = window(1, 1, "App", "Title");
         let second = window(1, 2, "App", "Title");
-        assert_eq!(cx.rejoin(&first, MatchPass::Switch).len(), 1);
-        assert!(cx.rejoin(&second, MatchPass::Switch).is_empty());
-        assert!(cx.rejoin(&first, MatchPass::Switch).is_empty());
+        let to_a = MatchPass::Switch { target: named(ids[0]) };
+        assert_eq!(cx.rejoin(&first, to_a).len(), 1);
+        assert!(cx.rejoin(&second, to_a).is_empty());
+        assert!(cx.rejoin(&first, to_a).is_empty());
         assert_eq!(cx.contexts_of(first.wid), vec![ids[0]]);
         assert_eq!(cx.get(ids[0]).unwrap().members.len(), 1);
     }
@@ -1753,10 +1856,11 @@ mod tests {
         cx.window_closed(w.wid);
         assert_eq!(cx.get(a).unwrap().members[0].link, RecordLink::Pending(w.wid));
         assert!(cx.is_unsorted(w.wid));
+        let to_a = MatchPass::Switch { target: named(a) };
         let same = window(1, 1, "App", "Title");
-        assert!(match_window(&same, &cx, MatchPass::Switch).is_empty());
+        assert!(match_window(&same, &cx, to_a).is_empty());
         let other = window(1, 2, "App", "Title");
-        assert!(match_window(&other, &cx, MatchPass::Switch).is_empty());
+        assert!(match_window(&other, &cx, to_a).is_empty());
     }
 
     #[test]
@@ -2847,11 +2951,14 @@ mod tests {
 
     /// R22 step 1 needs the same app as well as the same window server id.
     #[test]
-    #[ignore = "pending: R22 step 1 requires same app"]
     fn r22_step_1_requires_the_same_app() {
-        let (cx, _) = with_records(&[("A", vec![empty_record("Other", "Unrelated", Some(1001))])]);
+        let (cx, ids) =
+            with_records(&[("A", vec![empty_record("Other", "Unrelated", Some(1001))])]);
         let w = window(1, 1, "App", "Title");
-        assert_eq!(match_window(&w, &cx, MatchPass::Switch), vec![]);
+        assert_eq!(
+            match_window(&w, &cx, MatchPass::Switch { target: named(ids[0]) }),
+            vec![]
+        );
     }
 
     /// R22: within one context, a window server id match wins over an exact
@@ -2921,7 +3028,7 @@ mod tests {
             window_server_id: None,
             link: RecordLink::Empty,
         };
-        let (cx, _) = with_records(&[("A", vec![record])]);
+        let (cx, ids) = with_records(&[("A", vec![record])]);
         let beta = WindowDesc {
             wid: wid(1, 1),
             bundle_id: Some("com.google.Chrome.beta".into()),
@@ -2929,7 +3036,10 @@ mod tests {
             title: "Docs".into(),
             window_server_id: None,
         };
-        assert_eq!(match_window(&beta, &cx, MatchPass::Switch), vec![]);
+        assert_eq!(
+            match_window(&beta, &cx, MatchPass::Switch { target: named(ids[0]) }),
+            vec![]
+        );
     }
 
     /// R22: an empty title never matches at step 2. Otherwise a new untitled
@@ -2937,7 +3047,6 @@ mod tests {
     /// keeps step 4 out of arrivals. Rooms' exact-title pass also needs a
     /// title.
     #[test]
-    #[ignore = "bug: an empty record title matches any untitled window of its app at step 2"]
     fn r22_an_empty_title_never_matches_at_step_2() {
         let (mut cx, ids) =
             with_records(&[("A", vec![empty_record("App", "", None)]), ("B", vec![])]);
@@ -3059,7 +3168,6 @@ mod tests {
     /// R22: two-thirds of the shorter title is rounded down, as in Rooms'
     /// `SlotMatcher.similar`, which the spec names as the definition.
     #[test]
-    #[ignore = "bug: similar_titles rounds two-thirds of the shorter title up; Rooms rounds down"]
     fn r22_similar_prefix_threshold_rounds_two_thirds_down() {
         // Shorter title 4: 2 characters.
         assert!(similar_titles("Plan", "Plxx"));
@@ -3070,6 +3178,197 @@ mod tests {
         // Shorter title 10: 6 characters.
         assert!(similar_titles("Project AB", "Projec-99999"));
         assert!(!similar_titles("Project AB", "Proje-999999"));
+    }
+
+    /// R22: a blank title never matches at step 2 or step 3. A record
+    /// without a title still matches its window server id at step 1.
+    #[test]
+    fn r22_blank_titles_never_match_at_steps_2_and_3() {
+        let (cx, _) = with_records(&[(
+            "A",
+            vec![
+                empty_record("App", "", None),
+                empty_record("App", "   ", None),
+                empty_record("App", "    ", None),
+            ],
+        )]);
+        for title in ["", "   ", "    "] {
+            let w = window(1, 1, "App", title);
+            assert_eq!(match_window(&w, &cx, MatchPass::Arrival), vec![], "{title:?}");
+        }
+        let (cx, ids) = with_records(&[("A", vec![empty_record("App", "", Some(1001))])]);
+        assert_eq!(
+            steps(&match_window(&window(1, 1, "App", ""), &cx, MatchPass::Arrival)),
+            vec![(Slot::Context(ids[0]), MatchStep::WindowServerId)]
+        );
+    }
+
+    /// R22: without a bundle id on both sides, the same app means the same
+    /// app name.
+    #[test]
+    fn r22_same_app_falls_back_to_the_app_name() {
+        let record = MemberRecord {
+            bundle_id: None,
+            app_name: Some("Tool".into()),
+            title: "Main".into(),
+            window_server_id: None,
+            link: RecordLink::Empty,
+        };
+        let (cx, ids) = with_records(&[("A", vec![record])]);
+        let exact = vec![(Slot::Context(ids[0]), MatchStep::ExactTitle)];
+        let tool = WindowDesc {
+            bundle_id: None,
+            ..window(1, 1, "Tool", "Main")
+        };
+        assert_eq!(steps(&match_window(&tool, &cx, MatchPass::Arrival)), exact);
+        let with_bundle_id = window(1, 2, "Tool", "Main");
+        assert_eq!(
+            steps(&match_window(&with_bundle_id, &cx, MatchPass::Arrival)),
+            exact
+        );
+        let other = WindowDesc {
+            bundle_id: None,
+            ..window(2, 1, "Other", "Main")
+        };
+        assert_eq!(match_window(&other, &cx, MatchPass::Arrival), vec![]);
+    }
+
+    /// R22 step 4 fills only the switch target's records. Another context's
+    /// record and a pinned record of the same app stay empty, and a switch to
+    /// Everything or Unsorted runs no step 4, so an unsorted window stays
+    /// unsorted and shows under Unsorted.
+    #[test]
+    fn r22_step_4_runs_only_for_the_switch_target() {
+        let (mut cx, ids) = with_records(&[
+            ("A", vec![empty_record("Chrome", "Docs", None)]),
+            ("B", vec![empty_record("Chrome", "Calendar", None)]),
+        ]);
+        cx.pinned.push(empty_record("Chrome", "Music", None));
+        let gmail = window(1, 1, "Chrome", "Gmail - Inbox");
+        for target in [ContextKey::Everything, ContextKey::Unsorted] {
+            assert_eq!(cx.rejoin(&gmail, MatchPass::Switch { target }), vec![]);
+        }
+        cx.switch_to(ContextKey::Unsorted).unwrap();
+        let plan = plan_switch(&one_screen(cx.active(), vec![cx.switch_window(gmail.wid)]));
+        assert_eq!(plan.park, vec![]);
+        assert_eq!(
+            cx.rejoin(&gmail, MatchPass::Switch { target: named(ids[1]) }),
+            vec![RecordMatch {
+                slot: Slot::Context(ids[1]),
+                index: 0,
+                step: MatchStep::SameApp,
+            }]
+        );
+        assert_eq!(cx.contexts_of(gmail.wid), vec![ids[1]]);
+        assert!(!cx.is_pinned(gmail.wid));
+        assert_eq!(records(&cx, ids[0]), vec![("Docs", RecordLink::Empty)]);
+        assert_eq!(cx.pinned()[0].link, RecordLink::Empty);
+    }
+
+    fn by_window<T>(windows: &[WindowDesc], results: Vec<T>) -> Vec<(WindowId, T)> {
+        let mut pairs: Vec<(WindowId, T)> = windows.iter().map(|w| w.wid).zip(results).collect();
+        pairs.sort_by_key(|(wid, _)| *wid);
+        pairs
+    }
+
+    /// R22: during a switch, a window with a record's exact title gets the
+    /// record, and another window of the app doesn't take it at step 4,
+    /// whatever the order of the windows.
+    #[test]
+    fn r22_a_switch_matches_windows_the_same_in_any_order() {
+        let (cx, ids) = with_records(&[("A", vec![empty_record("Chrome", "Docs", None)])]);
+        let gmail = window(1, 1, "Chrome", "Gmail");
+        let docs = window(1, 2, "Chrome", "Docs");
+        for windows in [[gmail.clone(), docs.clone()], [docs.clone(), gmail.clone()]] {
+            let mut cx = cx.clone();
+            let matches = cx.rejoin_all(&windows, MatchPass::Switch { target: named(ids[0]) });
+            assert_eq!(
+                by_window(&windows, matches),
+                vec![
+                    (gmail.wid, vec![]),
+                    (docs.wid, vec![exact_title(Slot::Context(ids[0]), 0)]),
+                ]
+            );
+            assert!(cx.is_unsorted(gmail.wid));
+        }
+    }
+
+    /// R20, R22: windows that appear together are matched together. A
+    /// window with a similar title doesn't take the record of a window with
+    /// the exact title, whatever their order, and joins the active context.
+    #[test]
+    fn r22_windows_that_appear_together_match_the_same_in_any_order() {
+        let (mut cx, ids) = with_records(&[
+            (
+                "A",
+                vec![empty_record("Zed", "contexts.rs — butterflyray", None)],
+            ),
+            ("B", vec![]),
+        ]);
+        cx.switch_to(named(ids[1])).unwrap();
+        let other = window(1, 1, "Zed", "contexts.rs — sugarglider");
+        let own = window(1, 2, "Zed", "contexts.rs — butterflyray");
+        assert!(similar_titles(&other.title, &own.title));
+        for windows in [[other.clone(), own.clone()], [own.clone(), other.clone()]] {
+            let mut cx = cx.clone();
+            let arrivals = cx.windows_appeared(&windows, cx.active());
+            assert_eq!(
+                by_window(&windows, arrivals),
+                vec![
+                    (other.wid, Arrival::Joined(ids[1])),
+                    (
+                        own.wid,
+                        Arrival::Rejoined(vec![exact_title(Slot::Context(ids[0]), 0)])
+                    ),
+                ]
+            );
+        }
+    }
+
+    /// R21, R38: windows found at launch rejoin their contexts or stay
+    /// unsorted. They never join the saved active context, as a new window
+    /// would.
+    #[test]
+    fn r38_windows_found_at_launch_rejoin_or_stay_unsorted() {
+        let mut before = Contexts::new();
+        let a = before.create("A").unwrap();
+        let b = before.create("B").unwrap();
+        before.add_window(a, &window(1, 1, "Mail", "Inbox")).unwrap();
+        before.switch_to(named(b)).unwrap();
+        let mut cx = round_trip(&before);
+        let inbox = window(2, 1, "Mail", "Inbox");
+        let notes = window(3, 1, "Notes", "Notes");
+        assert_eq!(
+            cx.rejoin_all(&[inbox.clone(), notes.clone()], MatchPass::Arrival),
+            vec![vec![exact_title(Slot::Context(a), 0)], vec![]]
+        );
+        assert_eq!(cx.active(), named(b));
+        assert_eq!(cx.contexts_of(inbox.wid), vec![a]);
+        assert!(cx.is_unsorted(notes.wid));
+        assert_eq!(records(&cx, b), vec![]);
+    }
+
+    /// R22: once the window server ids are forgotten, a record without a
+    /// window no longer matches at step 1. Live records keep their ids.
+    #[test]
+    fn r22_forgotten_window_server_ids_match_nothing() {
+        let (mut cx, ids) =
+            with_records(&[("A", vec![empty_record("App", "Old title", Some(1001))])]);
+        let w = window(1, 1, "App", "New title");
+        assert_eq!(match_window(&w, &cx, MatchPass::Arrival).len(), 1);
+        let live = window(2, 1, "App", "Live");
+        cx.add_window(ids[0], &live).unwrap();
+        cx.pin(&live);
+        cx.forget_window_server_ids();
+        assert_eq!(match_window(&w, &cx, MatchPass::Arrival), vec![]);
+        let ids_of = |records: &[MemberRecord]| {
+            records.iter().map(|m| m.window_server_id).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids_of(&cx.get(ids[0]).unwrap().members),
+            vec![None, live.window_server_id]
+        );
+        assert_eq!(ids_of(cx.pinned()), vec![live.window_server_id]);
     }
 
     /// R23, Q4: ⌘Q where every window closes before the app terminates. The
