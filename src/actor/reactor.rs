@@ -4140,6 +4140,7 @@ pub mod tests {
         let shorter = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.));
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen],
+            bounds: vec![],
             spaces: vec![Some(space1)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -4154,6 +4155,7 @@ pub mod tests {
         apps.simulate_until_quiet(&mut reactor);
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![shorter],
+            bounds: vec![],
             spaces: vec![Some(space1)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
