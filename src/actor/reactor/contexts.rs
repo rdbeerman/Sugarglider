@@ -358,10 +358,14 @@ impl Reactor {
     }
 
     /// Applies the active context after contexts were turned on, or shows
-    /// every window after they were turned off.
+    /// every window after they were turned off. Contexts that were never
+    /// read are read first.
     pub(super) fn contexts_turned_on_or_off(&mut self) {
         if self.contexts_enabled() {
             info!("Contexts are on");
+            if self.contexts_unread {
+                self.read_contexts(SystemTime::now());
+            }
             if !self.contexts_in_use() {
                 return;
             }
@@ -458,22 +462,39 @@ impl Reactor {
         }
     }
 
-    /// Reads the contexts from `store`, which later saves go to.
-    ///
-    /// Window server ids are valid only within one boot of the Mac, so the
-    /// contexts forget their saved ids when `boot_id` differs from the boot
-    /// that saved them. Once the contexts are read, the layouts of contexts
-    /// that no longer exist are dropped. When the file can't be read, the
-    /// layouts stay, and new contexts take ids after theirs.
+    /// Sets `store` as the place the contexts are read from and saved to,
+    /// in the boot of the Mac that `boot_id` names. If contexts are on, the
+    /// contexts are read now at `now`. Otherwise they are read when contexts
+    /// are turned on. Until then the file is neither read nor changed, and
+    /// the layouts of the contexts it names stay.
     pub(super) fn open_contexts(
         &mut self,
         store: ContextsStore,
         boot_id: Option<String>,
         now: SystemTime,
     ) {
-        match store.load(now) {
+        self.contexts_store = store;
+        self.boot_id = boot_id;
+        self.contexts_unread = true;
+        if self.contexts_enabled() {
+            self.read_contexts(now);
+        }
+    }
+
+    /// Reads the contexts. A file that can't be read is moved aside with the
+    /// time `now` in its name.
+    ///
+    /// Window server ids are valid only within one boot of the Mac, so the
+    /// contexts forget their saved ids when the boot that saved them isn't
+    /// the current one. Once the contexts are read, the layouts of contexts
+    /// that no longer exist are dropped. When the file can't be read, the
+    /// layouts stay, and new contexts take ids after theirs. The windows of
+    /// the running apps then rejoin their contexts.
+    fn read_contexts(&mut self, now: SystemTime) {
+        self.contexts_unread = false;
+        match self.contexts_store.load(now) {
             Loaded::Read { mut contexts, boot_id: saved } => {
-                if saved.is_none() || saved != boot_id {
+                if saved.is_none() || saved != self.boot_id {
                     info!("The contexts were saved in another boot; forgetting window server ids");
                     contexts.forget_window_server_ids();
                 }
@@ -488,8 +509,14 @@ impl Reactor {
                 self.contexts = empty_contexts_after(self.layout.context_ids().max());
             }
         }
-        self.contexts_store = store;
-        self.boot_id = boot_id;
+        let mut wids: Vec<WindowId> = self
+            .windows
+            .keys()
+            .copied()
+            .filter(|wid| self.apps.contains_key(&wid.pid))
+            .collect();
+        wids.sort();
+        self.rejoin_windows(&wids);
     }
 }
 
@@ -1458,10 +1485,15 @@ mod tests {
     }
 
     /// Saves contexts with one member record, as a boot named `boot` did.
+    /// The record has window 1's window server id and a title that window 1
+    /// doesn't have now, so only the id can match window 1.
     fn saved_by_boot(s: &Setup, boot: Option<&str>) -> ContextsStore {
         let mut contexts = crate::model::contexts::Contexts::new();
         let id = contexts.create("C").unwrap();
-        let desc = s.desc(wid(1));
+        let desc = WindowDesc {
+            title: "Before the restart".into(),
+            ..s.desc(wid(1))
+        };
         contexts.add_window(id, &desc).unwrap();
         let store = ContextsStore::new(s.dir.path().join("contexts.json"));
         store.save(&contexts, boot).unwrap();
@@ -3493,12 +3525,13 @@ mod tests {
         fn in_dir(dir: TempDir, boot: Option<&str>, now: SystemTime, windows: usize) -> Setup {
             let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
             reactor.journal = ParkedJournal::open(dir.path().join("parked.json"), now);
+            // Contexts are on first, so that `contexts.json` is read at `now`.
+            reactor.handle_event(Event::ConfigChanged(config(true)));
             reactor.open_contexts(
                 ContextsStore::new(dir.path().join("contexts.json")),
                 boot.map(Into::into),
                 now,
             );
-            reactor.handle_event(Event::ConfigChanged(config(true)));
             reactor.handle_event(screens(vec![screen()], vec![Some(space())]));
             let mut s = Setup {
                 reactor,
@@ -3883,8 +3916,9 @@ mod tests {
 
     /// R28. With contexts off, a scenario from the existing reactor tests
     /// sends exactly the same requests, and ends at the same frames, when
-    /// `contexts.json` holds an active context whose member is one of the
-    /// windows. No file is written.
+    /// the reactor holds an active context whose member is one of the
+    /// windows, as it does after contexts were turned off. `contexts.json`
+    /// isn't read, and no file is written.
     #[test]
     fn r28_with_contexts_off_a_saved_active_context_changes_no_request() {
         let mut plain = Reactor::new_for_test(LayoutManager::new_for_test());
@@ -3913,6 +3947,8 @@ mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.journal = ParkedJournal::open(dir.path().join("parked.json"), SystemTime::now());
         reactor.open_contexts(store, Some("boot".into()), SystemTime::now());
+        assert!(reactor.contexts.contexts().is_empty());
+        reactor.contexts = saved;
         assert_eq!(ContextKey::Named(c), reactor.contexts.active());
 
         let (trace, after_drag, at_end) =
@@ -3962,13 +3998,16 @@ mod tests {
     /// current boot.
     #[test]
     fn a_contexts_json_from_another_boot_keeps_everything_but_window_server_ids() {
-        let mut s = Setup::new(2);
+        let mut s = Setup::new(1);
         let c = s.create("C", &[wid(1)]);
         s.switch(c);
         s.switch(ContextKey::Everything);
         s.reactor.contexts.switch_to(c).unwrap();
         let store = ContextsStore::new(s.dir.path().join("contexts.json"));
         store.save(&s.reactor.contexts, Some("earlier boot")).unwrap();
+        // No window is open, so none takes the record when the contexts are
+        // read.
+        s.close(wid(1));
 
         s.reactor.open_contexts(store, Some("boot".into()), SystemTime::now());
 
@@ -4288,5 +4327,108 @@ mod tests {
         assert!(all_frame_writes(apps.requests()).is_empty());
         assert_eq!(arranged, tiles(&reactor));
         assert_eq!(vec![wid(4)], reactor.parked.keys().copied().collect::<Vec<_>>());
+    }
+
+    /// Names of the files in the directory that start with `prefix`.
+    fn files_starting_with(dir: &TempDir, prefix: &str) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with(prefix))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// R28, journal and state files. With contexts off, the reactor doesn't
+    /// read `contexts.json`. An unreadable file stays where it is, and a
+    /// file with values to repair keeps its bytes. The layouts of contexts
+    /// in `layout.ron` stay when `contexts.json` is missing, through a quit,
+    /// and when contexts are turned on without a `contexts.json` to read.
+    #[test]
+    fn r28_with_contexts_off_contexts_json_is_not_read() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        let exits = catch_exits(&mut s);
+        save_and_exit(&mut s);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        let everything = s.frames(&all);
+        let path = s.dir.path().join("contexts.json");
+
+        for contents in [
+            &b"{ not json"[..],
+            br#"{ "version": 1, "contexts": [ { "id": 4, "name": "Everything" } ] }"#,
+        ] {
+            fs::write(&path, contents).unwrap();
+            let mut reactor = restore(&s, false);
+            register_app_1(&mut reactor, &everything);
+            assert_eq!(contents, &fs::read(&path).unwrap()[..]);
+            assert!(files_starting_with(&s.dir, "contexts.unreadable").is_empty());
+            assert!(reactor.contexts.contexts().is_empty());
+        }
+
+        fs::remove_file(&path).unwrap();
+        let mut reactor = restore(&s, false);
+        register_app_1(&mut reactor, &everything);
+        assert_eq!(vec![id_of(c)], reactor.layout.context_ids().collect::<Vec<_>>());
+        let exits = Arc::new(Mutex::new(vec![]));
+        let caught = exits.clone();
+        reactor.layout_file = Some(s.dir.path().join("layout.ron"));
+        reactor.exit = Box::new(move |code| caught.lock().unwrap().push(code));
+        reactor.handle_event(Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)));
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert!(!path.exists());
+        let layout = LayoutManager::load(s.dir.path().join("layout.ron"), config(true)).unwrap();
+        assert_eq!(vec![id_of(c)], layout.context_ids().collect::<Vec<_>>());
+
+        // A reactor without a `contexts.json`, as in a replay.
+        let mut reactor = Reactor::new_for_test(layout);
+        reactor.handle_event(Event::ConfigChanged(config(true)));
+        assert_eq!(vec![id_of(c)], reactor.layout.context_ids().collect::<Vec<_>>());
+    }
+
+    /// R33, R21, journal and state files. Contexts are off when Sugarglider
+    /// starts, and a config reload turns them on after the app registered.
+    /// `contexts.json` is read then, the windows rejoin C, and C shows with
+    /// its arrangement while the window that isn't in C is parked.
+    #[test]
+    fn contexts_json_is_read_when_a_config_reload_turns_contexts_on() {
+        let mut s = Setup::new(4);
+        let all = [wid(1), wid(2), wid(3), wid(4)];
+        let c = s.create("C", &[wid(1), wid(2), wid(3)]);
+        s.switch(c);
+        s.move_window(wid(1), Direction::Right);
+        let arranged = vec![
+            (wid(1), rect(400., 0., 400., 1000.)),
+            (wid(2), rect(0., 0., 400., 1000.)),
+            (wid(3), rect(800., 0., 400., 1000.)),
+        ];
+        assert_eq!(arranged, s.tiles());
+        let exits = catch_exits(&mut s);
+        save_and_exit(&mut s);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        let everything = s.frames(&all);
+        let mut reactor = restore(&s, false);
+        let mut apps = register_app_1(&mut reactor, &everything);
+        assert!(reactor.contexts.contexts().is_empty());
+        assert!(reactor.parked.is_empty());
+
+        reactor.handle_event(Event::ConfigChanged(config(true)));
+        apps.simulate_until_quiet(&mut reactor);
+
+        assert_eq!(c, reactor.contexts.active());
+        let mut tiles = reactor.layout.calculate_layout(space(), screen(), &reactor.config);
+        tiles.sort_by_key(|(wid, _)| *wid);
+        assert_eq!(arranged, tiles);
+        assert_eq!(
+            arranged,
+            all[..3].iter().map(|&wid| (wid, apps.windows[&wid].frame)).collect::<Vec<_>>()
+        );
+        assert_eq!(vec![wid(4)], reactor.parked.keys().copied().collect::<Vec<_>>());
+        assert_eq!(corner(CGSize::new(300., 1000.)), apps.windows[&wid(4)].frame);
     }
 }

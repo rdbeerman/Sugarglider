@@ -377,6 +377,9 @@ pub struct Reactor {
     contexts: Contexts,
     /// Where `contexts` are saved.
     contexts_store: ContextsStore,
+    /// Whether `contexts_store` is still to be read. It is read when
+    /// contexts are on.
+    contexts_unread: bool,
     /// Names the boot of the Mac, saved with the contexts.
     boot_id: Option<String>,
     /// A quit that waits for parked windows to come back.
@@ -609,6 +612,7 @@ impl Reactor {
             forced_writes: HashSet::default(),
             contexts: Contexts::new(),
             contexts_store: ContextsStore::in_memory(),
+            contexts_unread: false,
             boot_id: None,
             pending_exit: None,
             showing_everything: HashSet::default(),
