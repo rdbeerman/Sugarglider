@@ -11,8 +11,7 @@ use std::time::{Instant, SystemTime};
 use objc2_core_foundation::CGSize;
 use tracing::{debug, error, info, warn};
 
-use super::{ContextCommand, ContextRef, Reactor, RecordRef};
-use super::Event;
+use super::{ContextCommand, ContextRef, Event, Reactor, RecordRef};
 use crate::actor::app::{Request, WindowId, pid_t};
 use crate::actor::contexts_snapshot::{CONTEXTS_OFF, app_name};
 use crate::actor::contexts_store::{ContextsStore, Loaded, empty_contexts_after};
@@ -211,12 +210,8 @@ impl Reactor {
     /// window that has the focus, the switch's focus step runs, so that
     /// keystrokes don't go to a parked window.
     fn finish_apply(&mut self, plan: SwitchPlan, response: Option<EventResponse>) {
-        let parked: Vec<WindowId> = plan
-            .park
-            .iter()
-            .copied()
-            .filter(|wid| self.parked.contains_key(wid))
-            .collect();
+        let parked: Vec<WindowId> =
+            plan.park.iter().copied().filter(|wid| self.parked.contains_key(wid)).collect();
         let main_parked = self.main_window().is_some_and(|main| parked.contains(&main));
         if !main_parked {
             if let Some(response) = response {
@@ -516,9 +511,7 @@ impl Reactor {
             ContextCommand::SetContextNumber { context, number } => {
                 let id =
                     self.resolve_named_context(&context, "Only a named context can be numbered")?;
-                self.contexts
-                    .set_number(id, Some(number))
-                    .map_err(|err| err.to_string())?;
+                self.contexts.set_number(id, Some(number)).map_err(|err| err.to_string())?;
                 info!(?id, number, "Gave a context a number");
                 self.save_contexts();
                 Ok(())
@@ -541,10 +534,8 @@ impl Reactor {
                 self.edit_context_members(id, &add, &remove, &remove_records)
             }
             ContextCommand::RemoveRecord { context, record } => {
-                let id = self.resolve_named_context(
-                    &context,
-                    "Only a named context has member records",
-                )?;
+                let id = self
+                    .resolve_named_context(&context, "Only a named context has member records")?;
                 self.remove_record(id, &record)
             }
         }
@@ -570,10 +561,8 @@ impl Reactor {
     /// can shift between the client's `context list` and this command, and
     /// an index alone would then remove another record.
     fn remove_record(&mut self, id: ContextId, item: &RecordRef) -> Result<(), String> {
-        let Some(record) = self
-            .contexts
-            .get(id)
-            .and_then(|context| context.members.get(item.record))
+        let Some(record) =
+            self.contexts.get(id).and_then(|context| context.members.get(item.record))
         else {
             return Err(ContextError::NoSuchRecord.to_string());
         };
@@ -643,7 +632,12 @@ impl Reactor {
                 }
             }
         }
-        info!(?id, added = added.len(), removed = removed.len(), "Edited a context's members");
+        info!(
+            ?id,
+            added = added.len(),
+            removed = removed.len(),
+            "Edited a context's members"
+        );
         self.save_contexts();
         if !removed.is_empty() {
             self.park_windows_that_left(&removed);
@@ -5294,7 +5288,10 @@ mod tests {
         s.reactor
             .handle_event(Event::WindowsOnScreenUpdated { pid: None, on_screen: listed });
         s.reactor.contexts.add_window(id_of(c), &s.desc(quitting)).unwrap();
-        assert!(!s.reactor.contexts.is_member(c, panel), "the panel is in no context");
+        assert!(
+            !s.reactor.contexts.is_member(c, panel),
+            "the panel is in no context"
+        );
         assert!(!s.reactor.lists_unsorted(), "only the panel is in no context");
 
         s.reactor.contexts.remove_window(id_of(c), quitting).unwrap();

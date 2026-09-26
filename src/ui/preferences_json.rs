@@ -487,7 +487,11 @@ fn describe_context_command(cmd: &ContextCommand) -> (String, String, u32) {
         }
         ContextCommand::SetContextNumber { context, number } => {
             let (context, order) = describe_context_ref(context);
-            (format!("Give {context} the number {number}"), category, 120 + order)
+            (
+                format!("Give {context} the number {number}"),
+                category,
+                120 + order,
+            )
         }
         ContextCommand::DeleteContext(context) => {
             let (context, order) = describe_context_ref(context);
@@ -1091,9 +1095,8 @@ mod tests {
                 } else {
                     format!("{modifiers} + {name}")
                 };
-                let hotkey = Hotkey::from_str(&text).unwrap_or_else(|()| {
-                    panic!("the loader rejects its own key name: {text}")
-                });
+                let hotkey = Hotkey::from_str(&text)
+                    .unwrap_or_else(|()| panic!("the loader rejects its own key name: {text}"));
                 let shown = format_hotkey(&hotkey);
                 assert_eq!(
                     Some(hotkey),
@@ -1184,6 +1187,70 @@ mod tests {
             bindings.iter().map(|(key, cmd)| (key.to_string(), cmd.clone())).collect();
         expected.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(expected, keys);
+    }
+
+    /// Bindings whose former command ids collided keep separate rows and
+    /// round-trip to their original commands. The Preferences payload carries
+    /// each command itself, so a name with a suffix cannot overwrite a
+    /// duplicate of its unsuffixed name.
+    #[test]
+    fn context_bindings_with_colliding_former_command_ids_survive_the_preferences_round_trip() {
+        let bindings = [
+            (
+                "Ctrl + Alt + KeyA",
+                ContextCommand::SwitchContext(ContextRef::Name("x".into())),
+            ),
+            (
+                "Ctrl + Alt + KeyB",
+                ContextCommand::SwitchContext(ContextRef::Name("x".into())),
+            ),
+            (
+                "Ctrl + Alt + KeyC",
+                ContextCommand::SwitchContext(ContextRef::Name("x#2".into())),
+            ),
+        ];
+        let mut config = Config::default();
+        config.keys = bindings
+            .iter()
+            .map(|(key, command)| {
+                (
+                    Hotkey::from_str(key).unwrap(),
+                    WmCommand::ReactorCommand(ReactorCommand::Context(command.clone())),
+                )
+            })
+            .collect();
+
+        let prefs = PreferencesJson::from_config(&config);
+        let mut commands: Vec<&str> =
+            prefs.hotkeys.iter().map(|binding| binding.command.as_str()).collect();
+        commands.sort();
+        assert_eq!(
+            vec![
+                r#"{"switch_context":"x"}"#,
+                r#"{"switch_context":"x"}"#,
+                r#"{"switch_context":"x#2"}"#,
+            ],
+            commands
+        );
+
+        let mut actual: Vec<(String, ContextCommand)> = prefs
+            .apply_to_config(&config)
+            .keys
+            .into_iter()
+            .map(|(hotkey, command)| match command {
+                WmCommand::ReactorCommand(ReactorCommand::Context(command)) => {
+                    (hotkey.to_string(), command)
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        actual.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut expected: Vec<(String, ContextCommand)> = bindings
+            .iter()
+            .map(|(key, command)| (key.to_string(), command.clone()))
+            .collect();
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(expected, actual);
     }
 
     /// The Preferences switch shows and sets

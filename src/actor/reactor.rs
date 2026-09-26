@@ -298,16 +298,10 @@ pub enum ContextCommand {
     /// show on the visible Spaces, and switches to it.
     CreateContext(String),
     /// Renames a context (R4).
-    RenameContext {
-        context: ContextRef,
-        name: String,
-    },
+    RenameContext { context: ContextRef, name: String },
     /// Gives a context a number from 1 to 9, away from the context that
     /// holds it (R5).
-    SetContextNumber {
-        context: ContextRef,
-        number: u8,
-    },
+    SetContextNumber { context: ContextRef, number: u8 },
     /// Deletes a context (R6). Its windows stay open, and the ones that
     /// were only in it become unsorted.
     DeleteContext(ContextRef),
@@ -1018,11 +1012,8 @@ impl Reactor {
                 self.in_drag = false;
                 self.resizing_window = None;
                 // Clean up hidden_windows tracking for this window.
-                if let Some(wsid) = self
-                    .window_ids
-                    .iter()
-                    .find(|(_, w)| **w == wid)
-                    .map(|(wsid, _)| *wsid)
+                if let Some(wsid) =
+                    self.window_ids.iter().find(|(_, w)| **w == wid).map(|(wsid, _)| *wsid)
                 {
                     self.hidden_windows.remove(&wsid);
                 }
@@ -1732,10 +1723,7 @@ impl Reactor {
         // with Cmd+W). The window server might still show them as visible, but
         // we should not include them in the layout.
         self.visible_windows.extend(
-            on_screen
-                .visible
-                .into_iter()
-                .filter(|wsid| !self.hidden_windows.contains(wsid)),
+            on_screen.visible.into_iter().filter(|wsid| !self.hidden_windows.contains(wsid)),
         );
         self.window_server_info
             .extend(on_screen.info.into_iter().map(|info| (info.id, info)));

@@ -6,14 +6,13 @@
 
 use test_log::test;
 
+use super::membership::{focus_quietly, open_window};
 use super::*;
 use crate::actor::contexts_snapshot::{CommandResult, RequestId};
 use crate::actor::reactor::RecordRef;
 use crate::actor::server::{ContextRequest, Response, answer_context_request};
 use crate::model::contexts::Contexts;
 use crate::sys::app::WindowInfo;
-
-use super::membership::{focus_quietly, open_window};
 
 /// Sends a context command from the command line with request id
 /// `request`, and lets the apps answer.

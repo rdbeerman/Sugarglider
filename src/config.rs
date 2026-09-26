@@ -1623,17 +1623,11 @@ mod tests {
         )
         .unwrap();
         let config = Config::load(Some(&path)).unwrap();
-        assert_eq!(
-            Some(String::new()),
-            config.window_rules[0].conditions.app_id
-        );
+        assert_eq!(Some(String::new()), config.window_rules[0].conditions.app_id);
 
         let mut prefs = preferences_for(&config);
         prefs.animate = !prefs.animate;
-        assert_eq!(
-            config.window_rules,
-            prefs.apply_to_config(&config).window_rules
-        );
+        assert_eq!(config.window_rules, prefs.apply_to_config(&config).window_rules);
 
         write_preferences_to_path(&prefs, &path).unwrap();
 
@@ -1698,10 +1692,7 @@ mod tests {
 
         let saved = Config::load(Some(&path)).unwrap();
         assert_eq!(vec![config.window_rules[1].clone()], saved.window_rules);
-        assert_eq!(
-            prefs.apply_to_config(&config).window_rules,
-            saved.window_rules
-        );
+        assert_eq!(prefs.apply_to_config(&config).window_rules, saved.window_rules);
     }
 
     /// A config file with an error stays as it is, and the error says what
@@ -2056,11 +2047,8 @@ mod tests {
             sorted_bindings(&prefs.apply_to_config(&config).keys),
             sorted_bindings(&saved.keys)
         );
-        let commands: Vec<String> = saved
-            .keys
-            .iter()
-            .map(|(_, cmd)| command_json(cmd).to_string())
-            .collect();
+        let commands: Vec<String> =
+            saved.keys.iter().map(|(_, cmd)| command_json(cmd).to_string()).collect();
         assert!(commands.contains(&r#"{"switch_context":7}"#.to_string()));
         assert!(commands.contains(&r#"{"switch_context":"Comms"}"#.to_string()));
     }

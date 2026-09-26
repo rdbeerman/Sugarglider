@@ -23,10 +23,9 @@ use objc2_core_foundation::CGSize;
 use objc2_foundation::{NSData, NSInteger, NSObject, NSObjectProtocol, NSString, ns_string};
 use tracing::{Span, debug, warn};
 
-use crate::actor::contexts_snapshot;
 use crate::actor::layout::LayoutCommand;
-use crate::actor::reactor;
 use crate::actor::wm_controller::{self, WmCmd, WmCommand, WmEvent};
+use crate::actor::{contexts_snapshot, reactor};
 use crate::config;
 use crate::ui::swift_bridge;
 
@@ -457,7 +456,9 @@ impl MenuHandler {
             menu.removeItem(&item);
         }
         let entries = match contexts_snapshot::published() {
-            Some(snapshot) => context_menu(&snapshot, &ivars.context_keys.borrow(), command_available),
+            Some(snapshot) => {
+                context_menu(&snapshot, &ivars.context_keys.borrow(), command_available)
+            }
             None => Vec::new(),
         };
         let mut actions = Vec::new();

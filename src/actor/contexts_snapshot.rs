@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::actor::app::WindowId;
 use crate::model::contexts::{
-    Context, ContextError, ContextId, ContextKey, Contexts, EVERYTHING_NAME, MemberRecord, NameMatch,
-    Query, UNSORTED_NAME, rank_entries, resolve_name,
+    Context, ContextError, ContextId, ContextKey, Contexts, EVERYTHING_NAME, MemberRecord,
+    NameMatch, Query, UNSORTED_NAME, fold, rank_entries,
 };
 
 /// The app name that stands in when a record names no app.
@@ -268,23 +268,27 @@ impl ContextsSnapshot {
     /// ranks the live contexts: the named contexts, Unsorted while it is
     /// listed, and Everything. Ties go to the most recently used entry.
     pub fn rank(&self, query: &str) -> Vec<(ContextKey, NameMatch)> {
-        let mut entries: Vec<(ContextKey, &str, u64)> = self
+        let mut entries: Vec<(ContextKey, String, u64)> = self
             .contexts
             .iter()
             .map(|context| {
-                (ContextKey::Named(context.id), context.name.as_str(), context.last_used)
+                (
+                    ContextKey::Named(context.id),
+                    context.name.clone(),
+                    context.last_used,
+                )
             })
             .collect();
         if self.unsorted.listed {
             entries.push((
                 ContextKey::Unsorted,
-                UNSORTED_NAME,
+                UNSORTED_NAME.to_string(),
                 self.unsorted.last_used,
             ));
         }
         entries.push((
             ContextKey::Everything,
-            EVERYTHING_NAME,
+            EVERYTHING_NAME.to_string(),
             self.everything.last_used,
         ));
         rank_entries(query, entries)
@@ -307,11 +311,19 @@ impl ContextsSnapshot {
                 .map(|context| ContextKey::Named(context.id))
                 .ok_or(ContextError::NoSuchContext),
             Query::Name(name) if name.trim().is_empty() => Err(ContextError::NoQuery),
-            Query::Name(name) => resolve_name(
-                name,
-                self.rank(name),
-                self.unsorted.listed && !self.contexts.is_empty(),
-            ),
+            Query::Name(name) => {
+                let lists_unsorted = self.unsorted.listed && !self.contexts.is_empty();
+                if !lists_unsorted && fold(name.trim()) == fold(UNSORTED_NAME) {
+                    return Err(ContextError::NoMatch(name.trim().to_string()));
+                }
+                self.rank(name)
+                    .into_iter()
+                    .find(|&(key, found)| {
+                        matches!(key, ContextKey::Named(_)) || found == NameMatch::Exact
+                    })
+                    .map(|(key, _)| key)
+                    .ok_or_else(|| ContextError::NoMatch(name.trim().to_string()))
+            }
         }
     }
 }

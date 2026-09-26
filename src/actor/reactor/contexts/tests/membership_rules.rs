@@ -523,8 +523,11 @@ fn r23_a_window_list_between_the_closes_of_a_quit_keeps_the_first_windows_record
             records(&s, d),
             "{listed}"
         );
-        let saved: Vec<String> =
-            vec!["Window1".to_string(), "Doc A".to_string(), "Doc B".to_string()];
+        let saved: Vec<String> = vec![
+            "Window1".to_string(),
+            "Doc A".to_string(),
+            "Doc B".to_string(),
+        ];
         assert_eq!(saved, saved_members(&s, c), "{listed}");
     }
 }
@@ -1374,11 +1377,15 @@ fn r28_with_contexts_off_a_title_change_doesnt_change_a_rules_classification() {
     };
     assert_eq!(vec![wid(1), wid(2)], tiled(&s.reactor));
 
-    s.reactor
-        .handle_event(Event::WindowTitleChanged(wid(2), "Preferences".to_string().into()));
+    s.reactor.handle_event(Event::WindowTitleChanged(
+        wid(2),
+        "Preferences".to_string().into(),
+    ));
     let listed = on_screen(&s, &[wid(1)]);
-    s.reactor
-        .handle_event(Event::WindowsOnScreenUpdated { pid: Some(1), on_screen: listed });
+    s.reactor.handle_event(Event::WindowsOnScreenUpdated {
+        pid: Some(1),
+        on_screen: listed,
+    });
     s.apps.simulate_until_quiet(&mut s.reactor);
     assert_eq!(vec![wid(1)], tiled(&s.reactor));
 
@@ -1483,8 +1490,12 @@ fn r20_r36_a_new_focused_window_at_a_minimized_windows_frame_joins_the_active_co
     report_visible(&mut s, &[wid(1)]);
     s.switch(c);
     assert!(s.parked().is_empty());
-    s.reactor.handle_event(Event::RaiseFocusSent { sequence_id: s.reactor.raise_sequence });
-    s.reactor.handle_event(Event::RaiseTimeout { sequence_id: s.reactor.raise_sequence });
+    s.reactor.handle_event(Event::RaiseFocusSent {
+        sequence_id: s.reactor.raise_sequence,
+    });
+    s.reactor.handle_event(Event::RaiseTimeout {
+        sequence_id: s.reactor.raise_sequence,
+    });
     s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
     s.reactor.handle_event(Event::ApplicationActivated(1, Quiet::No));
     s.reactor

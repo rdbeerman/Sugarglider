@@ -108,7 +108,9 @@ impl Reactor {
     /// Applies focus that waited for windows the reactor sees for the first
     /// time, now that their membership is decided.
     pub(super) fn focus_windows_seen(&mut self, wids: &[WindowId]) {
-        let Some((waiting, source)) = self.focus_waiting else { return };
+        let Some((waiting, source)) = self.focus_waiting else {
+            return;
+        };
         if !wids.contains(&waiting) {
             return;
         }
@@ -226,7 +228,11 @@ impl Reactor {
         let guard = &mut self.switch_guard;
         match raise {
             Some((sequence_id, focus)) => {
-                guard.raise = Some(RaiseWait { sequence_id, focus, sent: false });
+                guard.raise = Some(RaiseWait {
+                    sequence_id,
+                    focus,
+                    sent: false,
+                });
             }
             None => guard.echoes.extend(parked),
         }

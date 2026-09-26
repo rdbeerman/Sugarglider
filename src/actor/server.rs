@@ -792,7 +792,10 @@ mod tests {
             panic!("{event:?}");
         };
         assert_eq!(
-            (RequestId(10), ContextCommand::DeleteContext(ContextRef::Number(1))),
+            (
+                RequestId(10),
+                ContextCommand::DeleteContext(ContextRef::Number(1))
+            ),
             (request, command)
         );
         assert!(wm_rx.try_recv().is_err());

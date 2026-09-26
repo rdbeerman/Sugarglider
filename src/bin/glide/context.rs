@@ -617,8 +617,7 @@ mod tests {
     /// `Success`, and answers the asks for its result with `results`.
     fn run_forget(args: &[&str], results: Vec<Response>) -> Ran {
         let reply = ron::ser::to_string(&Response::Success).unwrap().into_bytes();
-        let list_reply =
-            ron::ser::to_string(&Response::Contexts(snapshot())).unwrap().into_bytes();
+        let list_reply = ron::ser::to_string(&Response::Contexts(snapshot())).unwrap().into_bytes();
         run_server(
             args,
             Some(Server {
@@ -708,7 +707,10 @@ mod tests {
                 },
             ),
             (&["delete", "2"], CmdContext::Delete(query("2"))),
-            (&["delete", "--name", "2024"], CmdContext::Delete(by_name("2024"))),
+            (
+                &["delete", "--name", "2024"],
+                CmdContext::Delete(by_name("2024")),
+            ),
             (
                 &["number", "Comms", "3"],
                 CmdContext::Number {
@@ -718,10 +720,7 @@ mod tests {
             ),
             (
                 &["number", "--name", "3", "9"],
-                CmdContext::Number {
-                    query: by_name("3"),
-                    number: 9,
-                },
+                CmdContext::Number { query: by_name("3"), number: 9 },
             ),
             (&["pin"], CmdContext::Pin),
             (
@@ -936,11 +935,7 @@ mod tests {
         for number in ["0", "10", "255"] {
             let ran = run_with(&["number", "Comms", number], Response::Success);
             assert_eq!(
-                (
-                    1,
-                    "",
-                    format!("Context numbers go from 1 to 9, not {number}\n")
-                ),
+                (1, "", format!("Context numbers go from 1 to 9, not {number}\n")),
                 (ran.status, &*ran.out, ran.err),
                 "{number}"
             );
@@ -956,10 +951,7 @@ mod tests {
     fn a_forget_index_is_the_record_index_of_list_json() {
         let printed = printed_json(&["list", "--json"], snapshot());
         assert_eq!(json!(2), printed["contexts"][0]["members"][2]["record"]);
-        assert_eq!(
-            json!("Inbox"),
-            printed["contexts"][0]["members"][2]["title"]
-        );
+        assert_eq!(json!("Inbox"), printed["contexts"][0]["members"][2]["title"]);
         assert_eq!(json!(null), printed["contexts"][0]["members"][2]["window"]);
 
         let ran = run_forget(&["forget", "Comms", "2"], vec![Response::Success]);
@@ -993,10 +985,7 @@ mod tests {
                 &["forget", "Unsorted", "0"],
                 "Only a named context has member records",
             ),
-            (
-                &["forget", "nothing", "0"],
-                "No context matches \"nothing\"",
-            ),
+            (&["forget", "nothing", "0"], "No context matches \"nothing\""),
         ] {
             let ran = run_forget(args, vec![Response::Success]);
             assert_eq!(
@@ -1020,10 +1009,7 @@ mod tests {
         );
 
         assert_eq!(2, ran.asks());
-        assert_eq!(
-            (1, "", format!("{reason}\n")),
-            (ran.status, &*ran.out, ran.err)
-        );
+        assert_eq!((1, "", format!("{reason}\n")), (ran.status, &*ran.out, ran.err));
     }
 
     /// M6. The reactor's reason for a command that did nothing goes to
@@ -1384,7 +1370,11 @@ mod tests {
             (&["list", "--json"], Response::Pong("x".into()), "Pong(\"x\")"),
             (&["create", "X"], Response::Pong("x".into()), "Pong(\"x\")"),
             (&["everything"], Response::Pong("x".into()), "Pong(\"x\")"),
-            (&["forget", "Comms", "2"], Response::Pong("x".into()), "Pong(\"x\")"),
+            (
+                &["forget", "Comms", "2"],
+                Response::Pong("x".into()),
+                "Pong(\"x\")",
+            ),
         ] {
             let ran = run_with(args, reply);
             assert_eq!(

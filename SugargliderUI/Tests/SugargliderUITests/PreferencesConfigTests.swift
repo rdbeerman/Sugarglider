@@ -142,4 +142,22 @@ final class PreferencesConfigTests: XCTestCase {
     XCTAssertEqual(hotkeys.count, 2)
     XCTAssertNotEqual(hotkeys[0].id, hotkeys[1].id)
   }
+
+  /// The row identity does not derive from a command name. A context called
+  /// "x#2" therefore cannot collide with a second binding for "x".
+  func testBindingsWithFormerCommandIdCollisionRetainCommandsAndIdentity() throws {
+    let commandX = #"{"switch_context":"x"}"#
+    let commandXSuffixed = #"{"switch_context":"x#2"}"#
+    let config = PreferencesConfig(hotkeys: [
+      HotkeyBinding(key: "⌃⌥A", command: commandX, description: "Switch to x", category: "Contexts"),
+      HotkeyBinding(key: "⌃⌥B", command: commandX, description: "Switch to x", category: "Contexts"),
+      HotkeyBinding(
+        key: "⌃⌥C", command: commandXSuffixed, description: "Switch to x#2", category: "Contexts"),
+    ])
+
+    let decoded = try JSONDecoder().decode(PreferencesConfig.self, from: JSONEncoder().encode(config))
+
+    XCTAssertEqual(decoded.hotkeys.map(\.command), [commandX, commandX, commandXSuffixed])
+    XCTAssertEqual(Set(decoded.hotkeys.map(\.id)).count, 3)
+  }
 }
