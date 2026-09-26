@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -20,11 +20,13 @@ use tokio::sync::mpsc::unbounded_channel;
 use tracing::Span;
 
 use super::{Event, Reactor};
-use crate::actor::app::{AppThreadHandle, Request};
+use crate::actor::app::{AppThreadHandle, Request, pid_t};
 use crate::actor::layout::LayoutManager;
 use crate::actor::parked_journal::{JournalEntry, ParkedJournal};
+use crate::collections::HashMap;
 use crate::config::Config;
 use crate::model::contexts::Contexts;
+use crate::sys::app::Process;
 
 thread_local! {
     static DESERIALIZE_THREAD_HANDLE: RefCell<Option<AppThreadHandle>> = RefCell::new(None);
@@ -40,6 +42,9 @@ pub struct Record {
     file: Option<File>,
     #[cfg(test)]
     temp: Option<NamedTempFile>,
+    /// Where the layout line is, and how long it is, while it can still be
+    /// rewritten because no event follows it.
+    layout_line: Option<(u64, u64)>,
 }
 
 // The format is simple:
@@ -48,11 +53,17 @@ pub struct Record {
 // line existed start their events on the third line.
 
 /// What the reactor read at launch besides the config and the layout: the
-/// parked-window journal, and the contexts if they were read.
+/// parked-window journal, the contexts if they were read, and whether the
+/// process of each journal entry ran then.
 #[derive(Serialize, Deserialize)]
 pub(super) struct LaunchState {
     pub(super) journal: Vec<JournalEntry>,
     pub(super) contexts: Option<Contexts>,
+    /// The process check of each journal entry's pid at launch. A replay
+    /// answers from this instead of the processes on the machine that
+    /// replays it.
+    #[serde(default)]
+    pub(super) processes: Vec<(pid_t, Process)>,
 }
 
 impl Record {
@@ -61,12 +72,13 @@ impl Record {
             file: path.map(|path| File::create(path).unwrap()),
             #[cfg(test)]
             temp: None,
+            layout_line: None,
         }
     }
 
     #[cfg(test)]
     pub fn new_for_test(temp: NamedTempFile) -> Self {
-        Self { file: None, temp: Some(temp) }
+        Self { file: None, temp: Some(temp), layout_line: None }
     }
 
     #[cfg(test)]
@@ -93,14 +105,34 @@ impl Record {
         let Some(file) = self.file() else { return };
         let config = ron::ser::to_string(&config).unwrap();
         let layout = ron::ser::to_string(&layout).unwrap();
-        write!(file, "{config}\n{layout}\n").unwrap();
+        write!(file, "{config}\n").unwrap();
+        let layout_at = file.stream_position().unwrap();
+        write!(file, "{layout}\n").unwrap();
+        let layout_end = file.stream_position().unwrap();
+        self.layout_line = Some((layout_at, layout_end - layout_at));
     }
 
-    /// Records what the reactor read at launch. Call it before the first
-    /// event.
-    pub(super) fn launch_state(&mut self, state: &LaunchState) {
-        let Some(file) = self.file() else { return };
+    /// Records the layout as it is now, and what the reactor read at launch.
+    /// Call it after the contexts were read, and before the first event, so
+    /// that the layout line shows the layouts that reading the contexts left.
+    pub(super) fn launch_state(&mut self, layout: &LayoutManager, state: &LaunchState) {
+        let layout = ron::ser::to_string(layout).unwrap();
         let line = ron::ser::to_string(state).unwrap();
+        let layout_line = self.layout_line.take();
+        let Some(file) = self.file() else { return };
+        if let Some((at, len)) = layout_line {
+            // Rewrite the layout line in place when nothing follows it yet.
+            let end = at + len;
+            if file.metadata().is_ok_and(|meta| meta.len() == end) {
+                file.seek(SeekFrom::Start(at)).unwrap();
+                write!(file, "{layout}\n").unwrap();
+                let after = file.stream_position().unwrap();
+                if after < end {
+                    file.set_len(after).unwrap();
+                }
+                file.seek(SeekFrom::End(0)).unwrap();
+            }
+        }
         write!(file, "{line}\n").unwrap();
     }
 
@@ -145,8 +177,17 @@ pub fn replay(
         group_indicators_tx,
         journal,
     );
-    if let Some(contexts) = state.and_then(|state| state.contexts) {
-        reactor.contexts = contexts;
+    if let Some(state) = state {
+        // The process checks come from the recording: which processes run on
+        // the machine that replays it says nothing about the recorded run.
+        let processes: HashMap<pid_t, Process> = state.processes.into_iter().collect();
+        if !processes.is_empty() {
+            reactor.process_lookup =
+                Box::new(move |pid| processes.get(&pid).cloned().unwrap_or(Process::Gone));
+        }
+        if let Some(contexts) = state.contexts {
+            reactor.contexts = contexts;
+        }
     }
     std::thread::spawn(move || {
         // Unfortunately we have to spawn a thread because the reactor blocks

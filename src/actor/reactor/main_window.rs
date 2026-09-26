@@ -119,6 +119,7 @@ impl MainWindowTracker {
             | Event::Command(..)
             | Event::ContextCommandRequested(..)
             | Event::ConfigChanged(_)
+            | Event::ContextsRead(_)
             | Event::WindowsOnScreenUpdated { .. } => return None,
         };
         if Some(event_pid) == self.global_frontmost && quiet_edge == Quiet::No {

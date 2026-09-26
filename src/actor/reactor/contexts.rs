@@ -11,7 +11,7 @@ use std::time::{Instant, SystemTime};
 use objc2_core_foundation::CGSize;
 use tracing::{debug, error, info, warn};
 
-use super::{ContextCommand, ContextRef, Reactor};
+use super::{ContextCommand, ContextRef, Event, Reactor};
 use crate::actor::app::{Request, WindowId, pid_t};
 use crate::actor::contexts_snapshot::CONTEXTS_OFF;
 use crate::actor::contexts_store::{ContextsStore, Loaded, empty_contexts_after};
@@ -555,7 +555,7 @@ impl Reactor {
         if self.contexts_enabled() {
             info!("Contexts are on");
             if self.contexts_unread {
-                self.read_contexts(SystemTime::now());
+                self.read_contexts_after_reload(SystemTime::now());
             } else {
                 self.rejoin_every_window();
             }
@@ -715,6 +715,27 @@ impl Reactor {
             }
         }
         self.rejoin_every_window();
+    }
+
+    /// Reads the contexts when a config reload turns contexts on, and records
+    /// them: a replay has no `contexts.json` to read, so it applies the
+    /// contexts from the recording.
+    fn read_contexts_after_reload(&mut self, now: SystemTime) {
+        self.read_contexts(now);
+        let event = Event::ContextsRead(Box::new(self.contexts.clone()));
+        self.record.on_event(&event);
+    }
+
+    /// Sets the contexts that a recorded reload read, and applies them as the
+    /// reload did.
+    pub(super) fn contexts_read(&mut self, contexts: Contexts) {
+        self.contexts = contexts;
+        self.contexts_unread = false;
+        self.layout.retain_context_layouts(|id| self.contexts.get(id).is_some());
+        self.rejoin_every_window();
+        if self.contexts_in_use() {
+            self.apply_again_focusing_parked_main();
+        }
     }
 
     /// Has the windows of the running apps rejoin the contexts whose records

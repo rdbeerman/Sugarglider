@@ -209,7 +209,6 @@ fn a_replay_of_membership_and_focus_changes_writes_the_frames_of_the_run() {
 /// of the recording writes the same frames, whichever processes run on the
 /// Mac that replays it. The app's pid runs on no Mac.
 #[test]
-#[ignore = "bug: a replay looks up processes on the live system, so it drops the journal entry of an app that registered after StartupComplete"]
 fn a_replay_puts_back_a_window_whose_app_registers_after_startup_completes() {
     const PID: i32 = 2_000_000_000;
     let dir = TempDir::new().unwrap();
@@ -262,7 +261,6 @@ fn a_replay_puts_back_a_window_whose_app_registers_after_startup_completes() {
 /// is read then, and the window that isn't in the active context is parked.
 /// A replay of the recording writes the same frames.
 #[test]
-#[ignore = "bug: a recording keeps only the contexts read at launch, so its replay misses a contexts.json read when a reload turns contexts on"]
 fn a_replay_of_a_run_that_turns_contexts_on_writes_the_frames_of_the_run() {
     let dir = TempDir::new().unwrap();
     let mut contexts = Contexts::new();

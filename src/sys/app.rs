@@ -82,7 +82,7 @@ impl From<&NSRunningApplication> for AppInfo {
 }
 
 /// The process that has a process id.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Process {
     /// No process has the id.
     Gone,

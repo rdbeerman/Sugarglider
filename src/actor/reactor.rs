@@ -249,6 +249,10 @@ pub enum Event {
     /// result in the contexts snapshot under the request's id.
     ContextCommandRequested(RequestId, ContextCommand),
     ConfigChanged(Arc<Config>),
+
+    /// The contexts a config reload read when it turned contexts on. A
+    /// recording keeps them, so a replay applies the same contexts.
+    ContextsRead(Box<Contexts>),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -711,14 +715,21 @@ impl Reactor {
         }
     }
 
-    /// Records the journal and the contexts read at launch, so that a replay
-    /// of the recording starts from them.
+    /// Records the journal, the contexts, and the process checks read at
+    /// launch, so that a replay of the recording starts from them.
     fn record_launch_state(&mut self) {
+        let processes: Vec<(pid_t, Process)> = self
+            .journal
+            .entries()
+            .iter()
+            .map(|entry| (entry.pid, (self.process_lookup)(entry.pid)))
+            .collect();
         let state = LaunchState {
             journal: self.journal.entries().to_vec(),
             contexts: (!self.contexts_unread).then(|| self.contexts.clone()),
+            processes,
         };
-        self.record.launch_state(&state);
+        self.record.launch_state(&self.layout, &state);
     }
 
     pub async fn run(mut self, events: Receiver, events_tx: Sender) {
@@ -1626,6 +1637,7 @@ impl Reactor {
                     self.contexts_turned_on_or_off();
                 }
             }
+            Event::ContextsRead(contexts) => self.contexts_read(*contexts),
         }
         if let Some(RaisedWindow { wid: raised_window, source }) = raised_window {
             let spaces = self.screens.iter().flat_map(|screen| screen.space).collect();
@@ -2891,6 +2903,7 @@ pub mod tests {
             let state = LaunchState {
                 journal: vec![],
                 contexts: Some(contexts.clone()),
+                processes: vec![],
             };
             let line = ron::ser::to_string(&state).unwrap();
             let read: LaunchState = ron::de::from_str(&line).unwrap();
