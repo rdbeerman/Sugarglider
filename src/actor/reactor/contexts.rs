@@ -4738,4 +4738,30 @@ mod tests {
         assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
         assert!(s.parked().is_empty());
     }
+
+    /// R33. Pins what the reactor does with a sequence that the space manager
+    /// never sends: a display change that lists a Space as managed, between
+    /// `ShowEverythingOn` for that Space and the Space change that turns the
+    /// Space off. The space manager sends display changes with the Spaces it
+    /// manages, and those already leave out a Space it is turning off. The
+    /// reactor takes the Spaces the display change lists, stops showing
+    /// Everything there, and applies the context again, so the windows are
+    /// parked again while Sugarglider is off.
+    #[test]
+    fn r33_a_display_change_that_lists_a_space_being_turned_off_applies_the_context_again() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        s.reactor.handle_event(Event::ShowEverythingOn(vec![space()]));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert!(s.parked().is_empty());
+
+        let event = displays(&s, vec![screen()], vec![Some(space())], &all);
+        s.reactor.handle_event(event);
+        s.reactor.handle_event(Event::SpaceChanged(vec![None], Default::default()));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+    }
 }
