@@ -117,6 +117,17 @@ public struct WindowRuleJson: Codable, Identifiable {
 
 // MARK: - Config Bridge
 
+/// What the Preferences window needs from Rust.
+@MainActor
+protocol PreferencesBackend: AnyObject {
+    /// Loads the configuration of the running window manager.
+    func loadConfig() throws -> PreferencesConfig
+    /// Applies the configuration to the running window manager.
+    func updateConfig(_ config: PreferencesConfig) throws
+    /// Saves the configuration to the config file.
+    func saveConfigToFile(_ config: PreferencesConfig) throws
+}
+
 /// Error types for config operations.
 public enum ConfigBridgeError: LocalizedError {
     case loadFailed(String)
@@ -138,7 +149,7 @@ public enum ConfigBridgeError: LocalizedError {
 
 /// Bridge for communicating config changes with the Rust backend.
 @MainActor
-public final class ConfigBridge {
+public final class ConfigBridge: PreferencesBackend {
     public static let shared = ConfigBridge()
 
     private init() {}

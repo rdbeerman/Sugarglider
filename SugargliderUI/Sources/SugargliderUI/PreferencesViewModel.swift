@@ -82,10 +82,16 @@ public class PreferencesViewModel: ObservableObject {
     // Error state for UI feedback
     @Published public var lastError: String? = nil
 
+    private let backend: PreferencesBackend
     private var cancellables = Set<AnyCancellable>()
     private var isLoading = false
 
-    public init() {
+    public convenience init() {
+        self.init(backend: ConfigBridge.shared)
+    }
+
+    init(backend: PreferencesBackend) {
+        self.backend = backend
         loadFromConfig()
         setupAutoSave()
         loadLaunchAtLogin()
@@ -129,7 +135,7 @@ public class PreferencesViewModel: ObservableObject {
         defer { isLoading = false }
 
         do {
-            let config = try ConfigBridge.shared.loadConfig()
+            let config = try backend.loadConfig()
             applyConfig(config)
         } catch {
             print("Failed to load config: \(error)")
@@ -206,9 +212,9 @@ public class PreferencesViewModel: ObservableObject {
 
         do {
             // Update running window manager immediately
-            try ConfigBridge.shared.updateConfig(config)
+            try backend.updateConfig(config)
             // Persist to file
-            try ConfigBridge.shared.saveConfigToFile(config)
+            try backend.saveConfigToFile(config)
             lastError = nil
         } catch {
             lastError = error.localizedDescription
