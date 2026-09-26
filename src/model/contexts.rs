@@ -348,7 +348,9 @@ impl Contexts {
 
     /// Deletes a context. Its windows stay open; the ones that were only in
     /// this context become unsorted. If it was active, Unsorted becomes
-    /// active so that those windows stay visible.
+    /// active so that those windows stay visible. That counts as a use of
+    /// Unsorted, and the context before the deleted one stays the previous
+    /// context unless it is Unsorted.
     pub fn delete(&mut self, id: ContextId) -> Result<Context, ContextError> {
         let idx = self
             .contexts
@@ -359,8 +361,9 @@ impl Contexts {
         let key = ContextKey::Named(id);
         if self.active == key {
             self.active = ContextKey::Unsorted;
+            self.unsorted_last_used = self.take_use();
         }
-        if self.previous == Some(key) {
+        if self.previous == Some(key) || self.previous == Some(self.active) {
             self.previous = None;
         }
         Ok(context)
@@ -1065,8 +1068,9 @@ impl Contexts {
 pub struct SwitchScreen {
     /// The screen's active context after the switch.
     pub active: ContextKey,
-    /// The windows on the screen's Space, with the windows the user can't
-    /// see listed with `unseen_space` set or left out.
+    /// The windows on the screen's visible Space, and the windows that are
+    /// only on its other Spaces, with `unseen_space` set. Every parked
+    /// window must be listed, so that showing Everything puts each one back.
     pub windows: Vec<SwitchWindow>,
 }
 
@@ -1128,11 +1132,14 @@ pub struct SwitchPlan {
 ///
 /// A window must show when it is a member of its screen's active context;
 /// under Everything every window must show. Windows that must show and are
-/// parked are put back. The others are parked, except Sugarglider's own
-/// windows, untracked and minimized windows, windows of hidden apps, and
-/// windows on Spaces nobody can see. Windows that are parked already stay
-/// parked. The focus goes to the most recently focused window that shows
-/// and that the user can see.
+/// parked are put back to their journal frames, whatever their state. Under
+/// Everything that is every parked window in the input, which is how
+/// showing Everything, quitting, and turning Sugarglider off restore windows
+/// (R27, R32, R33). The others are parked, except Sugarglider's own windows,
+/// untracked and minimized windows, windows of hidden apps, and windows on
+/// Spaces nobody can see. Windows that are parked already stay parked. The
+/// focus goes to the most recently focused window that shows and that the
+/// user can see.
 pub fn plan_switch(input: &SwitchInput) -> SwitchPlan {
     let mut plan = SwitchPlan::default();
     let mut focus: Option<&SwitchWindow> = None;
@@ -2328,9 +2335,7 @@ mod tests {
     }
 
     #[test]
-    fn r10_the_active_context_applies_to_a_newly_visible_space() {
-        // The screen changed Space; the new Space's windows are planned
-        // against the same active context.
+    fn r13_windows_in_no_context_are_parked_under_a_named_context() {
         let plan = plan_switch(&one_screen(
             ContextKey::Named(A),
             vec![member_of(wid(4, 1), &[A]), member_of(wid(4, 2), &[])],
@@ -2819,7 +2824,6 @@ mod tests {
     /// R6, R18: deleting the active context never leaves the previous
     /// context equal to the new active one.
     #[test]
-    #[ignore = "bug: deleting the active context can leave previous() equal to active()"]
     fn r6_deleting_the_active_context_never_makes_it_previous() {
         let mut cx = Contexts::new();
         let a = cx.create("A").unwrap();
@@ -2828,6 +2832,29 @@ mod tests {
         cx.delete(a).unwrap();
         assert_eq!(cx.active(), ContextKey::Unsorted);
         assert_ne!(cx.previous(), Some(ContextKey::Unsorted));
+    }
+
+    /// R6, R18, R19: deleting the active context counts as a use of
+    /// Unsorted, and the context used before it stays the previous one.
+    #[test]
+    fn r6_deleting_the_active_context_uses_unsorted_and_keeps_previous() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        cx.switch_to(named(b)).unwrap();
+        cx.switch_to(named(a)).unwrap();
+        cx.delete(a).unwrap();
+        assert_eq!(
+            (cx.active(), cx.previous()),
+            (ContextKey::Unsorted, Some(named(b)))
+        );
+        assert_eq!(cx.last_used(ContextKey::Unsorted), 3);
+        assert_eq!(ranked_names("", &cx, true), vec!["Unsorted", "B", "Everything"]);
+        cx.switch_to(cx.previous().unwrap()).unwrap();
+        assert_eq!(
+            (cx.active(), cx.previous()),
+            (named(b), Some(ContextKey::Unsorted))
+        );
     }
 
     /// R10: a window on a Space nobody sees is left alone. When its Space
@@ -3789,6 +3816,84 @@ mod tests {
             Arrival::Rejoined(vec![exact_title(Slot::Context(b), 0)])
         );
         assert_eq!(cx.focus_target(relaunched.wid), named(b));
+    }
+
+    /// R27, R32, R33: showing Everything, which quitting and turning off
+    /// also do, puts back every parked window on every screen, including
+    /// windows on Spaces nobody sees. The focus never goes to one of those.
+    #[test]
+    fn r32_everything_puts_back_parked_windows_on_every_screen_and_space() {
+        let input = SwitchInput {
+            screens: vec![
+                SwitchScreen {
+                    active: ContextKey::Everything,
+                    windows: vec![
+                        SwitchWindow {
+                            last_focus: Some(1),
+                            ..member_of(wid(1, 1), &[A])
+                        },
+                        SwitchWindow {
+                            parked: true,
+                            unseen_space: true,
+                            last_focus: Some(9),
+                            ..member_of(wid(1, 2), &[B])
+                        },
+                    ],
+                },
+                SwitchScreen {
+                    active: ContextKey::Everything,
+                    windows: vec![
+                        SwitchWindow {
+                            parked: true,
+                            unseen_space: true,
+                            ..member_of(wid(2, 1), &[])
+                        },
+                        SwitchWindow {
+                            parked: true,
+                            minimized: true,
+                            ..member_of(wid(2, 2), &[A])
+                        },
+                        SwitchWindow {
+                            parked: true,
+                            last_focus: Some(5),
+                            ..member_of(wid(2, 3), &[B])
+                        },
+                    ],
+                },
+            ],
+        };
+        assert_eq!(
+            plan_switch(&input),
+            SwitchPlan {
+                park: vec![],
+                unpark: vec![wid(1, 2), wid(2, 1), wid(2, 2), wid(2, 3)],
+                focus: Some(wid(2, 3)),
+            }
+        );
+    }
+
+    /// R3, R24: focusing a pinned window never switches, whichever context
+    /// is active, even when the window is also in another context.
+    #[test]
+    fn r24_focusing_a_pinned_window_never_switches() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let music = window(1, 1, "Music", "Music");
+        cx.add_window(b, &music).unwrap();
+        cx.pin(&music);
+        for active in [
+            named(a),
+            named(b),
+            ContextKey::Unsorted,
+            ContextKey::Everything,
+        ] {
+            cx.switch_to(active).unwrap();
+            assert_eq!(cx.focus_target(music.wid), active);
+        }
+        cx.unpin(music.wid);
+        cx.switch_to(named(a)).unwrap();
+        assert_eq!(cx.focus_target(music.wid), named(b));
     }
 
     /// R27: Everything puts back every parked window, including ones on
