@@ -15,6 +15,7 @@ use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use indexmap::IndexMap;
 use livesplit_hotkey::Hotkey;
 use macro_rules_attribute::derive;
 use partial::{PartialConfig, ValidationError};
@@ -77,7 +78,9 @@ pub struct Config {
 struct ConfigPartial {
     settings: SettingsPartial,
     window_rules: Option<Vec<WindowRule>>,
-    keys: Option<FxHashMap<String, WmCommandOrDisable>>,
+    /// The `[keys]` table in the order the file writes it, so that two
+    /// spellings of one hotkey can resolve to the last one.
+    keys: Option<IndexMap<String, WmCommandOrDisable>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -416,19 +419,22 @@ impl ConfigPartial {
     }
 
     fn validate(self) -> Result<Config, SpannedError> {
-        let mut keys = Vec::new();
+        let mut keys: Vec<(Hotkey, WmCommand)> = Vec::new();
         for (key, cmd) in self.keys.unwrap_or_default() {
             let cmd = match cmd {
                 WmCommandOrDisable::WmCommand(wm_command) => wm_command,
                 WmCommandOrDisable::Disable(_) => continue,
             };
-            let Ok(key) = Hotkey::from_str(&key) else {
+            let Ok(hotkey) = Hotkey::from_str(&key) else {
                 return Err(SpannedError {
                     message: format!("Could not parse hotkey: {key}"),
                     span: None,
                 });
             };
-            keys.push((key, cmd));
+            // "Alt + T" and "Alt + KeyT" name the same hotkey; the last
+            // entry wins, as in a TOML table.
+            keys.retain(|(bound, _)| *bound != hotkey);
+            keys.push((hotkey, cmd));
         }
         Ok(Config {
             settings: self.settings.validate()?,
@@ -828,7 +834,7 @@ mod tests {
     use crate::actor::layout::LayoutCommand;
     use crate::actor::reactor::Command as ReactorCommand;
     use crate::actor::wm_controller::{ExecCmd, WmCmd};
-    use crate::model::Direction;
+    use crate::model::{Direction, Orientation};
     use crate::ui::preferences_json::{PreferencesJson, command_json};
 
     /// The JSON that `ConfigBridge` in `SugargliderUI` sends to
@@ -1320,6 +1326,48 @@ mod tests {
         assert_eq!(Vec::<serde_json::Value>::new(), bound_to("Alt + T"));
         assert_eq!(vec![serde_json::json!("debug")], bound_to("Alt + Ctrl + H"));
         assert_eq!(Config::default().keys.len() - 1, config.keys.len());
+    }
+
+    /// Two spellings of one hotkey in one file bind the command of the last
+    /// entry, in the order the file writes them. With `default_keys`, the
+    /// same hotkey of the defaults is replaced too.
+    #[test]
+    fn the_last_spelling_of_a_hotkey_binds_its_command() {
+        for default_keys in [false, true] {
+            let config = Config::parse(&format!(
+                r#"
+                [settings]
+                default_keys = {default_keys}
+
+                [keys]
+                "Alt + T" = "debug"
+                "Alt + KeyT" = {{ group = "vertical" }}
+                "#,
+            ))
+            .unwrap();
+
+            let alt_t = Hotkey::from_str("Alt + T").unwrap();
+            let bindings: Vec<&WmCommand> = config
+                .keys
+                .iter()
+                .filter(|(hotkey, _)| *hotkey == alt_t)
+                .map(|(_, cmd)| cmd)
+                .collect();
+            assert_eq!(1, bindings.len(), "default_keys = {default_keys}");
+            assert_eq!(
+                command_json(&WmCommand::ReactorCommand(ReactorCommand::Layout(
+                    LayoutCommand::Group(Orientation::Vertical)
+                ))),
+                command_json(bindings[0]),
+                "default_keys = {default_keys}"
+            );
+            let default_count = Config::default().keys.len();
+            assert_eq!(
+                if default_keys { default_count } else { 1 },
+                config.keys.len(),
+                "default_keys = {default_keys}"
+            );
+        }
     }
 
     #[test]
