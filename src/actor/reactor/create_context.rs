@@ -32,6 +32,28 @@ impl Reactor {
         self.switch_context(ContextKey::Named(id))
     }
 
+    /// Creates a context whose members are exactly `windows`, and switches to
+    /// it. Each window is resolved to its native tab group (R36), and a
+    /// pinned window is left out: it is a member of every context already
+    /// (R3). The caller checks that contexts are on and that Sugarglider
+    /// isn't quitting.
+    pub(super) fn create_context_from_windows(
+        &mut self,
+        name: &str,
+        windows: &[WindowId],
+    ) -> Result<(), String> {
+        let id = self.contexts.create(name).map_err(|err| err.to_string())?;
+        let members = self.group_windows(windows);
+        for &wid in &members {
+            if let Some(desc) = self.window_desc(wid) {
+                self.contexts.add_window(id, &desc).expect("the context was just created");
+            }
+        }
+        info!(name, members = members.len(), "Created a context");
+        self.save_contexts();
+        self.switch_context(ContextKey::Named(id))
+    }
+
     /// The windows on the visible Spaces for which `keep` returns true, in id
     /// order. These are the windows of running apps that the window server
     /// lists as visible, on a screen that shows a Space, or on no screen

@@ -771,6 +771,7 @@ mod tests {
         for unreadable in [
             &b"Context(Delete)"[..],
             b"Context(Run(switch_context(\"cli\")))",
+            b"Context(Run(9, unknown_command(1)))",
             b"Context(Run(9, switch_context(300)))",
             b"Context(Result(-1))",
             b"",

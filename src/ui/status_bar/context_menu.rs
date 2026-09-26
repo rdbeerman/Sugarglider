@@ -8,7 +8,8 @@
 //! "Menu bar".
 
 use livesplit_hotkey::Hotkey;
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::Value;
 
 use crate::actor::contexts_snapshot::ContextsSnapshot;
 use crate::actor::reactor::{self, ContextCommand, ContextRef};
@@ -16,14 +17,6 @@ use crate::actor::wm_controller::WmCommand;
 use crate::collections::{BTreeMap, HashSet};
 use crate::model::contexts::{ContextId, ContextKey, UNSORTED_NAME, fold};
 use crate::ui::status_bar::MenuKeyEquivalent;
-
-/// The name of the command that opens the switcher, as a key binding writes
-/// it.
-const OPEN_CONTEXT_SWITCHER: &str = "open_context_switcher";
-/// Whether the `open_context_switcher` command exists. M8 adds it as
-/// `ContextCommand::OpenContextSwitcher` and sets this to true, or replaces
-/// the arm that reads it. Until then the menu item stays disabled.
-const OPEN_CONTEXT_SWITCHER_BUILT: bool = false;
 
 /// What choosing an item of the section does.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,12 +48,7 @@ impl MenuAction {
             MenuAction::SendWindowTo(id) => {
                 context(ContextCommand::MoveWindowToContext(ContextRef::Id(*id)))
             }
-            MenuAction::OpenSwitcher if OPEN_CONTEXT_SWITCHER_BUILT => {
-                command_named(json!(OPEN_CONTEXT_SWITCHER))
-            }
-            // M8 adds the command; nothing names it yet, so the item is
-            // disabled.
-            MenuAction::OpenSwitcher => None,
+            MenuAction::OpenSwitcher => context(ContextCommand::OpenContextSwitcher),
         }
     }
 }
@@ -72,6 +60,7 @@ pub fn command_available(action: &MenuAction) -> bool {
 
 /// The command that a key binding written as `value` names, or `None` when
 /// no command reads `value`.
+#[cfg(test)]
 fn command_named(value: Value) -> Option<WmCommand> {
     let command: WmCommand = serde_json::from_value(value.clone()).ok()?;
     // `WmCommand` is untagged, so a command with another name could read the
@@ -114,7 +103,6 @@ impl ContextMenuKeys {
     /// The key equivalents of `bindings`. When several bindings have the same
     /// command, the first one counts.
     pub fn new(bindings: &[(Hotkey, WmCommand)]) -> Self {
-        let open_switcher = json!(OPEN_CONTEXT_SWITCHER);
         let mut keys = ContextMenuKeys::default();
         for (hotkey, command) in bindings {
             let Some(key) = MenuKeyEquivalent::from_hotkey(hotkey) else {
@@ -127,7 +115,7 @@ impl ContextMenuKeys {
                 Some(ContextCommand::ShowEverything) => {
                     keys.show_everything.get_or_insert(key);
                 }
-                _ if serde_json::to_value(command).is_ok_and(|value| value == open_switcher) => {
+                Some(ContextCommand::OpenContextSwitcher) => {
                     keys.open_switcher.get_or_insert(key);
                 }
                 _ => {}
@@ -221,11 +209,15 @@ pub fn context_menu(
         enabled: send.iter().any(|item| item.enabled),
         items: send,
     });
-    entries.push(MenuEntry::Item(item(
+    let open = item(
         "Open Switcher…",
         MenuAction::OpenSwitcher,
         keys.open_switcher.clone(),
-    )));
+    );
+    entries.push(MenuEntry::Item(MenuItem {
+        enabled: open.enabled && shown.is_some(),
+        ..open
+    }));
     entries.push(MenuEntry::Separator);
     entries
 }
@@ -761,7 +753,7 @@ mod tests {
     /// managed Space: after Stop Globally, or at the login window, the
     /// snapshot has no screens. Then no item is checked, whichever context
     /// is active, and the items that switch or create a context are
-    /// disabled. Send Window to still works.
+    /// disabled, including Open Switcher. Send Window to still works.
     #[test]
     fn with_no_managed_space_nothing_is_checked_and_switches_are_disabled() {
         for active in [Some("Comms"), Some("Unsorted"), None] {
@@ -778,7 +770,7 @@ mod tests {
                 .filter(|item| item.enabled && !matches!(item.action, MenuAction::SendWindowTo(_)))
                 .map(|item| item.title.as_str())
                 .collect();
-            assert_eq!(vec!["Open Switcher…"], enabled, "{active:?}");
+            assert!(enabled.is_empty(), "{active:?}");
             assert!(submenu(&entries).0, "{active:?}");
         }
     }
@@ -910,6 +902,10 @@ mod tests {
             (hotkey("Ctrl + Alt + Shift + Digit4"), switch_to_number(4)),
             (hotkey("Digit5"), switch_to_number(5)),
             (hotkey("Shift + Digit0"), context(ContextCommand::ShowEverything)),
+            (
+                hotkey("Ctrl + Alt + Space"),
+                context(ContextCommand::OpenContextSwitcher),
+            ),
         ];
 
         assert_eq!(
@@ -934,7 +930,10 @@ mod tests {
                 ]
                 .into(),
                 show_everything: Some(key("0", NSEventModifierFlags::Shift)),
-                open_switcher: None,
+                open_switcher: Some(key(
+                    " ",
+                    NSEventModifierFlags::Control | NSEventModifierFlags::Option,
+                )),
             },
             ContextMenuKeys::new(&bindings)
         );
@@ -1098,7 +1097,7 @@ mod tests {
     /// config give: each context by its id, Unsorted by its reserved name,
     /// Everything as `show_everything`, and a new context by its name. Send
     /// Window to and Open Switcher send `move_window_to_context` with the
-    /// context's id and `open_context_switcher`, once those commands exist.
+    /// context's id and `open_context_switcher`.
     #[test]
     fn the_items_send_the_commands_that_key_bindings_give() {
         let snapshot = snapshot(Some("Comms"), 2);
@@ -1109,9 +1108,7 @@ mod tests {
         let sent: Vec<(&str, Value)> = entries
             .iter()
             .filter_map(|entry| match entry {
-                MenuEntry::Item(item) if item.action != MenuAction::OpenSwitcher => {
-                    Some((item.title.as_str(), json(item.action.command())))
-                }
+                MenuEntry::Item(item) => Some((item.title.as_str(), json(item.action.command()))),
                 _ => None,
             })
             .collect();
@@ -1128,6 +1125,7 @@ mod tests {
                     "New Context from Current Windows…",
                     bound(r#"{ create_context = "Context 4" }"#)
                 ),
+                ("Open Switcher…", bound(r#""open_context_switcher""#)),
             ],
             sent
         );
@@ -1135,16 +1133,17 @@ mod tests {
             serde_json::json!({ "move_window_to_context": { "id": relax } }),
             json(MenuAction::SendWindowTo(relax).command()),
         );
-        // M8 adds the command; the item is disabled until then.
-        assert!(MenuAction::OpenSwitcher.command().is_none());
+        assert_eq!(
+            serde_json::json!("open_context_switcher"),
+            json(MenuAction::OpenSwitcher.command())
+        );
     }
 
     /// The status menu's own check, `command_available`, with the published
-    /// snapshot: every item is enabled except Open Switcher, whose command M8
-    /// adds. Send Window to now sends a typed command, so its submenu and
-    /// every item but the active context's are enabled.
+    /// snapshot: every item is enabled. Send Window to sends a typed command,
+    /// so its submenu and every item but the active context's are enabled.
     #[test]
-    fn the_status_menu_enables_every_item_but_open_switcher() {
+    fn the_status_menu_enables_open_switcher() {
         let entries = context_menu(&snapshot(Some("Unsorted"), 2), &keys(), command_available);
 
         let disabled: Vec<&str> = items(&entries)
@@ -1152,7 +1151,7 @@ mod tests {
             .filter(|item| !item.enabled)
             .map(|item| item.title.as_str())
             .collect();
-        assert_eq!(vec!["Open Switcher…"], disabled);
+        assert!(disabled.is_empty());
         let (enabled, send) = submenu(&entries);
         assert!(enabled);
         assert_eq!(3, send.len());

@@ -3,6 +3,7 @@
 
 //! UI components.
 
+pub mod context_switcher;
 pub mod group_bar;
 pub mod permission_flow;
 pub mod preferences_json;

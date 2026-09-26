@@ -1074,15 +1074,14 @@ mod tests {
 
     /// Key bindings. The default config ships the context bindings of the
     /// spec commented out, so none is bound, and every shipped line parses
-    /// once uncommented. `open_context_switcher` isn't shipped until the
-    /// switcher's command exists.
+    /// once uncommented.
     #[test]
     fn the_default_config_ships_the_context_bindings_commented_out() {
         use crate::actor::reactor::{ContextCommand, ContextRef};
 
         let default_config = include_str!("../sugarglider.default.toml");
-        assert!(!default_config.contains("open_context_switcher"));
         let shipped = [
+            r#"# "Ctrl + Alt + Space" = "open_context_switcher""#,
             r#"# "Ctrl + Alt + 0" = "show_everything""#,
             r#"# "Ctrl + Alt + 1" = { switch_context = 1 }"#,
             r#"# "Ctrl + Alt + 2" = { switch_context = 2 }"#,
@@ -1123,6 +1122,10 @@ mod tests {
                 (
                     "Ctrl + Alt + Digit2".to_string(),
                     ContextCommand::SwitchContext(ContextRef::Number(2))
+                ),
+                (
+                    "Ctrl + Alt + Space".to_string(),
+                    ContextCommand::OpenContextSwitcher
                 ),
                 ("Ctrl + Alt + Tab".to_string(), ContextCommand::PreviousContext),
             ],

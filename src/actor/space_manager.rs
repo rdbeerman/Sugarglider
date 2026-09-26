@@ -130,6 +130,9 @@ impl SpaceManager {
             } => {
                 self.cur_screen_id = ids.clone();
                 self.handle_space_changed(&spaces);
+                self.reactor_tx.send(reactor::Event::DisplayIdsChanged(
+                    self.cur_screen_id.iter().map(|id| id.get()).collect(),
+                ));
                 self.reactor_tx.send(reactor::Event::ScreenParametersChanged {
                     frames: frames.clone(),
                     bounds,

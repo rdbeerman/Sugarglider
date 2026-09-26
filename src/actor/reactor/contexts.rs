@@ -507,6 +507,7 @@ impl Reactor {
         self.rejoin_for_switch(target);
         match self.apply(Apply::Switch { target, screen }) {
             Ok((plan, response)) => {
+                self.hide_context_switcher();
                 self.save_contexts();
                 let parked: Vec<WindowId> =
                     plan.park.iter().copied().filter(|wid| self.parked.contains_key(wid)).collect();
@@ -554,6 +555,7 @@ impl Reactor {
     /// is about to stop managing. The active context doesn't change, and the
     /// next space change applies it again.
     pub(super) fn show_everything_on(&mut self, spaces: &[SpaceId]) {
+        self.hide_context_switcher();
         if !self.contexts_in_use() {
             return;
         }
@@ -591,17 +593,21 @@ impl Reactor {
         if self.pending_exit.is_some() {
             return Err(QUITTING.to_string());
         }
+        let opens = matches!(command, ContextCommand::OpenContextSwitcher);
         let switches = matches!(
             command,
             ContextCommand::SwitchContext(_)
                 | ContextCommand::ShowEverything
                 | ContextCommand::PreviousContext
                 | ContextCommand::CreateContext(_)
+                | ContextCommand::CreateContextFromWindows { .. }
+                | ContextCommand::OpenContextSwitcher
         );
         if switches && self.screens.iter().all(|screen| screen.space.is_none()) {
             return Err(NO_MANAGED_SPACE.to_string());
         }
-        match command {
+        let result = match command {
+            ContextCommand::OpenContextSwitcher => self.open_context_switcher(),
             ContextCommand::SwitchContext(reference) => {
                 let key = self.resolve(&reference).map_err(|err| err.to_string())?;
                 self.switch_context(key)
@@ -631,6 +637,24 @@ impl Reactor {
             }
             ContextCommand::ToggleWindowPinned => self.toggle_window_pinned(self.main_window()),
             ContextCommand::CreateContext(name) => self.create_context(&name),
+            ContextCommand::AddWindow { window, context } => {
+                self.add_window_to_context(self.carried_window(window), &context)
+            }
+            ContextCommand::MoveWindow { window, context } => {
+                self.move_window_to_context(self.carried_window(window), &context)
+            }
+            ContextCommand::TogglePinned { window } => {
+                self.toggle_window_pinned(self.carried_window(window))
+            }
+            ContextCommand::CreateContextFromWindows { name, windows } => {
+                self.create_context_from_windows(&name, &windows)
+            }
+            ContextCommand::EditContext {
+                context,
+                add,
+                remove,
+                remove_records,
+            } => self.edit_context(&context, &add, &remove, &remove_records),
             ContextCommand::RenameContext { context, name } => {
                 let id =
                     self.resolve_named_context(&context, "Only a named context can be renamed")?;
@@ -669,7 +693,11 @@ impl Reactor {
                     .resolve_named_context(&context, "Only a named context has member records")?;
                 self.remove_record(id, &record)
             }
+        };
+        if result.is_ok() && !opens {
+            self.hide_context_switcher();
         }
+        result
     }
 
     /// The named context that a command that changes contexts names, or
@@ -820,7 +848,7 @@ impl Reactor {
 
     /// The entry that a command names, as `model::contexts::resolve` finds
     /// it.
-    fn resolve(&self, reference: &ContextRef) -> Result<ContextKey, ContextError> {
+    pub(super) fn resolve(&self, reference: &ContextRef) -> Result<ContextKey, ContextError> {
         resolve(reference.query(), &self.contexts, self.lists_unsorted())
     }
 
@@ -864,6 +892,7 @@ impl Reactor {
             }
         } else {
             info!("Contexts are off; showing every window");
+            self.hide_context_switcher();
             // A window that waits for the window server's list is not new when
             // contexts come back: it was found while they were off.
             self.pending_first_seen.clear();
@@ -1116,6 +1145,7 @@ mod tests {
     mod membership_rules;
     mod replay_rules;
     mod scope;
+    mod switcher;
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))

@@ -286,7 +286,7 @@ fn key_from_text(text: &str) -> Option<KeyCode> {
 
 /// The hotkey as the Preferences window shows it, e.g. "⌥⇧H". The inverse of
 /// [`parse_hotkey_string`].
-fn format_hotkey(hotkey: &Hotkey) -> String {
+pub(crate) fn format_hotkey(hotkey: &Hotkey) -> String {
     let mut result = String::new();
     for &(modifier, symbol) in MODIFIER_SYMBOLS {
         if hotkey.modifiers.contains(modifier) {
@@ -456,6 +456,9 @@ fn describe_context_command(cmd: &ContextCommand) -> (String, String, u32) {
     let category = "Contexts".to_string();
     match cmd {
         ContextCommand::ShowEverything => ("Show every window".to_string(), category, 0),
+        ContextCommand::OpenContextSwitcher => {
+            ("Open the context switcher".to_string(), category, 11)
+        }
         ContextCommand::SwitchContext(ContextRef::Number(number)) => (
             format!("Switch to context {number}"),
             category,
@@ -489,6 +492,24 @@ fn describe_context_command(cmd: &ContextCommand) -> (String, String, u32) {
             category,
             40,
         ),
+        ContextCommand::AddWindow { context, .. } => {
+            let (name, order) = describe_context_ref(context);
+            (format!("Add a window to {name}"), category, 40 + order)
+        }
+        ContextCommand::MoveWindow { context, .. } => {
+            let (name, order) = describe_context_ref(context);
+            (format!("Move a window to {name}"), category, 60 + order)
+        }
+        ContextCommand::TogglePinned { .. } => ("Pin or unpin a window".to_string(), category, 81),
+        ContextCommand::CreateContextFromWindows { name, .. } => (
+            format!("Create context \"{name}\" from chosen windows"),
+            category,
+            40,
+        ),
+        ContextCommand::EditContext { context, .. } => {
+            let (name, order) = describe_context_ref(context);
+            (format!("Edit the windows of {name}"), category, 82 + order)
+        }
         ContextCommand::RenameContext { context, name } => {
             let (context, order) = describe_context_ref(context);
             (format!("Rename {context} to \"{name}\""), category, 100 + order)

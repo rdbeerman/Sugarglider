@@ -253,12 +253,13 @@ pub struct ScreenInfo {
 pub struct ScreenId(CGDirectDisplayID);
 
 impl ScreenId {
-    pub fn new(id: u32) -> ScreenId {
-        ScreenId(id)
-    }
-
     pub fn get(self) -> u32 {
         self.0
+    }
+
+    #[cfg(test)]
+    pub fn new(id: u32) -> ScreenId {
+        ScreenId(id)
     }
 }
 

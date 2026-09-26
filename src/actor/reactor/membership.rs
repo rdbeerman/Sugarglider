@@ -9,9 +9,12 @@ use redact::Secret;
 use tracing::{debug, error, info};
 
 use super::contexts::Apply;
-use super::{ContextRef, Reactor};
+use super::{ContextRef, Reactor, RecordRef};
 use crate::actor::app::{WindowId, pid_t};
-use crate::model::contexts::{Arrival, ContextKey, MatchPass, RecordLink, WindowDesc, plan_switch};
+use crate::actor::contexts_snapshot::app_name;
+use crate::model::contexts::{
+    Arrival, ContextId, ContextKey, MatchPass, RecordLink, Slot, WindowDesc, plan_switch,
+};
 
 impl Reactor {
     /// Decides the membership of windows that the reactor sees for the first
@@ -394,7 +397,6 @@ impl Reactor {
     }
 
     /// Pins the window and its tabs, which makes them members of every context,
-    /// or unpins them. Unpinned windows that no longer show are parked.
     pub(super) fn toggle_window_pinned(&mut self, window: Option<WindowId>) -> Result<(), String> {
         let tabs = self.command_windows(window)?;
         let unpin = self.contexts.is_pinned(tabs[0]);
@@ -411,6 +413,96 @@ impl Reactor {
             self.park_windows_that_left(&tabs);
         }
         Ok(())
+    }
+
+    /// The windows a switcher command acts on: each window resolved to its
+    /// native tab group (R36), without the windows that are pinned, which are
+    /// members of every context already (R3), and without duplicates.
+    pub(super) fn group_windows(&self, wids: &[WindowId]) -> Vec<WindowId> {
+        let mut windows: Vec<WindowId> = vec![];
+        for &wid in wids {
+            for tab in self.tabs_of(self.membership_window(wid)) {
+                if self.contexts.is_pinned(tab) || windows.contains(&tab) {
+                    continue;
+                }
+                windows.push(tab);
+            }
+        }
+        windows
+    }
+
+    /// The window a membership command acts on: the one it carries, or the
+    /// focused window when it carries none. A command that carries a window
+    /// never falls back to the focused one, because the switcher panel has
+    /// key focus while it is open.
+    pub(super) fn carried_window(&self, window: Option<WindowId>) -> Option<WindowId> {
+        window.or_else(|| self.main_window())
+    }
+
+    /// Changes a context's members as the switcher's edit view asks: the
+    /// records in `remove_records` go first (R23), then the windows in
+    /// `remove` leave at once (R37), then the windows in `add` join for the
+    /// next switch. A pinned window is left out of both lists.
+    pub(super) fn edit_context(
+        &mut self,
+        reference: &ContextRef,
+        add: &[WindowId],
+        remove: &[WindowId],
+        remove_records: &[RecordRef],
+    ) -> Result<(), String> {
+        let id = self.resolve_named(reference)?;
+        self.remove_member_records(id, remove_records);
+        let removed = self.group_windows(remove);
+        for &wid in &removed {
+            _ = self.contexts.remove_window(id, wid);
+            self.added_since_switch.remove(&wid);
+        }
+        let added = self.group_windows(add);
+        for &wid in &added {
+            if let Some(desc) = self.window_desc(wid) {
+                _ = self.contexts.add_window(id, &desc);
+                self.added_since_switch.insert(wid);
+            }
+        }
+        info!(
+            ?id,
+            added = added.len(),
+            removed = removed.len(),
+            "Edited a context"
+        );
+        self.save_contexts();
+        self.park_windows_that_left(&removed);
+        Ok(())
+    }
+
+    /// Removes the member records the switcher listed, from the highest index
+    /// down, so that removing one record doesn't move the next one's index. A
+    /// record that no longer matches its app and title, or that has an open
+    /// window again, is skipped and logged: R23 changes the list while the
+    /// panel is open.
+    fn remove_member_records(&mut self, id: ContextId, refs: &[RecordRef]) {
+        let mut highest_first: Vec<&RecordRef> = refs.iter().collect();
+        highest_first.sort_by_key(|item| std::cmp::Reverse(item.record));
+        for item in highest_first {
+            let matches = self
+                .contexts
+                .get(id)
+                .and_then(|context| context.members.get(item.record))
+                .is_some_and(|record| {
+                    record.window().is_none()
+                        && app_name(record) == item.app
+                        && record.title == item.title
+                });
+            if !matches {
+                info!(
+                    ?id,
+                    record = item.record,
+                    "Skipping a member record that changed before the edit"
+                );
+                continue;
+            }
+            _ = self.contexts.remove_record(Slot::Context(id), item.record);
+        }
     }
 
     /// Parks the windows that left the active context and no longer show, with
