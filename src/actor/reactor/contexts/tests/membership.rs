@@ -864,3 +864,33 @@ fn r37_membership_commands_that_cant_apply_change_nothing() {
     assert!(s.reactor.contexts.pinned().is_empty());
     assert!(s.parked().is_empty());
 }
+
+/// R36. Tabs 2 and 3 of a group hold different records, for example
+/// because window 3 was dragged into the group. The group's main tab,
+/// window 2, decides for both: switching to its context parks neither, and
+/// switching to a context without it parks both.
+#[test]
+fn r36_a_group_shows_and_hides_with_its_main_tab() {
+    let mut s = Setup::on(vec![screen()], vec![Some(space())]);
+    let at = |idx: usize, frame: CGRect| WindowInfo { frame, ..make_window(idx) };
+    let left = rect(0., 0., 600., 1000.);
+    let right = rect(600., 0., 600., 1000.);
+    let windows = vec![at(1, left), at(2, right), at(3, right)];
+    s.reactor
+        .handle_events(s.apps.make_app_with_opts(1, windows, Some(wid(2)), false));
+    s.reactor.handle_event(Event::StartupComplete);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    assert_eq!(vec![wid(2), wid(3)], s.reactor.tabs_of(wid(2)));
+    let c = s.create("C", &[wid(1), wid(2)]);
+    let d = s.create("D", &[wid(3)]);
+    let e = s.create("E", &[wid(1)]);
+
+    s.switch(c);
+    assert!(s.parked().is_empty());
+    assert_eq!(right, s.frame(wid(3)));
+
+    s.switch(d);
+    assert_eq!(vec![wid(1), wid(2), wid(3)], s.parked());
+    s.switch(e);
+    assert_eq!(vec![wid(2), wid(3)], s.parked());
+}

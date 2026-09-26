@@ -17,7 +17,7 @@ use crate::actor::contexts_store::{ContextsStore, Loaded, empty_contexts_after};
 use crate::actor::layout::{ActiveContext, EventResponse, LayoutEvent};
 use crate::model::contexts::{
     ContextError, ContextId, ContextKey, Contexts, MatchPass, NameMatch, SwitchInput, SwitchPlan,
-    SwitchScreen, WindowDesc, plan_switch, rank,
+    SwitchScreen, SwitchWindow, WindowDesc, plan_switch, rank,
 };
 use crate::sys::screen::SpaceId;
 
@@ -90,8 +90,10 @@ impl Reactor {
 
     /// Whether the window shows when `key` is shown. A window added to a
     /// context since the last switch counts as a member of the active
-    /// context until the next switch (R37).
+    /// context until the next switch (R37). A tab shows with its group's
+    /// main tab (R36).
     pub(super) fn shows_under(&self, key: ContextKey, wid: WindowId) -> bool {
+        let wid = self.membership_window(wid);
         match key {
             ContextKey::Everything => true,
             key => {
@@ -221,8 +223,14 @@ impl Reactor {
                 && self.windows[&wid]
                     .window_server_id
                     .is_some_and(|wsid| self.visible_windows.contains(&wsid));
-            let mut window = self.contexts.switch_window(wid);
-            if self.added_since_switch.contains(&wid) {
+            // A tab has the membership of its group's main tab (R36).
+            let decides = self.membership_window(wid);
+            let mut window = SwitchWindow {
+                wid,
+                last_focus: self.contexts.last_focus(wid),
+                ..self.contexts.switch_window(decides)
+            };
+            if self.added_since_switch.contains(&decides) {
                 // It counts as a member of the active context (R37).
                 match self.contexts.active() {
                     ContextKey::Named(id) if !window.contexts.contains(&id) => {

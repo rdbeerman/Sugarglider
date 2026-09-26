@@ -122,6 +122,12 @@ impl Reactor {
         tabs
     }
 
+    /// The window whose membership decides the window's (R36): the main tab
+    /// of its tab group, or the window itself.
+    pub(super) fn membership_window(&self, wid: WindowId) -> WindowId {
+        self.main_tab(wid).unwrap_or(wid)
+    }
+
     /// The main tab of the window's tab group: the app's main window when it
     /// is one of the group's tabs other than `wid`.
     fn main_tab(&self, wid: WindowId) -> Option<WindowId> {
