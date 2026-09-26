@@ -37,8 +37,7 @@ impl Reactor {
                 })
             })
             .collect();
-        let unsorted = self.windows_on_visible_spaces(|wid| self.contexts.is_unsorted(wid)).len();
-        ContextsSnapshot::new(&self.contexts, screens, unsorted)
+        ContextsSnapshot::new(&self.contexts, screens, self.unsorted_windows().len())
     }
 
     /// Keeps the result of a command from the command line for the next
@@ -150,11 +149,15 @@ mod tests {
         assert!(on.contexts.is_empty());
         assert_eq!(0, on.unsorted.windows);
 
-        // Windows open.
+        // Windows open. Before the first context exists, no window is
+        // unsorted, so nothing the snapshot holds changes.
+        let before = count(&published);
         s.reactor.handle_events(s.apps.make_app(1, make_windows(3)));
         s.reactor.handle_event(Event::StartupComplete);
         s.apps.simulate_until_quiet(&mut s.reactor);
-        assert_eq!(3, last(&published).unsorted.windows);
+        assert_eq!(before, count(&published));
+        assert_eq!(on, last(&published));
+        assert!(!on.unsorted.listed);
 
         // Nothing changes.
         let before = count(&published);
@@ -196,9 +199,11 @@ mod tests {
         s.reactor.handle_events(s.apps.make_app(2, vec![other_window]));
         s.apps.simulate_until_quiet(&mut s.reactor);
         assert_eq!(1, last(&published).unsorted.windows);
+        assert!(last(&published).unsorted.listed);
         s.apps.windows.remove(&other);
         s.reactor.handle_event(Event::WindowDestroyed(other));
         assert_eq!(0, last(&published).unsorted.windows);
+        assert!(!last(&published).unsorted.listed);
 
         // The Space is about to be turned off, so it shows every window
         // until the next space change.
@@ -212,13 +217,15 @@ mod tests {
         assert_eq!(shows(ContextKey::Named(work)), last(&published).screens);
 
         // The context is deleted. No command deletes a context yet, so the
-        // next event publishes the change.
+        // next event publishes the change. Unsorted is active, and without a
+        // context no window counts as unsorted.
         s.reactor.delete_context(work).unwrap();
         s.reactor.handle_event(Event::StartupComplete);
         let deleted = last(&published);
         assert!(deleted.contexts.is_empty());
         assert_eq!(ContextKey::Unsorted, deleted.active);
-        assert_eq!(3, deleted.unsorted.windows);
+        assert_eq!(0, deleted.unsorted.windows);
+        assert!(!deleted.unsorted.listed);
 
         // Contexts are turned off.
         s.reactor.handle_event(Event::ConfigChanged(config(false)));
@@ -231,6 +238,7 @@ mod tests {
     #[test]
     fn unsorted_counts_the_windows_on_the_visible_spaces() {
         let mut s = Setup::new(3);
+        s.reactor.contexts.create("Empty").unwrap();
         let published = capture(&mut s.reactor);
         s.reactor.handle_event(Event::StartupComplete);
         assert_eq!(3, last(&published).unsorted.windows);
@@ -316,6 +324,59 @@ mod tests {
         assert_eq!(ContextKey::Unsorted, last(&published).active);
         assert_eq!(vec![wid(1)], s.parked());
         assert_eq!(1, last(&published).unsorted.windows);
+        assert_eq!(vec![summary(&s, "C", 2)], last(&published).contexts);
+    }
+
+    /// R28, R29. Before the first context exists, no window is unsorted:
+    /// the snapshot counts none and doesn't list Unsorted, and its name
+    /// names nothing, so Everything stays active.
+    #[test]
+    fn unsorted_is_neither_counted_nor_named_before_the_first_context_exists() {
+        let mut s = Setup::new(2);
+        let published = capture(&mut s.reactor);
+        s.reactor.handle_event(Event::StartupComplete);
+        let none = last(&published);
+        assert_eq!((false, 0), (none.unsorted.listed, none.unsorted.windows));
+
+        request(
+            &mut s,
+            1,
+            ContextCommand::SwitchContext(ContextRef::Name("unsorted".into())),
+        );
+
+        assert_eq!(
+            Response::Error("No context matches \"unsorted\"".into()),
+            result_of(&s, 1)
+        );
+        assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+        assert!(s.parked().is_empty());
+    }
+
+    /// R29. While every window is in a context, Unsorted isn't listed, so
+    /// a name that only Unsorted's name starts, and Unsorted's own name,
+    /// name nothing. No switch goes to an empty Unsorted, which would park
+    /// every window.
+    #[test]
+    fn a_name_that_only_an_unlisted_unsorted_matches_names_nothing() {
+        let mut s = Setup::new(2);
+        s.create("Work");
+        let work = ContextKey::Named(s.id("Work"));
+        assert!(!s.reactor.published_contexts.clone().unwrap().unsorted.listed);
+
+        for (id, name) in [(1, "uns"), (2, "Unsorted")] {
+            request(
+                &mut s,
+                id,
+                ContextCommand::SwitchContext(ContextRef::Name(name.into())),
+            );
+            assert_eq!(
+                Response::Error(format!("No context matches \"{name}\"")),
+                result_of(&s, id)
+            );
+        }
+
+        assert_eq!(work, s.reactor.contexts.active());
+        assert!(s.parked().is_empty());
     }
 
     /// I1. A member window that closes no longer counts as open, in each of

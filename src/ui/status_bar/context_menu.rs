@@ -171,7 +171,7 @@ pub fn context_menu(
             switch(&context.name, ContextKey::Named(context.id), key)
         })
         .collect();
-    if active == ContextKey::Unsorted || snapshot.unsorted.windows > 0 {
+    if snapshot.unsorted.listed {
         entries.push(switch(UNSORTED_NAME, ContextKey::Unsorted, None));
     }
     entries.push(switch(
@@ -404,10 +404,12 @@ mod tests {
         assert!(send.iter().all(|item| item.enabled));
     }
 
-    /// R29. Unsorted is listed, after the contexts, while it has windows or
-    /// is active.
+    /// R29. Unsorted is listed, after the contexts, while the snapshot lists
+    /// it, which is while it has windows. An active Unsorted without windows
+    /// isn't listed, so the menu offers no switch that the reactor would
+    /// refuse, and nothing is checked.
     #[test]
-    fn unsorted_is_listed_while_it_has_windows_or_is_active() {
+    fn unsorted_is_listed_while_the_snapshot_lists_it() {
         let listed = |snapshot: &ContextsSnapshot| {
             titles(&context_menu(snapshot, &keys(), all)).contains(&"Unsorted")
         };
@@ -421,7 +423,7 @@ mod tests {
         );
         assert_eq!(vec!["Comms"], checked(&with_windows));
 
-        let active = context_menu(&snapshot(Some("Unsorted"), 0), &keys(), all);
+        let active = context_menu(&snapshot(Some("Unsorted"), 2), &keys(), all);
         let unsorted = items(&active).into_iter().find(|item| item.title == "Unsorted");
         assert_eq!(
             Some(&MenuItem {
@@ -431,6 +433,13 @@ mod tests {
             unsorted
         );
         assert_eq!(vec!["Unsorted"], checked(&active));
+
+        let empty = snapshot(Some("Unsorted"), 0);
+        assert!(!listed(&empty));
+        assert!(checked(&context_menu(&empty, &keys(), all)).is_empty());
+        let mut unlisted = snapshot(Some("Comms"), 2);
+        unlisted.unsorted.listed = false;
+        assert!(!listed(&unlisted));
     }
 
     /// Items whose command doesn't exist are disabled: the whole Send Window
@@ -683,7 +692,6 @@ mod tests {
             (Some("Comms"), 0, "Comms"),
             (Some("Relax"), 2, "Relax"),
             (Some("Build"), 0, "Build"),
-            (Some("Unsorted"), 0, "Unsorted"),
             (Some("Unsorted"), 2, "Unsorted"),
         ] {
             let snapshot = snapshot(active, unsorted);

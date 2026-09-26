@@ -12,6 +12,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::actor::app::WindowId;
 use crate::model::contexts::{
     Context, ContextId, ContextKey, Contexts, EVERYTHING_NAME, MemberRecord, UNSORTED_NAME,
 };
@@ -96,16 +97,25 @@ pub struct ContextSummary {
     pub number: Option<u8>,
     /// The use number of the last switch to the context. Larger is later.
     pub last_used: u64,
-    /// The app names of the open member windows, each once, in member order.
+    /// The app names of the open member windows, each once, in member order,
+    /// then those of the open pinned windows.
     pub apps: Vec<String>,
-    /// How many member windows are open.
+    /// How many member windows are open, wherever they are: on another
+    /// Space, minimized, or parked. Pinned windows are members of every
+    /// context and count too.
     pub windows: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsortedSummary {
-    /// How many tracked windows on the visible Spaces are in no named context
-    /// and not pinned.
+    /// Whether Unsorted is listed among the contexts to switch to: while it
+    /// has windows. The menu, the command line, and the switcher list it
+    /// by this field.
+    pub listed: bool,
+    /// How many tracked windows on the visible Spaces, parked ones included,
+    /// are in no named context and not pinned. Unlike a context's count, it
+    /// leaves out minimized windows and windows on other Spaces. It is 0
+    /// until the first context exists.
     pub windows: usize,
     /// The use number of the last switch to Unsorted.
     pub last_used: u64,
@@ -134,15 +144,17 @@ impl ContextsSnapshot {
 
     /// The snapshot of `contexts`, with the facts that only the reactor
     /// knows: what each visible screen shows, and how many windows are
-    /// unsorted.
+    /// unsorted. Unsorted is listed while that number isn't 0.
     pub fn new(contexts: &Contexts, screens: Vec<ScreenContext>, unsorted_windows: usize) -> Self {
+        let summary = |context| ContextSummary::new(context, contexts.pinned());
         ContextsSnapshot {
             enabled: true,
             scope: Scope::Global,
             active: contexts.active(),
             screens,
-            contexts: contexts.contexts().iter().map(ContextSummary::new).collect(),
+            contexts: contexts.contexts().iter().map(summary).collect(),
             unsorted: UnsortedSummary {
+                listed: unsorted_windows > 0,
                 windows: unsorted_windows,
                 last_used: contexts.last_used(ContextKey::Unsorted),
             },
@@ -188,11 +200,17 @@ impl ContextsSnapshot {
 }
 
 impl ContextSummary {
-    fn new(context: &Context) -> Self {
-        let open: Vec<&MemberRecord> =
-            context.members.iter().filter(|record| record.window().is_some()).collect();
+    /// The summary of `context`, whose members include the `pinned`
+    /// windows.
+    fn new(context: &Context, pinned: &[MemberRecord]) -> Self {
+        let mut open: Vec<WindowId> = Vec::new();
         let mut apps: Vec<String> = Vec::new();
-        for record in &open {
+        for record in context.members.iter().chain(pinned) {
+            let Some(wid) = record.window() else { continue };
+            if open.contains(&wid) {
+                continue;
+            }
+            open.push(wid);
             let app = app_name(record);
             if !apps.contains(&app) {
                 apps.push(app);
@@ -244,7 +262,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::actor::app::WindowId;
     use crate::model::contexts::WindowDesc;
 
     fn window(pid: i32, idx: u32, bundle_id: Option<&str>, app_name: Option<&str>) -> WindowDesc {
@@ -321,6 +338,41 @@ mod tests {
         assert!(snapshot.enabled);
         assert_eq!(ContextKey::Everything, snapshot.active);
         assert_eq!(2, snapshot.unsorted.windows);
+        assert!(snapshot.unsorted.listed);
+    }
+
+    /// R3. A pinned window is a member of every context, so its window and
+    /// its app count in every context, and once in a context that also has
+    /// a record of it. A closed pinned window doesn't count.
+    #[test]
+    fn a_pinned_window_counts_in_every_context() {
+        let mut contexts = Contexts::new();
+        let comms = contexts.create("Comms").unwrap();
+        let empty = contexts.create("Empty").unwrap();
+        let mail = window(1, 1, Some("com.apple.mail"), Some("Mail"));
+        let music = window(2, 1, Some("com.apple.Music"), Some("Music"));
+        let notes = window(3, 1, Some("com.apple.Notes"), Some("Notes"));
+        contexts.add_window(comms, &mail).unwrap();
+        contexts.add_window(comms, &music).unwrap();
+        contexts.pin(&music);
+        contexts.pin(&notes);
+        contexts.window_closed(notes.wid);
+
+        let snapshot = snapshot(&contexts, 0);
+
+        let counts: Vec<(ContextId, Vec<&str>, usize)> = snapshot
+            .contexts
+            .iter()
+            .map(|c| (c.id, c.apps.iter().map(String::as_str).collect(), c.windows))
+            .collect();
+        assert_eq!(
+            vec![
+                (comms, vec!["Mail", "Music"], 2),
+                (empty, vec!["Music"], 1)
+            ],
+            counts
+        );
+        assert!(!snapshot.unsorted.listed);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 //! Menu bar icon for displaying the current space ID.
 
-mod context_menu;
+pub(crate) mod context_menu;
 
 use std::cell::RefCell;
 use std::ffi::c_void;

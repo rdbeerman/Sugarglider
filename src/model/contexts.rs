@@ -716,9 +716,10 @@ pub enum Query<'a> {
 /// A number or an id names the context that has it. A name names the
 /// context with that name, ignoring case and accents. Everything and
 /// Unsorted match only their exact names, and Unsorted only while it is
-/// listed: `lists_unsorted` is true and a context exists (R28, R29). Any
-/// other name takes the best match of the switcher's ranking among the named
-/// contexts.
+/// listed: `lists_unsorted` is true and a context exists (R28, R29). While
+/// it isn't, its exact name names nothing, not a context whose name starts
+/// with it. Any other name takes the best match of the switcher's ranking
+/// among the named contexts.
 pub fn resolve(
     query: Query<'_>,
     contexts: &Contexts,
@@ -736,6 +737,9 @@ pub fn resolve(
         Query::Name(name) if name.trim().is_empty() => Err(ContextError::NoQuery),
         Query::Name(name) => {
             let lists_unsorted = lists_unsorted && !contexts.contexts.is_empty();
+            if !lists_unsorted && fold(name.trim()) == fold(UNSORTED_NAME) {
+                return Err(ContextError::NoMatch(name.trim().to_string()));
+            }
             rank(name, contexts, lists_unsorted)
                 .into_iter()
                 .find(|&(key, found)| {
@@ -4765,6 +4769,28 @@ mod tests {
                 Ok(ContextKey::Everything),
                 resolve(Query::Name("everything"), contexts, listed)
             );
+        }
+    }
+
+    /// R29. While Unsorted isn't listed, its exact name names nothing, even
+    /// when it starts a context's name. A shorter name still takes that
+    /// context.
+    #[test]
+    fn resolve_never_takes_unsorteds_name_for_a_context_that_it_starts() {
+        let mut cx = Contexts::new();
+        let work = cx.create("Unsorted work").unwrap();
+
+        for name in ["Unsorted", " UNSORTED "] {
+            assert_eq!(
+                Err(ContextError::NoMatch(name.trim().to_string())),
+                resolve(Query::Name(name), &cx, false),
+                "{name}"
+            );
+            assert_eq!(Ok(ContextKey::Unsorted), resolve(Query::Name(name), &cx, true));
+        }
+        for listed in [false, true] {
+            assert_eq!(Ok(named(work)), resolve(Query::Name("unsort"), &cx, listed));
+            assert_eq!(Ok(named(work)), resolve(Query::Name("Unsorted w"), &cx, listed));
         }
     }
 }

@@ -4597,6 +4597,8 @@ pub mod tests {
         use crate::actor::contexts_snapshot::{ContextsSnapshot, ScreenContext};
         use crate::model::contexts::ContextKey;
         use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
+        use crate::ui::status_bar::ContextMenuKeys;
+        use crate::ui::status_bar::context_menu::{MenuAction, MenuEntry, context_menu};
 
         type Published = Arc<Mutex<Vec<Arc<ContextsSnapshot>>>>;
 
@@ -4632,33 +4634,49 @@ pub mod tests {
             )
         }
 
-        /// Menu bar, R16, R29. The menu lists Unsorted while it is active,
-        /// also with no windows, and its item sends `{ switch_context =
-        /// "Unsorted" }`. The reactor takes that name as Unsorted, also
-        /// next to a context whose name starts with it, and applies
-        /// Unsorted again: a new use, published, with the other windows
-        /// still parked.
+        /// Menu bar, R29. When the windows of an active Unsorted all join a
+        /// context, Unsorted isn't listed any more. The menu built from the
+        /// published snapshot then offers no Unsorted item, whose switch the
+        /// reactor would refuse, and the reactor refuses that switch.
         #[test]
-        #[ignore = "bug: the reactor resolves the name Unsorted only while Unsorted has a window (R29), so the menu's Unsorted item can't apply an empty Unsorted again"]
-        fn the_unsorted_item_applies_unsorted_again_while_it_has_no_windows() {
+        fn the_menu_offers_no_unsorted_item_while_unsorted_is_not_listed() {
             let mut s = Setup::new(2);
-            s.create("Unsorted work");
+            let work = s.reactor.contexts.create("Unsorted work").unwrap();
+            let desc = s.reactor.window_desc(wid(1)).unwrap();
+            s.reactor.contexts.add_window(work, &desc).unwrap();
             let unsorted = || ContextCommand::SwitchContext(ContextRef::Name("Unsorted".into()));
             s.run(unsorted());
             assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
-            assert_eq!(vec![wid(1), wid(2)], s.parked());
-            let used = s.reactor.contexts.last_used(ContextKey::Unsorted);
+            assert_eq!(vec![wid(1)], s.parked());
+            let desc = s.reactor.window_desc(wid(2)).unwrap();
+            s.reactor.contexts.add_window(work, &desc).unwrap();
             let published = capture(&mut s.reactor);
 
-            s.run(unsorted());
+            s.reactor.handle_event(Event::MouseUp);
 
-            assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
-            assert_eq!(vec![wid(1), wid(2)], s.parked());
-            assert_eq!(1, count(&published));
-            let again = last(&published);
-            assert_eq!(ContextKey::Unsorted, again.active);
-            assert_eq!(0, again.unsorted.windows);
-            assert_eq!(used + 1, again.unsorted.last_used);
+            let snapshot = last(&published);
+            assert_eq!(ContextKey::Unsorted, snapshot.active);
+            assert!(!snapshot.unsorted.listed);
+            let entries = context_menu(&snapshot, &ContextMenuKeys::default(), |action| {
+                action.command().is_some()
+            });
+            let switches: Vec<(&str, bool)> = entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    MenuEntry::Item(item) if matches!(item.action, MenuAction::Switch(_)) => {
+                        Some((item.title.as_str(), item.checked))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                vec![("Unsorted work", false), ("Show Everything", false)],
+                switches
+            );
+            let used = s.reactor.contexts.last_used(ContextKey::Unsorted);
+            s.run(unsorted());
+            assert_eq!(used, s.reactor.contexts.last_used(ContextKey::Unsorted));
+            assert_eq!(vec![wid(1)], s.parked());
         }
 
         /// Menu bar, with the coordinator's decision for a desktop without

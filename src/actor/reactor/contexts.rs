@@ -479,25 +479,22 @@ impl Reactor {
         resolve(reference.query(), &self.contexts, self.lists_unsorted())
     }
 
-    /// Whether Unsorted is listed among the contexts to switch to: some
-    /// context exists, and some window of a running app that is in the
-    /// visible-window set is in no context. Sugarglider's own windows and
+    /// The unsorted windows: the windows on the visible Spaces that are in
+    /// no named context and not pinned. Sugarglider's own windows and
     /// windows the layout doesn't track don't count. Before the first
-    /// context exists, only Everything is listed.
-    pub(super) fn lists_unsorted(&self) -> bool {
+    /// context exists there are none, and only Everything is listed.
+    pub(super) fn unsorted_windows(&self) -> Vec<WindowId> {
         if self.contexts.contexts().is_empty() {
-            return false;
+            return Vec::new();
         }
-        let own_pid = std::process::id() as pid_t;
-        self.windows.iter().any(|(&wid, window)| {
-            wid.pid != own_pid
-                && self.apps.contains_key(&wid.pid)
-                && window.window_server_id.is_some_and(|wsid| self.visible_windows.contains(&wsid))
-                && self.contexts.is_unsorted(wid)
-                && self
-                    .layout_window_info(wid)
-                    .is_some_and(|info| !self.layout.is_untracked(&info))
-        })
+        self.windows_on_visible_spaces(|wid| self.contexts.is_unsorted(wid))
+    }
+
+    /// Whether Unsorted is listed among the contexts to switch to: while it
+    /// has unsorted windows. The snapshot publishes this for the menu, the
+    /// command line, and the switcher.
+    pub(super) fn lists_unsorted(&self) -> bool {
+        !self.unsorted_windows().is_empty()
     }
 
     /// Applies the active context after contexts were turned on, or shows

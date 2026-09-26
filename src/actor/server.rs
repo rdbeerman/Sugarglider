@@ -603,7 +603,11 @@ mod tests {
                     windows: 3,
                 },
             ],
-            unsorted: UnsortedSummary { windows: 4, last_used: 6 },
+            unsorted: UnsortedSummary {
+                listed: true,
+                windows: 4,
+                last_used: 6,
+            },
             everything: EverythingSummary { last_used: 5 },
             results: vec![result(1, None), result(u64::MAX, Some(ODD_NAME))],
         }

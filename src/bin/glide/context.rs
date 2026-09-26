@@ -176,8 +176,8 @@ fn name(snapshot: &ContextsSnapshot, key: ContextKey) -> &str {
 }
 
 /// One line per entry: a star on the active one, the number, the name, and
-/// how many windows are open, with their apps. Unsorted is listed while it
-/// has windows or is active.
+/// how many windows are open, with their apps. Unsorted is listed while the
+/// snapshot lists it.
 fn list(snapshot: &ContextsSnapshot) -> String {
     let windows = |count: usize| match count {
         1 => "1 window".to_string(),
@@ -194,7 +194,7 @@ fn list(snapshot: &ContextsSnapshot) -> String {
             (ContextKey::Named(context.id), context.number, detail)
         })
         .collect();
-    if snapshot.unsorted.windows > 0 || snapshot.active == ContextKey::Unsorted {
+    if snapshot.unsorted.listed {
         rows.push((ContextKey::Unsorted, None, windows(snapshot.unsorted.windows)));
     }
     rows.push((ContextKey::Everything, None, String::new()));
@@ -211,12 +211,17 @@ fn list(snapshot: &ContextsSnapshot) -> String {
     text
 }
 
-/// The shape in the spec's "Command line" section.
+/// The shape in the spec's "Command line" section, with the active context
+/// at the top level.
 #[derive(Serialize)]
 struct SnapshotJson<'a> {
     scope: Scope,
+    /// The name of the active context, also when it is Everything or
+    /// Unsorted, and while no screen shows a managed Space.
+    active: &'a str,
     screens: Vec<ScreenJson<'a>>,
     contexts: Vec<ContextJson<'a>>,
+    /// How many windows on the visible Spaces are unsorted.
     unsorted: usize,
 }
 
@@ -232,12 +237,15 @@ struct ContextJson<'a> {
     number: Option<u8>,
     active: bool,
     apps: &'a [String],
+    /// How many member windows are open, wherever they are, pinned windows
+    /// included.
     windows: usize,
 }
 
 fn json(snapshot: &ContextsSnapshot) -> String {
     let view = SnapshotJson {
         scope: snapshot.scope,
+        active: name(snapshot, snapshot.active),
         screens: snapshot
             .screens
             .iter()
@@ -314,7 +322,11 @@ mod tests {
                 summary(1, "Comms", &["WhatsApp", "Microsoft Teams"], 2),
                 summary(2, "Relax", &["WhatsApp", "Google Chrome"], 2),
             ],
-            unsorted: UnsortedSummary { windows: 3, last_used: 0 },
+            unsorted: UnsortedSummary {
+                listed: true,
+                windows: 3,
+                last_used: 0,
+            },
             everything: EverythingSummary { last_used: 0 },
             results: vec![],
         }
@@ -499,10 +511,13 @@ mod tests {
         assert_eq!(vec![ContextRequest::List], ran.requests);
     }
 
-    /// R29. Unsorted is listed while it has windows or is active.
+    /// R29. Unsorted is listed while the snapshot lists it, which is while
+    /// it has windows. An active Unsorted without windows is left out, so no
+    /// line has the star.
     #[test]
     fn list_leaves_out_an_empty_unsorted() {
         let mut snapshot = snapshot();
+        snapshot.unsorted.listed = false;
         snapshot.unsorted.windows = 0;
         snapshot.contexts[0].windows = 1;
         snapshot.contexts[0].apps.truncate(1);
@@ -517,7 +532,6 @@ mod tests {
         assert_eq!(
             "  1 Comms       1 window  WhatsApp\n\
             \x20   Relax       2 windows  WhatsApp, Google Chrome\n\
-            *   Unsorted    0 windows\n\
             \x20   Everything\n",
             run_with(&["list"], Response::Contexts(snapshot)).out
         );
@@ -532,6 +546,7 @@ mod tests {
         assert_eq!(
             json!({
               "scope": "global",
+              "active": "Comms",
               "screens": [{ "id": 1, "active": "Comms" }],
               "contexts": [
                 { "name": "Comms", "number": 1, "active": true,
@@ -928,6 +943,7 @@ mod tests {
         snapshot.contexts[1].number = None;
         snapshot.contexts[1].apps.clear();
         snapshot.contexts[1].windows = 0;
+        snapshot.unsorted.listed = false;
         snapshot.unsorted.windows = 0;
         snapshot
     }
@@ -952,6 +968,7 @@ mod tests {
         assert_eq!(
             json!({
               "scope": "global",
+              "active": "Everything",
               "screens": [
                 { "id": 1, "active": "Everything" },
                 { "id": 2, "active": "Everything" }
@@ -971,6 +988,7 @@ mod tests {
         unsorted.active = ContextKey::Unsorted;
         unsorted.screens[0].shows = ContextKey::Unsorted;
         let printed = printed_json(&["list", "--json"], unsorted);
+        assert_eq!(json!("Unsorted"), printed["active"]);
         assert_eq!(json!([{ "id": 1, "active": "Unsorted" }]), printed["screens"]);
         assert_eq!(
             json!([false, false]),
@@ -989,6 +1007,7 @@ mod tests {
         assert_eq!(
             json!({
               "scope": "global",
+              "active": "Everything",
               "screens": [{ "id": 1, "active": "Everything" }],
               "contexts": [],
               "unsorted": 0
@@ -1004,6 +1023,7 @@ mod tests {
         assert_eq!(
             json!({
               "scope": "global",
+              "active": "Comms",
               "screens": [{ "id": 1, "active": "Comms" }],
               "contexts": [
                 { "name": "Comms", "number": 1, "active": true,
@@ -1016,6 +1036,7 @@ mod tests {
         assert_eq!(
             json!({
               "scope": "global",
+              "active": "Everything",
               "screens": [
                 { "id": 1, "active": "Everything" },
                 { "id": 2, "active": "Everything" }
@@ -1025,6 +1046,31 @@ mod tests {
             }),
             printed_json(&["current", "--json"], everything_on_two_screens().current())
         );
+    }
+
+    /// While no screen shows a managed Space, as when Sugarglider is paused,
+    /// `screens` is empty, and the top-level `active` still names the active
+    /// context, Everything and Unsorted included.
+    #[test]
+    fn json_names_the_active_context_while_no_space_is_managed() {
+        for active in [
+            ContextKey::Named(id(1)),
+            ContextKey::Unsorted,
+            ContextKey::Everything,
+        ] {
+            let mut paused = snapshot();
+            paused.active = active;
+            paused.screens.clear();
+            let name = paused.name(active).unwrap().to_string();
+            for (args, reply) in [
+                (&["list", "--json"][..], paused.clone()),
+                (&["current", "--json"], paused.current()),
+            ] {
+                let printed = printed_json(args, reply);
+                assert_eq!(json!(name), printed["active"], "{args:?}");
+                assert_eq!(json!([]), printed["screens"], "{args:?}");
+            }
+        }
     }
 
     /// Names line up by characters, not bytes. A context with no open window
