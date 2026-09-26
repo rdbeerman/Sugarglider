@@ -85,6 +85,7 @@ impl MainWindowTracker {
             | Event::WindowFrameChanged(..)
             | Event::ScreenParametersChanged { .. }
             | Event::SpaceChanged(..)
+            | Event::ShowEverythingOn(..)
             | Event::MouseUp
             | Event::MouseMovedOverWindow(..)
             | Event::RaiseCompleted { .. }

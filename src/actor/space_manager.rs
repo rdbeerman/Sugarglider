@@ -210,6 +210,9 @@ impl SpaceManager {
         if self.is_globally_enabled == enabled {
             return;
         }
+        if !enabled {
+            self.show_everything_on(self.active_spaces().into_iter().flatten().collect());
+        }
         self.is_globally_enabled = enabled;
         if self.is_globally_enabled {
             // When enabling globally with default_disable, enable all current spaces
@@ -262,6 +265,9 @@ impl SpaceManager {
     }
 
     fn toggle_space(&mut self, space: SpaceId) {
+        if self.is_space_active(space) {
+            self.show_everything_on(vec![space]);
+        }
         let toggle_set = if self.config.settings.default_disable {
             &mut self.enabled_spaces
         } else {
@@ -275,6 +281,14 @@ impl SpaceManager {
         }
         self.send_space_enabled_status();
         self.request_space_refresh();
+    }
+
+    /// Tells the reactor to show every window on the Spaces before it stops
+    /// managing them.
+    fn show_everything_on(&self, spaces: Vec<SpaceId>) {
+        if !spaces.is_empty() {
+            self.reactor_tx.send(reactor::Event::ShowEverythingOn(spaces));
+        }
     }
 
     fn active_spaces(&self) -> Vec<Option<SpaceId>> {
@@ -733,6 +747,97 @@ mod tests {
             wm_events.iter().any(|e| matches!(e, WmEvent::HotkeysActive(false))),
             "Expected HotkeysActive(false), got {wm_events:?}"
         );
+    }
+
+    /// The Spaces of each `ShowEverythingOn` event.
+    fn shown_everything(events: &[reactor::Event]) -> Vec<Vec<SpaceId>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                reactor::Event::ShowEverythingOn(spaces) => Some(spaces.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn two_screens(h: &mut TestHarness) {
+        h.on_event(Event::ScreenParametersChanged {
+            screens: vec![screen(1), screen(2)],
+            frames: vec![CGRect::ZERO, CGRect::ZERO],
+            bounds: vec![CGRect::ZERO, CGRect::ZERO],
+            spaces: vec![Some(space(10)), Some(space(20))],
+            scale_factors: vec![1.0, 1.0],
+            converter: CoordinateConverter::default(),
+            on_screen: WindowsOnScreen::new(vec![]),
+        });
+        h.drain_all();
+    }
+
+    /// R33.
+    #[test]
+    fn r33_turning_sugarglider_off_shows_everything_first() {
+        let mut h = TestHarness::new();
+        two_screens(&mut h);
+
+        h.on_event(Event::ToggleGlobalEnabled);
+        let events = drain(&mut h.reactor_rx);
+        assert_eq!(vec![vec![space(10), space(20)]], shown_everything(&events));
+        h.send_space_changed(vec![Some(space(10)), Some(space(20))]);
+        let events = drain(&mut h.reactor_rx);
+        assert_eq!(vec![None, None], *space_changed_spaces(&events).unwrap());
+        assert!(shown_everything(&events).is_empty());
+
+        h.on_event(Event::ToggleGlobalEnabled);
+        assert!(shown_everything(&drain(&mut h.reactor_rx)).is_empty());
+        h.on_event(Event::SetGlobalEnabled(false));
+        assert_eq!(
+            vec![vec![space(10), space(20)]],
+            shown_everything(&drain(&mut h.reactor_rx))
+        );
+        h.on_event(Event::SetGlobalEnabled(false));
+        assert!(shown_everything(&drain(&mut h.reactor_rx)).is_empty());
+    }
+
+    /// R33.
+    #[test]
+    fn r33_turning_off_one_space_shows_everything_on_it_first() {
+        let mut h = TestHarness::new();
+        two_screens(&mut h);
+
+        h.on_event(Event::ToggleSpace(screen(2)));
+        assert_eq!(
+            vec![vec![space(20)]],
+            shown_everything(&drain(&mut h.reactor_rx))
+        );
+        h.on_event(Event::ToggleSpace(screen(2)));
+        assert!(shown_everything(&drain(&mut h.reactor_rx)).is_empty());
+
+        let mut config = Config::default();
+        config.settings.default_disable = true;
+        let mut h = TestHarness::new_with(false, config);
+        two_screens(&mut h);
+        h.on_event(Event::ToggleSpace(screen(1)));
+        assert!(shown_everything(&drain(&mut h.reactor_rx)).is_empty());
+        h.on_event(Event::ToggleSpace(screen(1)));
+        assert_eq!(
+            vec![vec![space(10)]],
+            shown_everything(&drain(&mut h.reactor_rx))
+        );
+    }
+
+    /// R33.
+    #[test]
+    fn r33_the_login_window_does_not_show_everything() {
+        let mut h = TestHarness::new();
+        two_screens(&mut h);
+
+        h.on_event(Event::LoginWindowActive(true));
+        h.send_space_changed(vec![Some(space(10)), Some(space(20))]);
+        let events = drain(&mut h.reactor_rx);
+        assert_eq!(vec![None, None], *space_changed_spaces(&events).unwrap());
+        assert!(shown_everything(&events).is_empty());
+        h.on_event(Event::ToggleGlobalEnabled);
+        assert!(shown_everything(&drain(&mut h.reactor_rx)).is_empty());
     }
 
     #[test]

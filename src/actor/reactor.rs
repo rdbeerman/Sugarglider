@@ -107,6 +107,11 @@ pub enum Event {
     /// sending SpaceChanged.
     SpaceChanged(Vec<Option<SpaceId>>, WindowsOnScreen),
 
+    /// Sugarglider is about to stop managing these Spaces, because it is
+    /// turned off or the user turned the Spaces off. Every window on them
+    /// shows until the next space change.
+    ShowEverythingOn(Vec<SpaceId>),
+
     /// All running apps at launch have been registered.
     StartupComplete,
 
@@ -376,6 +381,9 @@ pub struct Reactor {
     boot_id: Option<String>,
     /// A quit that waits for parked windows to come back.
     pending_exit: Option<PendingExit>,
+    /// Visible Spaces that show every window until the next space change,
+    /// because Sugarglider is about to stop managing them.
+    showing_everything: HashSet<SpaceId>,
     /// Where the layout is saved when Sugarglider quits. `None` saves nothing.
     layout_file: Option<PathBuf>,
     /// Ends the process with an exit code.
@@ -603,6 +611,7 @@ impl Reactor {
             contexts_store: ContextsStore::in_memory(),
             boot_id: None,
             pending_exit: None,
+            showing_everything: HashSet::default(),
             layout_file: None,
             exit: Box::new(|code| info!(code, "Not quitting a reactor that has no exit")),
         }
@@ -1031,6 +1040,7 @@ impl Reactor {
                 on_screen,
             } => {
                 info!("screen parameters changed");
+                self.showing_everything.clear();
                 let visible_window_order = on_screen.visible.clone();
                 self.update_complete_window_server_info(on_screen);
                 self.screens = frames
@@ -1085,6 +1095,7 @@ impl Reactor {
                 self.in_drag = false;
                 self.resizing_window = None;
                 info!("space changed");
+                self.showing_everything.clear();
                 for (space, screen) in spaces.iter().zip(&mut self.screens) {
                     screen.space = *space;
                 }
@@ -1108,6 +1119,7 @@ impl Reactor {
                 self.update_active_screen();
                 self.update_visible_windows();
             }
+            Event::ShowEverythingOn(spaces) => self.show_everything_on(&spaces),
             Event::LeftMouseDown(point, window_at_point) => {
                 if let Some(screen) = self.active_screen().copied()
                     && let Some(space) = screen.space

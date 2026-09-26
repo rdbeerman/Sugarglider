@@ -55,10 +55,13 @@ impl Reactor {
     }
 
     /// The context the Space shows when `active` is the active context. With
-    /// contexts off, while quitting, and in place of a context that doesn't
-    /// exist, that is Everything.
-    fn shown_with(&self, _space: SpaceId, active: ContextKey) -> ContextKey {
-        if !self.contexts_enabled() || self.pending_exit.is_some() {
+    /// contexts off, while quitting, on a Space about to be turned off, and in
+    /// place of a context that doesn't exist, that is Everything.
+    fn shown_with(&self, space: SpaceId, active: ContextKey) -> ContextKey {
+        if !self.contexts_enabled()
+            || self.pending_exit.is_some()
+            || self.showing_everything.contains(&space)
+        {
             return ContextKey::Everything;
         }
         if let ContextKey::Named(id) = active
@@ -294,6 +297,27 @@ impl Reactor {
         if let Ok((_, Some(response))) = self.apply(Apply::Again) {
             self.handle_layout_response(response);
         }
+    }
+
+    /// Shows every window on the visible ones of `spaces`, which Sugarglider
+    /// is about to stop managing. The active context doesn't change, and the
+    /// next space change applies it again.
+    pub(super) fn show_everything_on(&mut self, spaces: &[SpaceId]) {
+        if !self.contexts_in_use() {
+            return;
+        }
+        let visible: Vec<SpaceId> = self
+            .screens
+            .iter()
+            .filter_map(|screen| screen.space)
+            .filter(|space| spaces.contains(space))
+            .collect();
+        if visible.is_empty() {
+            return;
+        }
+        info!(?visible, "Showing every window before Spaces are turned off");
+        self.showing_everything.extend(visible);
+        self.apply_again();
     }
 
     pub(super) fn handle_context_command(&mut self, command: ContextCommand) {
@@ -631,6 +655,20 @@ mod tests {
             self.apps.windows.remove(&wid);
             self.reactor.handle_event(Event::WindowDestroyed(wid));
         }
+    }
+
+    /// A window server snapshot that lists the windows at their frames.
+    fn on_screen(s: &Setup, wids: &[WindowId]) -> WindowsOnScreen {
+        WindowsOnScreen::new(
+            wids.iter()
+                .map(|&wid| WindowServerInfo {
+                    id: s.reactor.windows[&wid].window_server_id.unwrap(),
+                    pid: wid.pid,
+                    layer: 0,
+                    frame: s.frame(wid),
+                })
+                .collect(),
+        )
     }
 
     fn entry(idx: u32, frame: CGRect) -> JournalEntry {
@@ -998,18 +1036,6 @@ mod tests {
     fn r10_l2_a_space_change_makes_the_contexts_layout_and_applies_it_in_the_same_event() {
         let mut s = Setup::new(3);
         // Window 3 is on another Space.
-        let on_screen = |s: &Setup, wids: &[WindowId]| {
-            WindowsOnScreen::new(
-                wids.iter()
-                    .map(|&wid| WindowServerInfo {
-                        id: s.reactor.windows[&wid].window_server_id.unwrap(),
-                        pid: 1,
-                        layer: 0,
-                        frame: s.frame(wid),
-                    })
-                    .collect(),
-            )
-        };
         let snapshot = on_screen(&s, &[wid(1), wid(2)]);
         s.reactor
             .handle_event(Event::WindowsOnScreenUpdated { pid: None, on_screen: snapshot });
@@ -1571,5 +1597,90 @@ mod tests {
         assert_eq!(vec![0], *exits.lock().unwrap());
         assert!(s.apps.requests().is_empty());
         assert_eq!(ContextKey::Everything, s.saved_active());
+    }
+
+    /// R33.
+    #[test]
+    fn r33_turning_off_shows_everything_first_and_turning_on_applies_the_context_again() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let everything = s.frames(&all);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+
+        s.reactor.handle_event(Event::ShowEverythingOn(vec![space()]));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(everything, s.frames(&all));
+        assert!(s.parked().is_empty());
+        assert!(s.journal_on_disk().is_empty());
+        assert_eq!(c, s.reactor.contexts.active());
+
+        s.reactor.handle_event(Event::SpaceChanged(vec![None], Default::default()));
+        let requests = s.apps.requests();
+        assert!(all.iter().all(|&wid| frame_writes(&requests, wid).is_empty()));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(everything, s.frames(&all));
+
+        s.reactor
+            .handle_event(Event::SpaceChanged(vec![Some(space())], on_screen(&s, &all)));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+    }
+
+    /// R33.
+    #[test]
+    fn r33_a_space_change_to_none_from_the_login_window_changes_nothing() {
+        let mut s = Setup::new(3);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        let frames = s.frames(&[wid(1), wid(2), wid(3)]);
+        let journal = s.journal_on_disk();
+
+        s.reactor.handle_event(Event::SpaceChanged(vec![None], Default::default()));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(frames, s.frames(&[wid(1), wid(2), wid(3)]));
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+        assert_eq!(journal, s.journal_on_disk());
+
+        let snapshot = on_screen(&s, &[wid(1), wid(2), wid(3)]);
+        s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], snapshot));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(frames, s.frames(&[wid(1), wid(2), wid(3)]));
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+    }
+
+    /// R33, R7.
+    #[test]
+    fn r33_turning_off_one_space_shows_everything_only_there() {
+        let left = screen();
+        let right = rect(1200., 0., 1200., 1000.);
+        let space2 = SpaceId::new(2);
+        let mut s = Setup::on(vec![left, right], vec![Some(space()), Some(space2)]);
+        let at = |x: f64, idx| WindowInfo {
+            frame: rect(x, 100., 50., 50.),
+            ..make_window(idx)
+        };
+        s.reactor.handle_events(
+            s.apps.make_app(1, vec![at(100., 1), at(200., 2), at(1300., 3), at(1400., 4)]),
+        );
+        s.reactor.handle_event(Event::StartupComplete);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let right_everything = s.frames(&[wid(3), wid(4)]);
+        let c = s.create("C", &[wid(1), wid(3)]);
+        s.switch(c);
+        assert_eq!(vec![wid(2), wid(4)], s.parked());
+
+        s.reactor.handle_event(Event::ShowEverythingOn(vec![space2]));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(vec![wid(2)], s.parked());
+        assert_eq!(right_everything, s.frames(&[wid(3), wid(4)]));
+        assert_eq!(right_everything, s.tiles_on(space2, right));
+        assert_eq!(vec![(wid(1), left)], s.tiles_on(space(), left));
+        assert_eq!(c, s.reactor.contexts.active());
     }
 }
