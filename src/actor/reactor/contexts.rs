@@ -4869,18 +4869,17 @@ mod tests {
         assert!(s.parked().is_empty());
     }
 
-    /// R33. Pins what the reactor does with a sequence that the space manager
-    /// never sends: a display change that lists a Space as managed, between
-    /// `ShowEverythingOn` for that Space and the Space change that turns the
-    /// Space off. The space manager sends display changes with the Spaces it
-    /// manages, and those already leave out a Space it is turning off. The
-    /// reactor takes the Spaces the display change lists, stops showing
-    /// Everything there, and applies the context again, so the windows are
-    /// parked again while Sugarglider is off.
+    /// R33. A display change that still lists a Space that is being turned
+    /// off, between `ShowEverythingOn` for that Space and the Space change
+    /// that turns it off, keeps showing Everything there. So no window is
+    /// parked while Sugarglider is off. The space manager's display changes
+    /// leave out a Space it is turning off, so this guards the reactor
+    /// against another order. Turning the Space on again applies the context.
     #[test]
-    fn r33_a_display_change_that_lists_a_space_being_turned_off_applies_the_context_again() {
+    fn r33_a_display_change_that_lists_a_space_being_turned_off_keeps_showing_everything() {
         let mut s = Setup::new(3);
         let all = [wid(1), wid(2), wid(3)];
+        let everything = s.frames(&all);
         let c = s.create("C", &[wid(1)]);
         s.switch(c);
         s.reactor.handle_event(Event::ShowEverythingOn(vec![space()]));
@@ -4892,6 +4891,14 @@ mod tests {
         s.reactor.handle_event(Event::SpaceChanged(vec![None], Default::default()));
         s.apps.simulate_until_quiet(&mut s.reactor);
 
+        assert!(s.parked().is_empty());
+        assert_eq!(everything, s.frames(&all));
+        assert!(s.journal_on_disk().is_empty());
+
+        let snapshot = on_screen(&s, &all);
+        s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], snapshot));
+        s.apps.simulate_until_quiet(&mut s.reactor);
         assert_eq!(vec![wid(2), wid(3)], s.parked());
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
     }
 }

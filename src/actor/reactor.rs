@@ -1055,7 +1055,7 @@ impl Reactor {
                 on_screen,
             } => {
                 info!("screen parameters changed");
-                self.showing_everything.clear();
+                self.showing_everything.retain(|space| spaces.contains(&Some(*space)));
                 let visible_window_order = on_screen.visible.clone();
                 self.update_complete_window_server_info(on_screen);
                 self.screens = frames
