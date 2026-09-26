@@ -208,7 +208,7 @@ Switches to the entry (R12). `"everything"` shows Everything (R27). Sent by ↩ 
 { "add_window": { "window": { "pid": 812, "idx": 9123 }, "context": { "id": 4 } } }
 ```
 
-Adds the target window to the context, as `add_window_to_context` does for the focused window (R37). Sent by ⌘↩ on a named context.
+Adds `window`, the target window, to the context. The rules are those of `add_window_to_context` (R37), but Rust acts on the window that the command carries, never on the focused window (see "Commands in the reactor"). Sent by ⌘↩ on a named context.
 
 ### `move_window`
 
@@ -216,7 +216,7 @@ Adds the target window to the context, as `add_window_to_context` does for the f
 { "move_window": { "window": { "pid": 812, "idx": 9123 }, "context": { "id": 4 } } }
 ```
 
-Moves the target window out of the active context and into this one, as `move_window_to_context` does (R37). Sent by ⇧⌘↩ on a named context.
+Moves `window`, the target window, out of the active context and into this one. The rules are those of `move_window_to_context` (R37), for the window that the command carries, never the focused one. Sent by ⇧⌘↩ on a named context.
 
 ### `toggle_pinned`
 
@@ -224,7 +224,7 @@ Moves the target window out of the active context and into this one, as `move_wi
 { "toggle_pinned": { "window": { "pid": 812, "idx": 9123 } } }
 ```
 
-Pins or unpins the target window, as `toggle_window_pinned` does (R3). Sent by ⌘P.
+Pins or unpins `window`, the target window. The rules are those of `toggle_window_pinned` (R3), for the window that the command carries, never the focused one. Sent by ⌘P.
 
 ### `create`
 

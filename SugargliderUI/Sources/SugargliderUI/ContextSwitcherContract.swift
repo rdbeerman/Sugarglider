@@ -200,19 +200,21 @@ import Foundation
 /// ```json
 /// { "add_window": { "window": { "pid": 812, "idx": 9123 }, "context": { "id": 4 } } }
 /// ```
-/// Adds the target window to the context, as `add_window_to_context` does
-/// for the focused window (R37).
+/// Adds `window`, the target window, to the context, with the rules of
+/// `add_window_to_context` (R37). Rust acts on the window the command
+/// carries, never on the focused window.
 ///
 /// ```json
 /// { "move_window": { "window": { "pid": 812, "idx": 9123 }, "context": { "id": 4 } } }
 /// ```
-/// Moves the target window out of the active context and into this one, as
-/// `move_window_to_context` does (R37).
+/// Moves `window`, the target window, out of the active context and into
+/// this one, with the rules of `move_window_to_context` (R37).
 ///
 /// ```json
 /// { "toggle_pinned": { "window": { "pid": 812, "idx": 9123 } } }
 /// ```
-/// Pins or unpins the target window, as `toggle_window_pinned` does (R3).
+/// Pins or unpins `window`, the target window, with the rules of
+/// `toggle_window_pinned` (R3).
 ///
 /// ```json
 /// { "create": { "name": "Sugarglider",
