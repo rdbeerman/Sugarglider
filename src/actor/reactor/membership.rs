@@ -95,9 +95,22 @@ impl Reactor {
         changed
     }
 
+    /// Whether the window server lists the window as visible and accessibility
+    /// hasn't reported it closed. A window that is minimized, that is only on
+    /// another Space, or that was closed with ⌘W is not on screen, and its
+    /// frame is its last tile, which another window of the app can share.
+    fn window_on_screen(&self, wid: WindowId) -> bool {
+        self.windows.get(&wid).is_some_and(|window| {
+            window.window_server_id.is_some_and(|wsid| {
+                self.visible_windows.contains(&wsid) && !self.hidden_windows.contains(&wsid)
+            })
+        })
+    }
+
     /// The windows of the app that share the window's frame, the window first.
-    /// Native tabs of one group are separate windows with one frame. Parked
-    /// windows share a corner without being tabs.
+    /// Native tabs of one group are separate windows with one frame, and both
+    /// are on screen. Parked windows share a corner without being tabs, and a
+    /// window that isn't on screen is no tab of one that is.
     pub(super) fn tabs_of(&self, wid: WindowId) -> Vec<WindowId> {
         let Some(window) = self.windows.get(&wid) else {
             return vec![];
@@ -113,6 +126,7 @@ impl Reactor {
                 other != wid
                     && other.pid == wid.pid
                     && !self.parked.contains_key(&other)
+                    && self.window_on_screen(other)
                     && Self::frame_key(&other_window.frame_monotonic) == key
             })
             .map(|(&other, _)| other)
@@ -129,10 +143,16 @@ impl Reactor {
     }
 
     /// The main tab of the window's tab group: the app's main window when it is
-    /// one of the group's tabs other than `wid`.
+    /// one of the group's tabs other than `wid`. Both must be on screen: the
+    /// frame of a minimized window, a window on another Space, or a window
+    /// closed with ⌘W is only its last tile, so another window of the app can
+    /// share it without being one of its tabs.
     fn main_tab(&self, wid: WindowId) -> Option<WindowId> {
         let main = self.main_window_tracker.app_main_window(wid.pid)?;
         if main == wid || self.parked.contains_key(&wid) || self.parked.contains_key(&main) {
+            return None;
+        }
+        if !self.window_on_screen(wid) || !self.window_on_screen(main) {
             return None;
         }
         let key = |wid| Some(Self::frame_key(&self.windows.get(&wid)?.frame_monotonic));

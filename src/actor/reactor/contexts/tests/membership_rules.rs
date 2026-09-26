@@ -1277,7 +1277,6 @@ fn r20_h5_a_new_window_at_a_parked_windows_corner_joins_the_active_context() {
 /// shows no frame, so it is no tab of the new window: window 3 matches no
 /// record, joins C, and shows. It is never parked (R20).
 #[test]
-#[ignore = "bug: the tab check compares frames of windows that aren't on screen, so a new window at a minimized window's frame joins that window's context and is parked"]
 fn r20_r36_a_new_window_at_a_minimized_windows_frame_joins_the_active_context() {
     let mut s = Setup::new(2);
     let c = s.create("C", &[wid(1)]);
@@ -1299,13 +1298,53 @@ fn r20_r36_a_new_window_at_a_minimized_windows_frame_joins_the_active_context() 
     assert_eq!(tiles, s.frames(&[wid(1), wid(3)]));
 }
 
+/// R20, R36, R24. Window 2 of D is minimized at the frame it had on the
+/// right half of the screen. Under C, app 1 opens window 3 at that frame and
+/// makes it the main window, as an app that restores its last window frame
+/// does. The minimized window is no tab: window 3 matches no record, joins C
+/// and takes the focus there, and window 2 keeps its membership in D.
+#[test]
+fn r20_r36_a_new_focused_window_at_a_minimized_windows_frame_joins_the_active_context() {
+    let mut s = Setup::new(2);
+    let c = s.create("C", &[wid(1)]);
+    let d = s.create("D", &[wid(2)]);
+    let minimized_at = s.frame(wid(2));
+    report_visible(&mut s, &[wid(1)]);
+    s.switch(c);
+    assert!(s.parked().is_empty());
+    s.reactor.handle_event(Event::RaiseTimeout { sequence_id: s.reactor.raise_sequence });
+    s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
+    s.reactor.handle_event(Event::ApplicationActivated(1, Quiet::No));
+    s.reactor
+        .handle_event(Event::ApplicationMainWindowChanged(1, Some(wid(1)), Quiet::No));
+    assert_eq!(c, s.reactor.contexts.active());
+
+    s.reactor
+        .handle_event(Event::ApplicationMainWindowChanged(1, Some(wid(3)), Quiet::No));
+    let info = WindowInfo {
+        frame: minimized_at,
+        ..make_window(3)
+    };
+    open_window(&mut s, wid(3), info, &[wid(1)]);
+
+    assert_eq!(vec![id_of(c)], s.reactor.contexts.contexts_of(wid(3)));
+    assert_eq!(c, s.reactor.contexts.active());
+    assert_eq!(vec![id_of(d)], s.reactor.contexts.contexts_of(wid(2)));
+    assert!(s.parked().is_empty());
+    let tiles = halves(wid(1), wid(3));
+    assert_eq!(tiles, s.tiles());
+    assert_eq!(tiles, s.frames(&[wid(1), wid(3)]));
+}
+
 /// R36, R13. App 1 has window 1 on another Space, only in D, and window 2 on
 /// the visible Space, only in C. Each fills the screen on its own Space, so
 /// they have the same frame. Window 1 is still the app's main window. A
 /// window on a Space nobody sees is no tab, so a switch to C shows window 2,
 /// its member, and parks nothing.
+///
+/// Then the user changes to Space 1, where window 1 becomes visible. It is
+/// only in D, so under C it must not show: it is parked and gets no tile.
 #[test]
-#[ignore = "bug: the tab check compares frames of windows that aren't on screen, so a window on another Space decides the membership of a window at the same frame"]
 fn r36_r13_a_window_on_another_space_at_the_same_frame_is_no_tab() {
     let mut s = Setup::on(vec![screen()], vec![Some(space())]);
     let full = |idx: usize| WindowInfo {
@@ -1331,6 +1370,15 @@ fn r36_r13_a_window_on_another_space_at_the_same_frame_is_no_tab() {
     assert_eq!(Vec::<WindowId>::new(), s.parked());
     assert_eq!(vec![(wid(2), screen())], s.tiles());
     assert_eq!(screen(), s.frame(wid(2)));
+
+    let snapshot = on_screen(&s, &[wid(1)]);
+    s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], snapshot));
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    assert!(!s.reactor.contexts.is_member(c, wid(1)));
+    assert_eq!(vec![wid(1)], s.parked());
+    assert!(s.tiles().is_empty());
+    assert_eq!(corner(screen().size), s.frame(wid(1)));
 }
 
 /// R22 step 4, R29. C holds an empty record of app 2 that no title matches. App
