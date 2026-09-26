@@ -528,6 +528,72 @@ fn describe_context_command(cmd: &ContextCommand) -> (String, String, String, u3
             format!("create_context_{name}"),
             40,
         ),
+        ContextCommand::AddWindow { context, .. } => {
+            let (name, id, order) = describe_context_ref(context);
+            (
+                format!("Add a window to {name}"),
+                category,
+                format!("add_window_{id}"),
+                40 + order,
+            )
+        }
+        ContextCommand::MoveWindow { context, .. } => {
+            let (name, id, order) = describe_context_ref(context);
+            (
+                format!("Move a window to {name}"),
+                category,
+                format!("move_window_{id}"),
+                60 + order,
+            )
+        }
+        ContextCommand::TogglePinned { .. } => (
+            "Pin or unpin a window".to_string(),
+            category,
+            "toggle_pinned".to_string(),
+            81,
+        ),
+        ContextCommand::CreateContextFromWindows { name, .. } => (
+            format!("Create context \"{name}\" from chosen windows"),
+            category,
+            format!("create_context_from_windows_{name}"),
+            40,
+        ),
+        ContextCommand::EditContext { context, .. } => {
+            let (name, id, order) = describe_context_ref(context);
+            (
+                format!("Edit the windows of {name}"),
+                category,
+                format!("edit_context_{id}"),
+                82 + order,
+            )
+        }
+        ContextCommand::RenameContext { context, .. } => {
+            let (name, id, order) = describe_context_ref(context);
+            (
+                format!("Rename {name}"),
+                category,
+                format!("rename_context_{id}"),
+                83 + order,
+            )
+        }
+        ContextCommand::SetContextNumber { context, .. } => {
+            let (name, id, order) = describe_context_ref(context);
+            (
+                format!("Give {name} a number"),
+                category,
+                format!("set_context_number_{id}"),
+                84 + order,
+            )
+        }
+        ContextCommand::DeleteContext(reference) => {
+            let (name, id, order) = describe_context_ref(reference);
+            (
+                format!("Delete {name}"),
+                category,
+                format!("delete_context_{id}"),
+                85 + order,
+            )
+        }
     }
 }
 

@@ -297,6 +297,58 @@ pub enum ContextCommand {
     /// Creates a context with this name, whose members are the windows that
     /// show on the visible Spaces, and switches to it.
     CreateContext(String),
+    /// Adds `window` to the context. `None` means the focused window, which
+    /// only a key binding uses: the switcher always passes `Some`, and the
+    /// reactor never falls back to the focused window when it has one.
+    AddWindow {
+        window: Option<WindowId>,
+        context: ContextRef,
+    },
+    /// Moves `window` out of the active context and into this one.
+    MoveWindow {
+        window: Option<WindowId>,
+        context: ContextRef,
+    },
+    /// Pins or unpins `window`.
+    TogglePinned { window: Option<WindowId> },
+    /// Creates a context whose members are exactly `windows`, and switches
+    /// to it. Every window is resolved to its native tab group (R36), and a
+    /// pinned window is left out: it is a member of every context already.
+    CreateContextFromWindows {
+        name: String,
+        windows: Vec<WindowId>,
+    },
+    /// Changes a context's members: first the records in `remove_records`,
+    /// then the windows in `remove` at once, then the windows in `add`,
+    /// which take effect at the next switch (R37).
+    EditContext {
+        context: ContextRef,
+        add: Vec<WindowId>,
+        remove: Vec<WindowId>,
+        remove_records: Vec<RecordRef>,
+    },
+    /// Renames a context (R4).
+    RenameContext {
+        context: ContextRef,
+        name: String,
+    },
+    /// Gives a context a number from 1 to 9 (R5).
+    SetContextNumber {
+        context: ContextRef,
+        number: u8,
+    },
+    /// Deletes a context (R6).
+    DeleteContext(ContextRef),
+}
+
+/// A member record that the switcher's `edit` removes: the record at
+/// `record` in the context, with the app name and title it had when the
+/// panel read the payload.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RecordRef {
+    pub record: usize,
+    pub app: String,
+    pub title: String,
 }
 
 /// Names a context in a command.

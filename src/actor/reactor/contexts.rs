@@ -479,6 +479,7 @@ impl Reactor {
                 | ContextCommand::ShowEverything
                 | ContextCommand::PreviousContext
                 | ContextCommand::CreateContext(_)
+                | ContextCommand::CreateContextFromWindows { .. }
         );
         if switches && self.screens.iter().all(|screen| screen.space.is_none()) {
             return Err(NO_MANAGED_SPACE.to_string());
@@ -504,6 +505,29 @@ impl Reactor {
             }
             ContextCommand::ToggleWindowPinned => self.toggle_window_pinned(self.main_window()),
             ContextCommand::CreateContext(name) => self.create_context(&name),
+            ContextCommand::AddWindow { window, context } => {
+                self.add_window_to_context(self.carried_window(window), &context)
+            }
+            ContextCommand::MoveWindow { window, context } => {
+                self.move_window_to_context(self.carried_window(window), &context)
+            }
+            ContextCommand::TogglePinned { window } => {
+                self.toggle_window_pinned(self.carried_window(window))
+            }
+            ContextCommand::CreateContextFromWindows { name, windows } => {
+                self.create_context_from_windows(&name, &windows)
+            }
+            ContextCommand::EditContext {
+                context,
+                add,
+                remove,
+                remove_records,
+            } => self.edit_context(&context, &add, &remove, &remove_records),
+            ContextCommand::RenameContext { context, name } => self.rename_context(&context, &name),
+            ContextCommand::SetContextNumber { context, number } => {
+                self.set_context_number(&context, number)
+            }
+            ContextCommand::DeleteContext(reference) => self.delete_context_named(&reference),
         }
     }
 
@@ -580,10 +604,6 @@ impl Reactor {
     /// Deletes a context. Its windows stay open, and the ones that were only
     /// in it become unsorted. When it was active, Unsorted shows first, and
     /// then the context's layouts go.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no command deletes a context yet")
-    )]
     pub(super) fn delete_context(&mut self, id: ContextId) -> Result<(), ContextError> {
         let was_active = self.contexts.active() == ContextKey::Named(id);
         self.contexts.delete(id)?;
@@ -788,6 +808,7 @@ mod tests {
     mod membership;
     mod membership_rules;
     mod replay_rules;
+    mod switcher;
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
