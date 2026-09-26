@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 
 pub use context_menu::ContextMenuKeys;
-use context_menu::{MenuAction, MenuEntry, MenuItem, context_menu};
+use context_menu::{MenuAction, MenuEntry, MenuItem, command_available, context_menu};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{
@@ -458,9 +458,7 @@ impl MenuHandler {
             menu.removeItem(&item);
         }
         let entries = match contexts_snapshot::published() {
-            Some(snapshot) => context_menu(&snapshot, &ivars.context_keys.borrow(), |action| {
-                action.command().is_some()
-            }),
+            Some(snapshot) => context_menu(&snapshot, &ivars.context_keys.borrow(), command_available),
             None => Vec::new(),
         };
         let mut actions = Vec::new();

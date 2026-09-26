@@ -17,12 +17,13 @@ use crate::collections::{BTreeMap, HashSet};
 use crate::model::contexts::{ContextId, ContextKey, UNSORTED_NAME, fold};
 use crate::ui::status_bar::MenuKeyEquivalent;
 
-/// The name of the command that moves the focused window to a context, as a
-/// key binding writes it.
-const MOVE_WINDOW_TO_CONTEXT: &str = "move_window_to_context";
 /// The name of the command that opens the switcher, as a key binding writes
 /// it.
 const OPEN_CONTEXT_SWITCHER: &str = "open_context_switcher";
+/// Whether the `open_context_switcher` command exists. M8 adds it as
+/// `ContextCommand::OpenContextSwitcher` and sets this to true, or replaces
+/// the arm that reads it. Until then the menu item stays disabled.
+const OPEN_CONTEXT_SWITCHER_BUILT: bool = false;
 
 /// What choosing an item of the section does.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,11 +53,21 @@ impl MenuAction {
             MenuAction::Switch(ContextKey::Everything) => context(ContextCommand::ShowEverything),
             MenuAction::NewContext(name) => context(ContextCommand::CreateContext(name.clone())),
             MenuAction::SendWindowTo(id) => {
-                command_named(json!({ MOVE_WINDOW_TO_CONTEXT: { "id": id } }))
+                context(ContextCommand::MoveWindowToContext(ContextRef::Id(*id)))
             }
-            MenuAction::OpenSwitcher => command_named(json!(OPEN_CONTEXT_SWITCHER)),
+            MenuAction::OpenSwitcher if OPEN_CONTEXT_SWITCHER_BUILT => {
+                command_named(json!(OPEN_CONTEXT_SWITCHER))
+            }
+            // M8 adds the command; nothing names it yet, so the item is
+            // disabled.
+            MenuAction::OpenSwitcher => None,
         }
     }
+}
+
+/// The status menu's enable check: whether the action's command exists.
+pub fn command_available(action: &MenuAction) -> bool {
+    action.command().is_some()
 }
 
 /// The command that a key binding written as `value` names, or `None` when
@@ -611,7 +622,7 @@ mod tests {
     /// The check that the status menu makes: whether the action's command
     /// exists.
     fn exists(action: &MenuAction) -> bool {
-        action.command().is_some()
+        command_available(action)
     }
 
     fn hotkey(text: &str) -> Hotkey {
@@ -1121,20 +1132,32 @@ mod tests {
             ],
             sent
         );
-        for (action, expected) in [
-            (
-                MenuAction::SendWindowTo(relax),
-                serde_json::json!({ "move_window_to_context": { "id": relax } }),
-            ),
-            (
-                MenuAction::OpenSwitcher,
-                serde_json::json!("open_context_switcher"),
-            ),
-        ] {
-            if let Some(command) = action.command() {
-                assert_eq!(expected, serde_json::to_value(command).unwrap());
-            }
-        }
+        assert_eq!(
+            serde_json::json!({ "move_window_to_context": { "id": relax } }),
+            json(MenuAction::SendWindowTo(relax).command()),
+        );
+        // M8 adds the command; the item is disabled until then.
+        assert!(MenuAction::OpenSwitcher.command().is_none());
+    }
+
+    /// The status menu's own check, `command_available`, with the published
+    /// snapshot: every item is enabled except Open Switcher, whose command M8
+    /// adds. Send Window to now sends a typed command, so its submenu and
+    /// every item but the active context's are enabled.
+    #[test]
+    fn the_status_menu_enables_every_item_but_open_switcher() {
+        let entries = context_menu(&snapshot(Some("Unsorted"), 2), &keys(), command_available);
+
+        let disabled: Vec<&str> = items(&entries)
+            .into_iter()
+            .filter(|item| !item.enabled)
+            .map(|item| item.title.as_str())
+            .collect();
+        assert_eq!(vec!["Open Switcher…"], disabled);
+        let (enabled, send) = submenu(&entries);
+        assert!(enabled);
+        assert_eq!(3, send.len());
+        assert!(send.iter().all(|item| item.enabled));
     }
 
     /// Menu bar, R23. A context whose windows are all closed is still
