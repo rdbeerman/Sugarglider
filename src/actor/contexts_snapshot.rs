@@ -210,6 +210,19 @@ impl ContextsSnapshot {
         }
     }
 
+    /// What the managed screens show: the first screen's entry that isn't
+    /// Everything, or Everything while every screen shows it. `None` while
+    /// no screen shows a managed Space, and while contexts are off. The
+    /// status title and the menu's checkmark follow it.
+    pub fn shown(&self) -> Option<ContextKey> {
+        if !self.enabled || self.screens.is_empty() {
+            return None;
+        }
+        let mut shown = self.screens.iter().map(|screen| screen.shows);
+        let context = shown.find(|key| *key != ContextKey::Everything);
+        Some(context.unwrap_or(ContextKey::Everything))
+    }
+
     /// The snapshot with only the named contexts that are active or that a
     /// screen shows.
     pub fn current(&self) -> Self {
@@ -425,6 +438,40 @@ mod tests {
         );
         contexts.switch_to(ContextKey::Unsorted).unwrap();
         assert!(self::snapshot(&contexts, 2).current().contexts.is_empty());
+    }
+
+    /// What the screens show, for the status title and the menu: the first
+    /// screen that shows a context other than Everything, else Everything,
+    /// and nothing while no screen shows a managed Space or contexts are
+    /// off. The active context doesn't count, because it may not show.
+    #[test]
+    fn the_shown_entry_is_the_first_one_that_a_screen_shows_other_than_everything() {
+        let contexts = three();
+        let comms = named(&contexts, "Comms");
+        let client = named(&contexts, "Client work");
+        let on = |shows: &[ContextKey]| ContextsSnapshot {
+            active: comms,
+            screens: shows
+                .iter()
+                .zip(1..)
+                .map(|(&shows, id)| ScreenContext { id, shows })
+                .collect(),
+            ..snapshot(&contexts, 0)
+        };
+        let everything = ContextKey::Everything;
+
+        assert_eq!(None, on(&[]).shown());
+        assert_eq!(Some(everything), on(&[everything]).shown());
+        assert_eq!(Some(everything), on(&[everything, everything]).shown());
+        assert_eq!(Some(comms), on(&[comms]).shown());
+        assert_eq!(Some(comms), on(&[everything, comms]).shown());
+        assert_eq!(Some(client), on(&[client, comms]).shown());
+        assert_eq!(
+            Some(ContextKey::Unsorted),
+            on(&[everything, ContextKey::Unsorted]).shown()
+        );
+        let off = ContextsSnapshot { enabled: false, ..on(&[comms]) };
+        assert_eq!(None, off.shown());
     }
 
     #[test]

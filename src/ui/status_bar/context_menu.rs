@@ -138,6 +138,10 @@ fn context_command(command: &WmCommand) -> Option<&ContextCommand> {
 
 /// The section for `snapshot`, which is empty while contexts are off.
 ///
+/// The checkmark is on what the managed screens show. While no screen shows
+/// a managed Space, nothing is checked, and the items that switch or create
+/// a context are disabled, because the reactor refuses them then.
+///
 /// `available` tells whether the command of an action exists. An item whose
 /// command doesn't exist is disabled.
 pub fn context_menu(
@@ -149,6 +153,7 @@ pub fn context_menu(
         return Vec::new();
     }
     let active = snapshot.active;
+    let shown = snapshot.shown();
     let item = |title: &str, action: MenuAction, key: Option<MenuKeyEquivalent>| MenuItem {
         title: title.to_string(),
         checked: false,
@@ -157,9 +162,11 @@ pub fn context_menu(
         key,
     };
     let switch = |title: &str, to: ContextKey, key: Option<MenuKeyEquivalent>| {
+        let switch_to = item(title, MenuAction::Switch(to), key);
         MenuEntry::Item(MenuItem {
-            checked: active == to,
-            ..item(title, MenuAction::Switch(to), key)
+            checked: shown == Some(to),
+            enabled: switch_to.enabled && shown.is_some(),
+            ..switch_to
         })
     };
 
@@ -181,12 +188,15 @@ pub fn context_menu(
     ));
     entries.push(MenuEntry::Separator);
 
-    let name = new_context_name(snapshot);
-    entries.push(MenuEntry::Item(item(
+    let new_context = item(
         "New Context from Current Windows…",
-        MenuAction::NewContext(name),
+        MenuAction::NewContext(new_context_name(snapshot)),
         None,
-    )));
+    );
+    entries.push(MenuEntry::Item(MenuItem {
+        enabled: new_context.enabled && shown.is_some(),
+        ..new_context
+    }));
     let send: Vec<MenuItem> = snapshot
         .contexts
         .iter()
@@ -468,7 +478,11 @@ mod tests {
     fn without_contexts_send_window_to_is_disabled() {
         let mut contexts = Contexts::new();
         contexts.switch_to(ContextKey::Everything).unwrap();
-        let snapshot = ContextsSnapshot::new(&contexts, Vec::new(), 0);
+        let screens = vec![ScreenContext {
+            id: 1,
+            shows: ContextKey::Everything,
+        }];
+        let snapshot = ContextsSnapshot::new(&contexts, screens, 0);
 
         let entries = context_menu(&snapshot, &ContextMenuKeys::default(), all);
 
@@ -719,7 +733,6 @@ mod tests {
     /// `ShowEverythingOn` step of `a_snapshot_is_published_after_each_kind_of_change`
     /// show.
     #[test]
-    #[ignore = "bug: the checkmark is on the model's context while the screens show Everything"]
     fn while_the_screens_show_everything_show_everything_is_checked() {
         let mut contexts = Contexts::new();
         let comms = contexts.create("Comms").unwrap();
@@ -733,6 +746,50 @@ mod tests {
         let entries = context_menu(&everything_shown, &keys(), all);
 
         assert_eq!(vec!["Show Everything"], checked(&entries));
+    }
+
+    /// Menu bar, with the coordinator's decision for a desktop without a
+    /// managed Space: after Stop Globally, or at the login window, the
+    /// snapshot has no screens. Then no item is checked, whichever context
+    /// is active, and the items that switch or create a context are
+    /// disabled. Send Window to still works.
+    #[test]
+    fn with_no_managed_space_nothing_is_checked_and_switches_are_disabled() {
+        for active in [Some("Comms"), Some("Unsorted"), None] {
+            let snapshot = ContextsSnapshot {
+                screens: Vec::new(),
+                ..snapshot(active, 2)
+            };
+
+            let entries = context_menu(&snapshot, &keys(), all);
+
+            assert!(checked(&entries).is_empty(), "{active:?}");
+            let enabled: Vec<&str> = items(&entries)
+                .into_iter()
+                .filter(|item| item.enabled && !matches!(item.action, MenuAction::SendWindowTo(_)))
+                .map(|item| item.title.as_str())
+                .collect();
+            assert_eq!(vec!["Open Switcher…"], enabled, "{active:?}");
+            assert!(submenu(&entries).0, "{active:?}");
+        }
+    }
+
+    /// Menu bar, with the coordinator's decision for mixed screens: while
+    /// one screen shows Everything and another the context, the context
+    /// has the checkmark.
+    #[test]
+    fn with_mixed_screens_the_context_a_screen_shows_is_checked() {
+        let mut snapshot = snapshot(Some("Relax"), 0);
+        let relax = ContextKey::Named(id(&snapshot, "Relax"));
+        snapshot.screens = vec![
+            ScreenContext {
+                id: 1,
+                shows: ContextKey::Everything,
+            },
+            ScreenContext { id: 2, shows: relax },
+        ];
+
+        assert_eq!(vec!["Relax"], checked(&context_menu(&snapshot, &keys(), all)));
     }
 
     /// Menu bar. Send Window to offers each named context in order, never

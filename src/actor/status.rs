@@ -293,13 +293,11 @@ impl Status {
     }
 }
 
-/// The name of the context that the status item shows: the active context.
-/// `None` under Everything, and while contexts are off.
+/// The name of the context that the status item shows: the context that a
+/// managed screen shows. `None` while the screens show Everything, while no
+/// screen shows a managed Space, and while contexts are off.
 fn shown_context_name(snapshot: &ContextsSnapshot) -> Option<&str> {
-    if !snapshot.enabled {
-        return None;
-    }
-    match snapshot.active {
+    match snapshot.shown()? {
         ContextKey::Everything => None,
         key => snapshot.name(key),
     }
@@ -436,7 +434,6 @@ mod tests {
     /// Space off, the title names no context, whichever is active. The
     /// Space's number still shows while the setting is on.
     #[test]
-    #[ignore = "bug: the title names the active context while no Space is managed"]
     fn with_no_managed_space_the_title_names_no_context() {
         let mut contexts = Contexts::new();
         let comms = contexts.create("Comms").unwrap();
@@ -462,7 +459,6 @@ mod tests {
     /// `ShowEverythingOn` step of `a_snapshot_is_published_after_each_kind_of_change`
     /// show.
     #[test]
-    #[ignore = "bug: the title names the model's context while the screens show Everything"]
     fn while_the_screens_show_everything_the_title_adds_nothing() {
         let mut contexts = Contexts::new();
         let comms = contexts.create("Comms").unwrap();
@@ -475,6 +471,30 @@ mod tests {
 
         assert_eq!("", title(None, &everything_shown));
         assert_eq!("2", title(Some(2), &everything_shown));
+    }
+
+    /// Menu bar, with the coordinator's decision for mixed screens: in
+    /// global scope, while one screen shows Everything, for example until
+    /// the Space change that turns its Space off, and another shows the
+    /// context, the title names the context.
+    #[test]
+    fn with_mixed_screens_the_title_names_the_context_a_screen_shows() {
+        let mut contexts = Contexts::new();
+        let comms = contexts.create("Comms").unwrap();
+        contexts.switch_to(ContextKey::Named(comms)).unwrap();
+        for shows in [
+            [ContextKey::Everything, ContextKey::Named(comms)],
+            [ContextKey::Named(comms), ContextKey::Everything],
+        ] {
+            let screens = vec![
+                ScreenContext { id: 1, shows: shows[0] },
+                ScreenContext { id: 2, shows: shows[1] },
+            ];
+            let mixed = ContextsSnapshot::new(&contexts, screens, 0);
+
+            assert_eq!("Comms", title(None, &mixed), "{shows:?}");
+            assert_eq!("2 · Comms", title(Some(2), &mixed), "{shows:?}");
+        }
     }
 
     /// Menu bar. The title shows the context's name as the model stores it,
