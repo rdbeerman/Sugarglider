@@ -146,12 +146,13 @@ impl Reactor {
 
     /// Clears the parked state of the windows and returns each with the frame
     /// it had before it was parked. The next layout pass writes each one's
-    /// frame.
+    /// frame, even if the reactor believes the window is there already.
     pub(super) fn release_parked(&mut self, wids: &[WindowId]) -> Vec<(WindowId, CGRect)> {
         let mut released = vec![];
         for wid in wids {
             let Some(frame) = self.parked.remove(wid) else { continue };
             self.frame_attempts.remove(wid);
+            self.forced_writes.insert(*wid);
             // The user can't be resizing a window in a corner, and
             // `update_layout` doesn't write to the window being resized.
             if self.resizing_window == Some(*wid) {
@@ -1752,6 +1753,31 @@ mod tests {
             mouse,
         ));
         s.apps.windows.get_mut(&wid).unwrap().frame = frame;
+    }
+
+    #[test]
+    fn h4_an_unpark_writes_the_frame_when_the_known_frame_already_matches_it() {
+        let mut s = Setup::new(2);
+        let tile = s.frame(wid(1));
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        // Something set the frame the reactor knows back to the tile, while
+        // the window is still in its corner.
+        s.reactor.windows.get_mut(&wid(1)).unwrap().frame_monotonic = tile;
+
+        s.reactor.unpark_windows(&[wid(1)]);
+
+        let requests = s.apps.requests();
+        assert_eq!(vec![tile], frame_writes(&requests, wid(1)));
+        s.handle_requests(requests);
+        assert_eq!(tile, s.frame(wid(1)));
+        assert!(s.journal_on_disk().is_empty());
+        assert!(s.reactor.forced_writes.is_empty());
+        s.refresh_visible_windows();
+        assert!(
+            frame_writes(&s.apps.requests(), wid(1)).is_empty(),
+            "only the unpark write is forced"
+        );
     }
 
     #[test]

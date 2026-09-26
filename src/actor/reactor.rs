@@ -301,6 +301,9 @@ pub struct Reactor {
     /// Finds the process that has a pid now, to tell which journal entries
     /// belong to apps that are still running.
     process_lookup: ProcessLookup,
+    /// Windows put back from parking whose next frame write goes out even
+    /// when their known frame already matches it.
+    forced_writes: HashSet<WindowId>,
 }
 
 /// How many times in a row we write the same frame to a window before giving
@@ -512,6 +515,7 @@ impl Reactor {
             parked: HashMap::default(),
             journal,
             process_lookup: Box::new(Process::with_pid),
+            forced_writes: HashSet::default(),
         }
     }
 
@@ -1807,7 +1811,8 @@ impl Reactor {
             };
             let target_frame = round_to_physical(target_frame, scale_factor);
             let current_frame = window.frame_monotonic;
-            if target_frame.same_as(current_frame) {
+            let forced = self.forced_writes.remove(&wid);
+            if target_frame.same_as(current_frame) && !forced {
                 continue;
             }
             // Some apps move a window back after we place it, which turns into
@@ -1845,6 +1850,7 @@ impl Reactor {
             anim.add_window(&app.handle, wid, current_frame, target_frame, is_new, txid);
             window.frame_monotonic = target_frame;
         }
+        self.forced_writes.clear();
         // If the user is doing something with the mouse we don't want to
         // animate on top of that.
         let skip_anim =
