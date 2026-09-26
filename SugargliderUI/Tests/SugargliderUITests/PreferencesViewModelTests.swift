@@ -177,7 +177,8 @@ final class PreferencesViewModelTests: XCTestCase {
 
   /// Rust refuses to save over a config file with an error. The window's
   /// banner shows `lastError`: Rust's message once, without a second
-  /// "Failed to save config", until a save succeeds.
+  /// "Failed to save config", until a save succeeds. A failed save leaves
+  /// the running app alone, so the two still match.
   func testShowsWhySavingFailedUntilASaveSucceeds() {
     let message = """
       Failed to save config: /tmp/glide.toml has an error, so it was not changed.
@@ -197,11 +198,14 @@ final class PreferencesViewModelTests: XCTestCase {
 
     XCTAssertEqual(model.lastError, message)
     XCTAssertEqual(backend.saved.count, 0)
+    // The running app was not changed either, so it still matches the file.
+    XCTAssertEqual(backend.updated.count, 0)
 
     backend.saveError = nil
     model.saveToConfig()
 
     XCTAssertNil(model.lastError)
     XCTAssertEqual(backend.saved.count, 1)
+    XCTAssertEqual(backend.updated.count, 1)
   }
 }

@@ -249,10 +249,10 @@ public class PreferencesViewModel: ObservableObject {
         let config = buildConfig()
 
         do {
-            // Update running window manager immediately
-            try backend.updateConfig(config)
-            // Persist to file
+            // Write the file first. The running app changes only after the
+            // write succeeds, so a failed save can't leave the two apart.
             try backend.saveConfigToFile(config)
+            try backend.updateConfig(config)
             lastError = nil
         } catch {
             lastError = error.localizedDescription
