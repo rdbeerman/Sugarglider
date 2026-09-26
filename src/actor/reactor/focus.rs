@@ -5,7 +5,9 @@
 //! Sugarglider switches to that context. The design is in
 //! `docs/specs/contexts.md`.
 
-use tracing::{debug, info};
+use std::time::{Duration, Instant};
+
+use tracing::{debug, info, warn};
 
 use super::Reactor;
 use crate::actor::app::{Quiet, Request, WindowId, pid_t};
@@ -14,6 +16,10 @@ use crate::collections::HashSet;
 use crate::model::contexts::ContextKey;
 
 const FINDER: &str = "com.apple.finder";
+
+/// How long a switch waits at most for its end, in case the events that
+/// end it never arrive, for example because an app didn't answer a write.
+const GUARD_DEADLINE: Duration = Duration::from_secs(2);
 
 /// What a switch waits for before focus from outside counts again (R25).
 /// Until then, activations and main window changes can be the switch's own.
@@ -27,6 +33,8 @@ pub(super) struct SwitchGuard {
     /// Finder, when the switch activated it because no window could take
     /// focus (R12, step 6), until its activation arrives.
     finder: Option<pid_t>,
+    /// When the switch started to wait.
+    pub(super) since: Option<Instant>,
 }
 
 impl SwitchGuard {
@@ -191,8 +199,30 @@ impl Reactor {
             Some(_) => HashSet::default(),
             None => parked.iter().copied().collect(),
         };
-        self.switch_guard = SwitchGuard { raise, echoes, finder };
+        self.switch_guard = SwitchGuard {
+            raise,
+            echoes,
+            finder,
+            since: Some(Instant::now()),
+        };
         debug!(guard = ?self.switch_guard, "Waiting for the switch to end");
+    }
+
+    /// Stops waiting for the end of a switch that started to wait 2 seconds
+    /// or more before `now`. The reactor's visibility refresh calls this.
+    pub(super) fn guard_deadline_tick(&mut self, now: Instant) {
+        let guard = &self.switch_guard;
+        if guard.holds()
+            && guard
+                .since
+                .is_some_and(|since| now.saturating_duration_since(since) >= GUARD_DEADLINE)
+        {
+            warn!(
+                ?guard,
+                "The switch didn't end in time; focus from outside counts again"
+            );
+            self.switch_guard = SwitchGuard::default();
+        }
     }
 
     /// A raise sequence reported a completed raise of `window`, or with

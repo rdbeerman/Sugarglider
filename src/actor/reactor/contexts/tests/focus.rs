@@ -471,3 +471,24 @@ fn r12_step_6_a_switch_that_leaves_no_window_to_focus_activates_finder() {
     activate(&mut s, 1, wid(1), Order::GloballyFirst);
     assert_eq!(c, s.reactor.contexts.active());
 }
+
+/// R25. When the events that end a switch never arrive, focus from
+/// outside counts again at the first visibility refresh 2 seconds after the
+/// switch.
+#[test]
+fn r25_a_switch_whose_end_never_arrives_stops_waiting_after_2_seconds() {
+    let TwoApps { mut s, c, d, other } = two_apps();
+    let _raises = capture_raises(&mut s);
+    activate(&mut s, 2, other, Order::GloballyFirst);
+    assert_eq!(d, s.reactor.contexts.active());
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    let since = s.reactor.switch_guard.since.unwrap();
+    s.reactor.guard_deadline_tick(since + Duration::from_millis(1999));
+    activate(&mut s, 1, wid(1), Order::GloballyFirst);
+    assert_eq!(d, s.reactor.contexts.active());
+
+    s.reactor.guard_deadline_tick(since + Duration::from_secs(2));
+    activate(&mut s, 1, wid(1), Order::GloballyLast);
+    assert_eq!(c, s.reactor.contexts.active());
+}

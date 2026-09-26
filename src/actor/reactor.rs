@@ -711,6 +711,7 @@ impl Reactor {
                     // Periodically refresh visible windows to detect closed windows.
                     self.update_visible_windows();
                     self.exit_deadline_tick(Instant::now());
+                    self.guard_deadline_tick(Instant::now());
                     visibility_timer.set_next_fire(visibility_refresh_interval);
                 }
             }
