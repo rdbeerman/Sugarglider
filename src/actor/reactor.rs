@@ -4558,4 +4558,119 @@ pub mod tests {
             None,
         ));
     }
+
+    /// The contexts as the status item's title and menu receive them.
+    mod menu_bar {
+        use std::sync::{Arc, Mutex};
+
+        use pretty_assertions::assert_eq;
+        use test_log::test;
+
+        use super::super::create_context::tests::{Setup, space, wid};
+        use super::super::{ContextCommand, ContextRef, Event, Reactor};
+        use crate::actor::contexts_snapshot::{ContextsSnapshot, ScreenContext};
+        use crate::model::contexts::ContextKey;
+        use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
+
+        type Published = Arc<Mutex<Vec<Arc<ContextsSnapshot>>>>;
+
+        /// Keeps every snapshot that the reactor publishes from now on.
+        fn capture(reactor: &mut Reactor) -> Published {
+            let published = Published::default();
+            let sink = published.clone();
+            reactor.publish_contexts =
+                Box::new(move |snapshot| sink.lock().unwrap().push(snapshot));
+            published
+        }
+
+        fn count(published: &Published) -> usize {
+            published.lock().unwrap().len()
+        }
+
+        fn last(published: &Published) -> ContextsSnapshot {
+            (**published.lock().unwrap().last().unwrap()).clone()
+        }
+
+        /// A window server snapshot that lists app 1's windows at their
+        /// frames.
+        fn listed(s: &Setup, idxs: &[u32]) -> WindowsOnScreen {
+            WindowsOnScreen::new(
+                idxs.iter()
+                    .map(|&idx| WindowServerInfo {
+                        id: WindowServerId::new(idx),
+                        pid: 1,
+                        layer: 0,
+                        frame: s.apps.windows[&wid(idx)].frame,
+                    })
+                    .collect(),
+            )
+        }
+
+        /// Menu bar, R16, R29. The menu lists Unsorted while it is active,
+        /// also with no windows, and its item sends `{ switch_context =
+        /// "Unsorted" }`. The reactor takes that name as Unsorted, also
+        /// next to a context whose name starts with it, and applies
+        /// Unsorted again: a new use, published, with the other windows
+        /// still parked.
+        #[test]
+        fn the_unsorted_item_applies_unsorted_again_while_it_has_no_windows() {
+            let mut s = Setup::new(2);
+            s.create("Unsorted work");
+            let unsorted = || ContextCommand::SwitchContext(ContextRef::Name("Unsorted".into()));
+            s.run(unsorted());
+            assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+            assert_eq!(vec![wid(1), wid(2)], s.parked());
+            let used = s.reactor.contexts.last_used(ContextKey::Unsorted);
+            let published = capture(&mut s.reactor);
+
+            s.run(unsorted());
+
+            assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+            assert_eq!(vec![wid(1), wid(2)], s.parked());
+            assert_eq!(1, count(&published));
+            let again = last(&published);
+            assert_eq!(ContextKey::Unsorted, again.active);
+            assert_eq!(0, again.unsorted.windows);
+            assert_eq!(used + 1, again.unsorted.last_used);
+        }
+
+        /// Menu bar, with the coordinator's decision for a desktop without
+        /// a managed Space. When no screen shows a managed Space any more,
+        /// the reactor publishes a snapshot without screens, and the active
+        /// context stays, so the title can tell that no Space shows it.
+        /// This holds for a Space change from the login window, and for
+        /// R33's path, where the Space shows Everything before it is turned
+        /// off.
+        #[test]
+        fn leaving_every_managed_space_publishes_a_snapshot_without_screens() {
+            let mut s = Setup::new(2);
+            s.create("Work");
+            let work = ContextKey::Named(s.id("Work"));
+            let shows = |key| vec![ScreenContext { id: 1, shows: key }];
+            let all = listed(&s, &[1, 2]);
+            let published = capture(&mut s.reactor);
+
+            s.reactor.handle_event(Event::SpaceChanged(vec![None], all.clone()));
+
+            assert_eq!(1, count(&published));
+            let login_window = last(&published);
+            assert_eq!(Vec::<ScreenContext>::new(), login_window.screens);
+            assert_eq!(work, login_window.active);
+
+            s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], all.clone()));
+            s.apps.simulate_until_quiet(&mut s.reactor);
+            assert_eq!(shows(work), last(&published).screens);
+            s.reactor.handle_event(Event::ShowEverythingOn(vec![space()]));
+            s.apps.simulate_until_quiet(&mut s.reactor);
+            assert_eq!(shows(ContextKey::Everything), last(&published).screens);
+            let before = count(&published);
+
+            s.reactor.handle_event(Event::SpaceChanged(vec![None], all));
+
+            assert_eq!(before + 1, count(&published));
+            let turned_off = last(&published);
+            assert_eq!(Vec::<ScreenContext>::new(), turned_off.screens);
+            assert_eq!(work, turned_off.active);
+        }
+    }
 }
