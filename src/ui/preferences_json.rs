@@ -6,9 +6,7 @@
 //! This module defines types that are serialized to JSON for exchange between
 //! the Swift preferences UI and the Rust backend.
 
-use std::str::FromStr;
-
-use livesplit_hotkey::Hotkey;
+use livesplit_hotkey::{Hotkey, KeyCode, Modifiers};
 use serde::{Deserialize, Serialize};
 
 use crate::actor::layout::{LayoutCommand, SizeShare};
@@ -173,86 +171,132 @@ pub fn command_json(cmd: &WmCommand) -> serde_json::Value {
     serde_json::to_value(cmd).expect("commands serialize to JSON")
 }
 
-/// Parse a macOS-style hotkey string (e.g., "⌥⇧H") back to a livesplit Hotkey.
-fn parse_hotkey_string(s: &str) -> Option<Hotkey> {
-    let mut modifiers = Vec::new();
-    let mut key_part = String::new();
+/// The modifiers of a hotkey string, in the order the Preferences window
+/// shows them, each with its macOS symbol. [`format_hotkey`] writes them and
+/// [`parse_hotkey_string`] reads them.
+const MODIFIER_SYMBOLS: &[(Modifiers, char)] = &[
+    (Modifiers::CONTROL, '⌃'),
+    (Modifiers::ALT, '⌥'),
+    (Modifiers::SHIFT, '⇧'),
+    (Modifiers::META, '⌘'),
+];
 
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '⌃' => modifiers.push("Ctrl"),
-            '⌥' => modifiers.push("Alt"),
-            '⇧' => modifiers.push("Shift"),
-            '⌘' => modifiers.push("Cmd"),
-            _ => {
-                // Everything else is the key
-                key_part.push(c);
-                key_part.extend(chars);
-                break;
-            }
+/// The keys whose text in the Preferences window differs from the name
+/// [`KeyCode::name`] gives them, with the text the window shows. Every other
+/// key keeps its name (e.g. "F1", "Numpad1").
+const KEY_TEXT: &[(KeyCode, &str)] = &[
+    (KeyCode::Backquote, "`"),
+    (KeyCode::Backslash, "\\"),
+    (KeyCode::BracketLeft, "["),
+    (KeyCode::BracketRight, "]"),
+    (KeyCode::Comma, ","),
+    (KeyCode::Digit0, "0"),
+    (KeyCode::Digit1, "1"),
+    (KeyCode::Digit2, "2"),
+    (KeyCode::Digit3, "3"),
+    (KeyCode::Digit4, "4"),
+    (KeyCode::Digit5, "5"),
+    (KeyCode::Digit6, "6"),
+    (KeyCode::Digit7, "7"),
+    (KeyCode::Digit8, "8"),
+    (KeyCode::Digit9, "9"),
+    (KeyCode::Equal, "="),
+    (KeyCode::KeyA, "A"),
+    (KeyCode::KeyB, "B"),
+    (KeyCode::KeyC, "C"),
+    (KeyCode::KeyD, "D"),
+    (KeyCode::KeyE, "E"),
+    (KeyCode::KeyF, "F"),
+    (KeyCode::KeyG, "G"),
+    (KeyCode::KeyH, "H"),
+    (KeyCode::KeyI, "I"),
+    (KeyCode::KeyJ, "J"),
+    (KeyCode::KeyK, "K"),
+    (KeyCode::KeyL, "L"),
+    (KeyCode::KeyM, "M"),
+    (KeyCode::KeyN, "N"),
+    (KeyCode::KeyO, "O"),
+    (KeyCode::KeyP, "P"),
+    (KeyCode::KeyQ, "Q"),
+    (KeyCode::KeyR, "R"),
+    (KeyCode::KeyS, "S"),
+    (KeyCode::KeyT, "T"),
+    (KeyCode::KeyU, "U"),
+    (KeyCode::KeyV, "V"),
+    (KeyCode::KeyW, "W"),
+    (KeyCode::KeyX, "X"),
+    (KeyCode::KeyY, "Y"),
+    (KeyCode::KeyZ, "Z"),
+    (KeyCode::Minus, "-"),
+    (KeyCode::Period, "."),
+    (KeyCode::Quote, "'"),
+    (KeyCode::Semicolon, ";"),
+    (KeyCode::Slash, "/"),
+    (KeyCode::Backspace, "⌫"),
+    (KeyCode::Enter, "↩"),
+    (KeyCode::Escape, "Esc"),
+    (KeyCode::Space, "Space"),
+    (KeyCode::Tab, "⇥"),
+    (KeyCode::ArrowDown, "↓"),
+    (KeyCode::ArrowLeft, "←"),
+    (KeyCode::ArrowRight, "→"),
+    (KeyCode::ArrowUp, "↑"),
+];
+
+/// The text the Preferences window shows for a key.
+fn key_text(key: KeyCode) -> &'static str {
+    for &(entry, text) in KEY_TEXT {
+        if entry == key {
+            return text;
         }
     }
+    key.name()
+}
 
-    if key_part.is_empty() || modifiers.is_empty() {
-        // Need both a key and at least one modifier for a valid hotkey
+/// The key whose window text is `text`, or `None` when no key reads it. A key
+/// the window shows by name (e.g. "F1") reads through the loader's names.
+fn key_from_text(text: &str) -> Option<KeyCode> {
+    for &(key, name) in KEY_TEXT {
+        if name == text {
+            return Some(key);
+        }
+    }
+    text.parse::<KeyCode>().ok()
+}
+
+/// The hotkey as the Preferences window shows it, e.g. "⌥⇧H". The inverse of
+/// [`parse_hotkey_string`].
+fn format_hotkey(hotkey: &Hotkey) -> String {
+    let mut result = String::new();
+    for &(modifier, symbol) in MODIFIER_SYMBOLS {
+        if hotkey.modifiers.contains(modifier) {
+            result.push(symbol);
+        }
+    }
+    result.push_str(key_text(hotkey.key_code));
+    result
+}
+
+/// The hotkey that the window text `s` shows, e.g. "⌥⇧H". The inverse of
+/// [`format_hotkey`]; a key without a modifier is a hotkey too.
+fn parse_hotkey_string(s: &str) -> Option<Hotkey> {
+    let mut modifiers = Modifiers::empty();
+    let mut rest = s;
+    'modifiers: loop {
+        for &(modifier, symbol) in MODIFIER_SYMBOLS {
+            if let Some(stripped) = rest.strip_prefix(symbol) {
+                modifiers.insert(modifier);
+                rest = stripped;
+                continue 'modifiers;
+            }
+        }
+        break;
+    }
+    if rest.is_empty() {
         return None;
     }
-
-    // Convert key symbols back to livesplit format
-    let key_name = match key_part.as_str() {
-        "←" => "ArrowLeft",
-        "→" => "ArrowRight",
-        "↑" => "ArrowUp",
-        "↓" => "ArrowDown",
-        "\\" => "Backslash",
-        "/" => "Slash",
-        "=" => "Equal",
-        "Space" => "Space",
-        "Esc" => "Escape",
-        "⌫" => "Backspace",
-        "↩" => "Return",
-        "⇥" => "Tab",
-        "-" => "Minus",
-        "[" => "BracketLeft",
-        "]" => "BracketRight",
-        "'" => "Quote",
-        ";" => "Semicolon",
-        "," => "Comma",
-        "." => "Period",
-        "`" => "Backquote",
-        other => {
-            // Single letter or number - prepend "Key" for letters
-            if other.len() == 1 {
-                let c = other.chars().next().unwrap();
-                if c.is_ascii_alphabetic() {
-                    // Will be handled below with format
-                    other
-                } else {
-                    other
-                }
-            } else {
-                other
-            }
-        }
-    };
-
-    // Build the hotkey string in livesplit format
-    let mut parts = modifiers.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-
-    // Add key name with proper prefix
-    let final_key = if key_name.len() == 1 && key_name.chars().next().unwrap().is_ascii_alphabetic()
-    {
-        format!("Key{}", key_name.to_uppercase())
-    } else if key_name.len() == 1 && key_name.chars().next().unwrap().is_ascii_digit() {
-        format!("Digit{}", key_name)
-    } else {
-        key_name.to_string()
-    };
-    parts.push(final_key);
-
-    let hotkey_str = parts.join(" + ");
-    Hotkey::from_str(&hotkey_str).ok()
+    let key_code = key_from_text(rest)?;
+    Some(Hotkey { key_code, modifiers })
 }
 
 impl WindowRuleJson {
@@ -322,56 +366,6 @@ impl HotkeyBindingJson {
             }
         }
     }
-}
-
-/// Format a hotkey using macOS-style symbols.
-fn format_hotkey(hotkey: &Hotkey) -> String {
-    let s = hotkey.to_string();
-    // Convert "Alt + Ctrl + Shift + KeyH" to "⌥⌃⇧H"
-    let mut result = String::new();
-
-    // Check for modifiers in order: Ctrl, Alt/Option, Shift, Cmd
-    if s.contains("Ctrl") {
-        result.push('⌃');
-    }
-    if s.contains("Alt") {
-        result.push('⌥');
-    }
-    if s.contains("Shift") {
-        result.push('⇧');
-    }
-    if s.contains("Cmd") || s.contains("Super") {
-        result.push('⌘');
-    }
-
-    // Extract the key name (last part after " + ")
-    if let Some(key_part) = s.rsplit(" + ").next() {
-        let key_name = key_part
-            .strip_prefix("Key")
-            .or_else(|| key_part.strip_prefix("Numpad"))
-            .or_else(|| key_part.strip_prefix("Digit"))
-            .unwrap_or(key_part);
-
-        // Map special keys
-        let formatted = match key_name {
-            "ArrowLeft" => "←",
-            "ArrowRight" => "→",
-            "ArrowUp" => "↑",
-            "ArrowDown" => "↓",
-            "Backslash" => "\\",
-            "Equal" => "=",
-            "Slash" => "/",
-            "Space" => "Space",
-            "Escape" => "Esc",
-            "Backspace" => "⌫",
-            "Enter" | "Return" => "↩",
-            "Tab" => "⇥",
-            _ => key_name,
-        };
-        result.push_str(formatted);
-    }
-
-    result
 }
 
 /// Get the description, category, and sort order for a WmCommand.
@@ -628,6 +622,8 @@ fn group_mode_name(orientation: &Orientation) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     #[test]
@@ -718,8 +714,308 @@ mod tests {
         let hk = parse_hotkey_string("⌥⇧0").unwrap();
         assert_eq!(hk.to_string(), "Alt + Shift + Digit0");
 
-        // No modifier should fail
-        assert!(parse_hotkey_string("H").is_none());
+        // The window shows the Command modifier as ⌘
+        let hk = parse_hotkey_string("⌥⌘H").unwrap();
+        assert_eq!(hk.to_string(), "Alt + Meta + KeyH");
+
+        // Numpad keys and function keys keep their names
+        let hk = parse_hotkey_string("⌥Numpad1").unwrap();
+        assert_eq!(hk.to_string(), "Alt + Numpad1");
+        let hk = parse_hotkey_string("⌥F5").unwrap();
+        assert_eq!(hk.to_string(), "Alt + F5");
+
+        // Enter is shown as ↩
+        let hk = parse_hotkey_string("⌥↩").unwrap();
+        assert_eq!(hk.to_string(), "Alt + Enter");
+
+        // A key with no modifier is a hotkey too
+        let hk = parse_hotkey_string("H").unwrap();
+        assert_eq!(hk.to_string(), "KeyH");
+    }
+
+    /// Keys. A key without a modifier keeps its key through the window's
+    /// JSON, config in and config out.
+    #[test]
+    fn a_hotkey_without_a_modifier_survives_the_preferences_round_trip() {
+        let mut config = Config::default();
+        config.keys = vec![(
+            Hotkey::from_str("KeyH").unwrap(),
+            WmCommand::Wm(WmCmd::ToggleGlobalEnabled),
+        )];
+
+        let json = serde_json::to_string(&PreferencesJson::from_config(&config)).unwrap();
+        let prefs: PreferencesJson = serde_json::from_str(&json).unwrap();
+
+        let row = prefs
+            .hotkeys
+            .iter()
+            .find(|row| row.command.contains("toggle_global_enabled"))
+            .expect("the binding is shown");
+        assert_eq!("H", row.key);
+        let applied = prefs.apply_to_config(&config);
+        assert_eq!(1, applied.keys.len());
+        assert_eq!(Hotkey::from_str("KeyH").unwrap(), applied.keys[0].0);
+        assert_eq!(
+            command_json(&WmCommand::Wm(WmCmd::ToggleGlobalEnabled)),
+            command_json(&applied.keys[0].1)
+        );
+    }
+
+    /// Keys. The config loader accepts these key names ([`KeyCode::name`]
+    /// writes them), and every combination of the four modifiers.
+    const KEY_NAMES: &[&str] = &[
+        "Backquote",
+        "Backslash",
+        "BracketLeft",
+        "BracketRight",
+        "Comma",
+        "Digit0",
+        "Digit1",
+        "Digit2",
+        "Digit3",
+        "Digit4",
+        "Digit5",
+        "Digit6",
+        "Digit7",
+        "Digit8",
+        "Digit9",
+        "Equal",
+        "IntlBackslash",
+        "IntlRo",
+        "IntlYen",
+        "KeyA",
+        "KeyB",
+        "KeyC",
+        "KeyD",
+        "KeyE",
+        "KeyF",
+        "KeyG",
+        "KeyH",
+        "KeyI",
+        "KeyJ",
+        "KeyK",
+        "KeyL",
+        "KeyM",
+        "KeyN",
+        "KeyO",
+        "KeyP",
+        "KeyQ",
+        "KeyR",
+        "KeyS",
+        "KeyT",
+        "KeyU",
+        "KeyV",
+        "KeyW",
+        "KeyX",
+        "KeyY",
+        "KeyZ",
+        "Minus",
+        "Period",
+        "Quote",
+        "Semicolon",
+        "Slash",
+        "AltLeft",
+        "AltRight",
+        "Backspace",
+        "CapsLock",
+        "ContextMenu",
+        "ControlLeft",
+        "ControlRight",
+        "Enter",
+        "MetaLeft",
+        "MetaRight",
+        "ShiftLeft",
+        "ShiftRight",
+        "Space",
+        "Tab",
+        "Convert",
+        "KanaMode",
+        "Lang1",
+        "Lang2",
+        "Lang3",
+        "Lang4",
+        "Lang5",
+        "NonConvert",
+        "Delete",
+        "End",
+        "Help",
+        "Home",
+        "Insert",
+        "PageDown",
+        "PageUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "ArrowUp",
+        "NumLock",
+        "Numpad0",
+        "Numpad1",
+        "Numpad2",
+        "Numpad3",
+        "Numpad4",
+        "Numpad5",
+        "Numpad6",
+        "Numpad7",
+        "Numpad8",
+        "Numpad9",
+        "NumpadAdd",
+        "NumpadBackspace",
+        "NumpadClear",
+        "NumpadClearEntry",
+        "NumpadComma",
+        "NumpadDecimal",
+        "NumpadDivide",
+        "NumpadEnter",
+        "NumpadEqual",
+        "NumpadHash",
+        "NumpadMemoryAdd",
+        "NumpadMemoryClear",
+        "NumpadMemoryRecall",
+        "NumpadMemoryStore",
+        "NumpadMemorySubtract",
+        "NumpadMultiply",
+        "NumpadParenLeft",
+        "NumpadParenRight",
+        "NumpadStar",
+        "NumpadSubtract",
+        "Escape",
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F11",
+        "F12",
+        "F13",
+        "F14",
+        "F15",
+        "F16",
+        "F17",
+        "F18",
+        "F19",
+        "F20",
+        "F21",
+        "F22",
+        "F23",
+        "F24",
+        "Fn",
+        "FnLock",
+        "PrintScreen",
+        "ScrollLock",
+        "Pause",
+        "BrowserBack",
+        "BrowserFavorites",
+        "BrowserForward",
+        "BrowserHome",
+        "BrowserRefresh",
+        "BrowserSearch",
+        "BrowserStop",
+        "Eject",
+        "LaunchApp1",
+        "LaunchApp2",
+        "LaunchMail",
+        "MediaPlayPause",
+        "MediaSelect",
+        "MediaStop",
+        "MediaTrackNext",
+        "MediaTrackPrevious",
+        "Power",
+        "Sleep",
+        "AudioVolumeDown",
+        "AudioVolumeMute",
+        "AudioVolumeUp",
+        "WakeUp",
+        "Again",
+        "Copy",
+        "Cut",
+        "Find",
+        "Open",
+        "Paste",
+        "Props",
+        "Select",
+        "Undo",
+        "Gamepad0",
+        "Gamepad1",
+        "Gamepad2",
+        "Gamepad3",
+        "Gamepad4",
+        "Gamepad5",
+        "Gamepad6",
+        "Gamepad7",
+        "Gamepad8",
+        "Gamepad9",
+        "Gamepad10",
+        "Gamepad11",
+        "Gamepad12",
+        "Gamepad13",
+        "Gamepad14",
+        "Gamepad15",
+        "Gamepad16",
+        "Gamepad17",
+        "Gamepad18",
+        "Gamepad19",
+        "BrightnessDown",
+        "BrightnessUp",
+        "DisplayToggleIntExt",
+        "KeyboardLayoutSelect",
+        "LaunchAssistant",
+        "LaunchControlPanel",
+        "LaunchScreenSaver",
+        "MailForward",
+        "MailReply",
+        "MailSend",
+        "MediaFastForward",
+        "MediaPlay",
+        "MediaPause",
+        "MediaRecord",
+        "MediaRewind",
+        "MicrophoneMuteToggle",
+        "PrivacyScreenToggle",
+        "SelectTask",
+        "ShowAllWindows",
+        "ZoomToggle",
+    ];
+
+    /// Keys. Config -> window -> config is identity for every key the loader
+    /// accepts, with every modifier combination and with none.
+    #[test]
+    fn every_hotkey_string_survives_config_window_config() {
+        for bits in 0..16 {
+            let mut modifiers = Modifiers::empty();
+            if bits & 1 != 0 {
+                modifiers |= Modifiers::SHIFT;
+            }
+            if bits & 2 != 0 {
+                modifiers |= Modifiers::CONTROL;
+            }
+            if bits & 4 != 0 {
+                modifiers |= Modifiers::ALT;
+            }
+            if bits & 8 != 0 {
+                modifiers |= Modifiers::META;
+            }
+            for name in KEY_NAMES {
+                let text = if modifiers.is_empty() {
+                    (*name).to_string()
+                } else {
+                    format!("{modifiers} + {name}")
+                };
+                let hotkey = Hotkey::from_str(&text).unwrap_or_else(|()| {
+                    panic!("the loader rejects its own key name: {text}")
+                });
+                let shown = format_hotkey(&hotkey);
+                assert_eq!(
+                    Some(hotkey),
+                    parse_hotkey_string(&shown),
+                    "{text} is shown as {shown}"
+                );
+            }
+        }
     }
 
     /// Key bindings. Context bindings survive the round trip through the
