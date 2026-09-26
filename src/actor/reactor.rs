@@ -34,7 +34,8 @@ use tracing::{Span, debug, error, info, instrument, trace, warn};
 use super::mouse;
 use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, pid_t};
 use crate::actor::layout::{
-    self, DragUpdate, DropAction, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo,
+    self, ActiveContext, DragUpdate, DropAction, LayoutCommand, LayoutEvent, LayoutManager,
+    LayoutWindowInfo,
 };
 use crate::actor::raise::{self, RaiseManager, RaiseRequest};
 use crate::actor::space_manager::SpaceManager;
@@ -893,7 +894,8 @@ impl Reactor {
                     .collect::<Vec<_>>()
                     .into_iter()
                     .map(|(space, size)| {
-                        self.layout.handle_event(LayoutEvent::SpaceExposed(space, size))
+                        let context = ActiveContext::EVERYTHING;
+                        self.layout.handle_event(LayoutEvent::SpaceExposed(space, size, context))
                     })
                     .reduce(layout::EventResponse::coalesce);
                 if let Some(response) = response {
@@ -940,7 +942,8 @@ impl Reactor {
                     .iter()
                     .filter_map(|screen| screen.space.map(|space| (space, screen.frame.size)))
                     .map(|(space, size)| {
-                        self.layout.handle_event(LayoutEvent::SpaceExposed(space, size))
+                        let context = ActiveContext::EVERYTHING;
+                        self.layout.handle_event(LayoutEvent::SpaceExposed(space, size, context))
                     })
                     .reduce(layout::EventResponse::coalesce);
                 if let Some(response) = response {
@@ -2374,7 +2377,11 @@ pub mod tests {
         // A screen change that doesn't disturb the stacking shouldn't restack.
         let desired = reactor
             .layout
-            .handle_event(LayoutEvent::SpaceExposed(space, CGSize::new(1000., 900.)))
+            .handle_event(LayoutEvent::SpaceExposed(
+                space,
+                CGSize::new(1000., 900.),
+                ActiveContext::EVERYTHING,
+            ))
             .raise_windows;
         let on_screen = desired
             .iter()
@@ -2457,7 +2464,11 @@ pub mod tests {
 
         let desired = reactor
             .layout
-            .handle_event(LayoutEvent::SpaceExposed(space, CGSize::new(1000., 1000.)))
+            .handle_event(LayoutEvent::SpaceExposed(
+                space,
+                CGSize::new(1000., 1000.),
+                ActiveContext::EVERYTHING,
+            ))
             .raise_windows;
         let on_screen = desired
             .iter()
@@ -2496,7 +2507,11 @@ pub mod tests {
 
         let desired = reactor
             .layout
-            .handle_event(LayoutEvent::SpaceExposed(space, CGSize::new(1000., 1000.)))
+            .handle_event(LayoutEvent::SpaceExposed(
+                space,
+                CGSize::new(1000., 1000.),
+                ActiveContext::EVERYTHING,
+            ))
             .raise_windows;
         let on_screen = desired
             .iter()
@@ -2536,7 +2551,11 @@ pub mod tests {
 
         let desired = reactor
             .layout
-            .handle_event(LayoutEvent::SpaceExposed(space, CGSize::new(1000., 1000.)))
+            .handle_event(LayoutEvent::SpaceExposed(
+                space,
+                CGSize::new(1000., 1000.),
+                ActiveContext::EVERYTHING,
+            ))
             .raise_windows;
         let mut on_screen = vec![WindowServerInfo {
             id: WindowServerId::new(90),
@@ -2680,7 +2699,11 @@ pub mod tests {
 
         let desired = reactor
             .layout
-            .handle_event(LayoutEvent::SpaceExposed(space, CGSize::new(1000., 1000.)))
+            .handle_event(LayoutEvent::SpaceExposed(
+                space,
+                CGSize::new(1000., 1000.),
+                ActiveContext::EVERYTHING,
+            ))
             .raise_windows;
         let mut on_screen = vec![
             WindowServerInfo {
