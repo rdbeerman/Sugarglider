@@ -21,6 +21,10 @@ import Foundation
 /// `{"pid": 812, "idx": 9123}`. The switcher never reads its fields. It
 /// sends the value back unchanged.
 ///
+/// Rust serializes every key whose value can't be null, empty arrays
+/// included. A show payload without one doesn't decode, and the panel
+/// doesn't open. Keys the contract doesn't name are ignored.
+///
 /// Functions
 /// ---------
 ///
@@ -37,19 +41,25 @@ import Foundation
 ///
 /// Swift to Rust, looked up with `dlsym(RTLD_DEFAULT, …)` when the panel
 /// needs them, so a binary without them still loads, and the panel shows an
-/// inline error instead:
+/// inline error instead. `sugarglider_rank_contexts` replaces the spec's
+/// `sugarglider_get_contexts()`. The panel calls both on the main thread,
+/// so neither may wait on the reactor or on `WmController`:
 ///
 /// - `sugarglider_rank_contexts(query: *const c_char) -> *mut c_char`
 ///   returns `model::contexts::rank(query, …)` as the rank result below,
-///   computed from the latest published state. NULL means contexts are
+///   computed from the published snapshot. NULL means contexts are
 ///   unavailable, for example because the feature is off.
 /// - `sugarglider_run_context_command(json: *const c_char) -> *mut c_char`
 ///   takes one command below. NULL means Rust accepted the command and sent
-///   it to the reactor. Otherwise it returns an error message for the user:
-///   invalid JSON, the feature is off, a context id that no longer exists,
-///   a name that is empty, reserved, or taken (R4), or a number outside 1 to
-///   9. Rust checks these against the published snapshot before it sends
-///   the command. The reactor logs failures that come later.
+///   it to the reactor without waiting. Otherwise it returns an error
+///   message for the user: invalid JSON, the feature is off, a context id
+///   that no longer exists, a name that is empty, reserved, or taken (R4), a
+///   number outside 1 to 9, or a record in `remove_records` that no longer
+///   matches. Rust checks these against the published snapshot before it
+///   sends the command. The reactor logs failures that come later.
+///
+/// Rust acts on the window that a command carries, never on the window
+/// focused when the command arrives.
 ///
 /// Swift frees every returned string with the existing
 /// `sugarglider_free_string`. Each input string is NUL-terminated UTF-8 and
@@ -107,16 +117,18 @@ import Foundation
 ///   Sugarglider's own. Then the panel disables ⌘↩, ⇧⌘↩, and ⌘P and says
 ///   why. Otherwise `windows` holds it.
 /// - `contexts`: every named context. `number` is 1 to 9 or null.
-///   `hotkey` is the binding that runs `switch_context` with that number,
-///   formatted like the Preferences hotkey list, or null when none is bound.
-///   `active` is true for the active context. `apps` holds the distinct app
-///   names of the context's open member windows, in member order; the panel
-///   shows the first three. `windows` counts those open windows. `members`
-///   lists every member record in the model's order: `record` is the
-///   record's index in that list, `app` is its app name (the bundle id when
-///   the name is unknown), and `window` is its open window, or null when the
-///   window is gone (the record is empty or pending, R23).
-/// - `unsorted`: the number of unsorted windows (R3, R29) and whether
+///   `hotkey` is a label for a `switch_context` binding that resolves to
+///   the context, by number, name, or id, or null when none does. The panel
+///   shows it as it is. `active` is true for the active context. `apps`
+///   holds the distinct app names of the context's open member windows, in
+///   member order; the panel shows the first three. `windows` counts those
+///   open windows. `members` lists every member record in the model's
+///   order: `record` is the record's index in that list, `app` is its app
+///   name (the bundle id when the name is unknown, or "Unknown app"), and
+///   `window` is its open window, or null when the window is gone (the
+///   record is empty or pending, R23).
+/// - `unsorted`: the number of tracked windows on the visible Spaces that
+///   are in no named context and aren't pinned (R3, R29), and whether
 ///   Unsorted is active.
 /// - `everything`: whether Everything is active, and the binding that runs
 ///   `show_everything`, or null.
@@ -226,11 +238,12 @@ import Foundation
 /// Changes a context's members. Rust first removes each record in
 /// `remove_records` (`Contexts::remove_record`, R23), from the highest
 /// `record` down. It removes a record only when the record at that index
-/// still has no open window and still has this app and title; otherwise it
-/// skips the item and logs it. Then it removes the windows in `remove`, which
-/// takes effect at once, as `remove_window_from_context` does (R37). Then it
-/// adds the windows in `add`, which takes effect at the next switch, as
-/// `add_window_to_context` does (R37).
+/// still has no open window and still has this app and title. When one
+/// doesn't match, `run` sends nothing and returns an error. Then Rust
+/// removes the windows in `remove`, which takes effect at once, as
+/// `remove_window_from_context` does (R37). Then it adds the windows in
+/// `add`, which takes effect at the next switch, as `add_window_to_context`
+/// does (R37).
 ///
 /// ```json
 /// { "rename": { "context": { "id": 4 }, "name": "Client work 2026" } }
