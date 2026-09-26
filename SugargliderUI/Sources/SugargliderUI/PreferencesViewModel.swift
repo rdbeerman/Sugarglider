@@ -29,11 +29,25 @@ public struct AppRule: Identifiable {
     public var appName: String
     public var bundleId: String
     public var behavior: AppBehavior
+    /// Window-rule conditions the App Rules pane doesn't show. Stored and
+    /// saved unchanged.
+    public var titleRegex: String?
+    public var titleSubstring: String?
+    public var axRole: String?
+    public var axSubrole: String?
 
-    public init(appName: String, bundleId: String, behavior: AppBehavior) {
+    public init(
+        appName: String, bundleId: String, behavior: AppBehavior,
+        titleRegex: String? = nil, titleSubstring: String? = nil,
+        axRole: String? = nil, axSubrole: String? = nil
+    ) {
         self.appName = appName
         self.bundleId = bundleId
         self.behavior = behavior
+        self.titleRegex = titleRegex
+        self.titleSubstring = titleSubstring
+        self.axRole = axRole
+        self.axSubrole = axSubrole
     }
 }
 
@@ -192,7 +206,11 @@ public class PreferencesViewModel: ObservableObject {
             return AppRule(
                 appName: rule.appName ?? "",
                 bundleId: rule.bundleId ?? "",
-                behavior: behavior
+                behavior: behavior,
+                titleRegex: rule.titleRegex,
+                titleSubstring: rule.titleSubstring,
+                axRole: rule.axRole,
+                axSubrole: rule.axSubrole
             )
         }
     }
@@ -259,7 +277,11 @@ public class PreferencesViewModel: ObservableObject {
                 WindowRuleJson(
                     appName: rule.appName.isEmpty ? nil : rule.appName,
                     bundleId: rule.bundleId.isEmpty ? nil : rule.bundleId,
-                    behavior: rule.behavior.rawValue.lowercased()
+                    behavior: rule.behavior.rawValue.lowercased(),
+                    titleRegex: rule.titleRegex,
+                    titleSubstring: rule.titleSubstring,
+                    axRole: rule.axRole,
+                    axSubrole: rule.axSubrole
                 )
             },
             hotkeys: hotkeys

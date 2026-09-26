@@ -111,17 +111,35 @@ public struct WindowRuleJson: Codable, Identifiable {
     public var appName: String?
     public var bundleId: String?
     public var behavior: String
+    /// Conditions that the App Rules pane doesn't show. Stored and sent back
+    /// unchanged, so a save keeps them.
+    public var titleRegex: String?
+    public var titleSubstring: String?
+    public var axRole: String?
+    public var axSubrole: String?
 
-    public init(appName: String? = nil, bundleId: String? = nil, behavior: String = "tile") {
+    public init(
+        appName: String? = nil, bundleId: String? = nil, behavior: String = "tile",
+        titleRegex: String? = nil, titleSubstring: String? = nil,
+        axRole: String? = nil, axSubrole: String? = nil
+    ) {
         self.appName = appName
         self.bundleId = bundleId
         self.behavior = behavior
+        self.titleRegex = titleRegex
+        self.titleSubstring = titleSubstring
+        self.axRole = axRole
+        self.axSubrole = axSubrole
     }
 
     enum CodingKeys: String, CodingKey {
         case appName
         case bundleId
         case behavior
+        case titleRegex
+        case titleSubstring
+        case axRole
+        case axSubrole
     }
 }
 

@@ -25,7 +25,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::actor::wm_controller::WmCommand;
 use crate::model::LayoutKind;
-use crate::ui::preferences_json::command_json;
+use crate::ui::preferences_json::{WindowRuleJson, command_json};
 
 pub fn data_dir() -> PathBuf {
     dirs::home_dir().unwrap().join(".glide")
@@ -643,35 +643,54 @@ fn write_preferences_to_path(
     }
     doc["settings"]["experimental"]["contexts"]["enable"] = value(prefs.contexts_enable);
 
-    // Update window_rules as an array of tables
-    let mut rules_array = toml_edit::ArrayOfTables::new();
-    for rule in &prefs.window_rules {
-        let mut table = toml_edit::Table::new();
+    // Update window_rules only when the window changed them. The window
+    // carries every condition through, but the comments and the rest of a
+    // rule's table are not in the JSON, so an unchanged list leaves the
+    // document's rules as they are.
+    let window_rules: Vec<WindowRule> =
+        prefs.window_rules.iter().filter_map(WindowRuleJson::to_rule).collect();
+    if window_rules != current_config.window_rules {
+        let mut rules_array = toml_edit::ArrayOfTables::new();
+        for rule in &window_rules {
+            let mut table = toml_edit::Table::new();
 
-        // Build the 'if' conditions table
-        let mut conditions = toml_edit::Table::new();
-        if let Some(ref app_id) = rule.bundle_id {
-            if !app_id.is_empty() {
-                conditions["app_id"] = value(app_id);
+            // Build the 'if' conditions table
+            let mut conditions = toml_edit::Table::new();
+            if let Some(ref app_id) = rule.conditions.app_id {
+                if !app_id.is_empty() {
+                    conditions["app_id"] = value(app_id);
+                }
             }
-        }
-        if let Some(ref app_name) = rule.app_name {
-            if !app_name.is_empty() {
-                conditions["app_name"] = value(app_name);
+            if let Some(ref app_name) = rule.conditions.app_name {
+                if !app_name.is_empty() {
+                    conditions["app_name"] = value(app_name);
+                }
             }
-        }
-        if !conditions.is_empty() {
-            table["if"] = toml_edit::Item::Table(conditions);
+            if let Some(ref title_regex) = rule.conditions.title_regex {
+                conditions["title_regex"] = value(title_regex.as_str());
+            }
+            if let Some(ref title_substring) = rule.conditions.title_substring {
+                conditions["title_substring"] = value(title_substring);
+            }
+            if let Some(ref ax_role) = rule.conditions.ax_role {
+                conditions["ax_role"] = value(ax_role);
+            }
+            if let Some(ref ax_subrole) = rule.conditions.ax_subrole {
+                conditions["ax_subrole"] = value(ax_subrole);
+            }
+            if !conditions.is_empty() {
+                table["if"] = toml_edit::Item::Table(conditions);
+            }
+
+            table["float"] = value(rule.float);
+            rules_array.push(table);
         }
 
-        table["float"] = value(rule.behavior == "float");
-        rules_array.push(table);
-    }
-
-    if !rules_array.is_empty() {
-        doc["window_rules"] = toml_edit::Item::ArrayOfTables(rules_array);
-    } else if doc.contains_key("window_rules") {
-        doc.remove("window_rules");
+        if !rules_array.is_empty() {
+            doc["window_rules"] = toml_edit::Item::ArrayOfTables(rules_array);
+        } else if doc.contains_key("window_rules") {
+            doc.remove("window_rules");
+        }
     }
 
     // Update [keys] section, only when a binding changed. No bindings at all
@@ -1550,6 +1569,76 @@ mod tests {
             bound_to("Alt + KeyT"),
             WmCommand::Wm(WmCmd::Exec(ExecCmd::String(cmd))) if cmd == "open -a Terminal"
         ));
+    }
+
+    /// A save that changes no window rule leaves the file's
+    /// `[[window_rules]]` tables alone, comments included, and a rule's
+    /// conditions stay in the running config too.
+    #[test]
+    fn preferences_keep_window_rule_conditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "# Float the picture-in-picture window.\n\
+             [[window_rules]]\n\
+             if = { title_regex = \"Picture-in-Picture\" }\n\
+             float = true\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(1, config.window_rules.len());
+
+        let mut prefs = preferences_for(&config);
+        prefs.animate = !prefs.animate;
+        let running = prefs.apply_to_config(&config);
+        assert_eq!(config.window_rules, running.window_rules);
+
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("# Float the picture-in-picture window."),
+            "{written}"
+        );
+        assert!(
+            written.contains("title_regex = \"Picture-in-Picture\""),
+            "{written}"
+        );
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(config.window_rules, saved.window_rules);
+    }
+
+    /// A window rule that the App Rules pane removes goes away, and the
+    /// rules that stay keep their conditions in the file and the running
+    /// config.
+    #[test]
+    fn preferences_write_window_rule_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "[[window_rules]]\n\
+             if = { title_regex = \"Picture-in-Picture\" }\n\
+             float = true\n\n\
+             [[window_rules]]\n\
+             if = { app_id = \"com.example.X\" }\n\
+             float = false\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(2, config.window_rules.len());
+
+        let mut prefs = preferences_for(&config);
+        prefs.window_rules.remove(0);
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(vec![config.window_rules[1].clone()], saved.window_rules);
+        assert_eq!(
+            prefs.apply_to_config(&config).window_rules,
+            saved.window_rules
+        );
     }
 
     /// A config file with an error stays as it is, and the error says what

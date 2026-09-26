@@ -14,7 +14,7 @@ use crate::actor::reactor::{
     Command as ReactorCommand, ContextCommand, ContextRef, ReactorCommand as ReactorCmd,
 };
 use crate::actor::wm_controller::{WmCmd, WmCommand};
-use crate::config::{Config, WindowRule, WindowRuleConditions};
+use crate::config::{Config, ConfigRegex, WindowRule, WindowRuleConditions};
 use crate::log::MetricsCommand;
 use crate::model::{Direction, LayoutKind, Orientation};
 
@@ -77,6 +77,12 @@ pub struct WindowRuleJson {
     pub app_name: Option<String>,
     pub bundle_id: Option<String>,
     pub behavior: String, // "tile" or "float"
+    /// The conditions the App Rules pane doesn't show. The Swift UI carries
+    /// them through unchanged, so a save keeps them.
+    pub title_regex: Option<String>,
+    pub title_substring: Option<String>,
+    pub ax_role: Option<String>,
+    pub ax_subrole: Option<String>,
 }
 
 impl PreferencesJson {
@@ -151,7 +157,7 @@ impl PreferencesJson {
         settings.experimental.contexts.enable = self.contexts_enable;
 
         let window_rules: Vec<WindowRule> =
-            self.window_rules.iter().map(WindowRuleJson::to_rule).collect();
+            self.window_rules.iter().filter_map(WindowRuleJson::to_rule).collect();
 
         let keys = self.bindings();
 
@@ -312,22 +318,43 @@ impl WindowRuleJson {
             app_name: rule.conditions.app_name.clone(),
             bundle_id: rule.conditions.app_id.clone(),
             behavior: if rule.float { "float" } else { "tile" }.to_string(),
+            title_regex: rule
+                .conditions
+                .title_regex
+                .as_ref()
+                .map(|regex| regex.as_str().to_string()),
+            title_substring: rule.conditions.title_substring.clone(),
+            ax_role: rule.conditions.ax_role.clone(),
+            ax_subrole: rule.conditions.ax_subrole.clone(),
         }
     }
 
-    /// Convert to a WindowRule.
-    pub fn to_rule(&self) -> WindowRule {
-        WindowRule {
+    /// Convert to a WindowRule. `None` when a title regex doesn't compile:
+    /// the rule is dropped rather than widened to every window.
+    pub fn to_rule(&self) -> Option<WindowRule> {
+        let title_regex = match &self.title_regex {
+            Some(pattern) => match pattern.parse::<ConfigRegex>() {
+                Ok(regex) => Some(regex),
+                Err(e) => {
+                    tracing::warn!(
+                        "Dropping window rule with an invalid title regex {pattern}: {e}"
+                    );
+                    return None;
+                }
+            },
+            None => None,
+        };
+        Some(WindowRule {
             conditions: WindowRuleConditions {
                 app_id: self.bundle_id.clone(),
                 app_name: self.app_name.clone(),
-                title_regex: None,
-                title_substring: None,
-                ax_role: None,
-                ax_subrole: None,
+                title_regex,
+                title_substring: self.title_substring.clone(),
+                ax_role: self.ax_role.clone(),
+                ax_subrole: self.ax_subrole.clone(),
             },
             float: self.behavior == "float",
-        }
+        })
     }
 }
 
@@ -649,6 +676,10 @@ mod tests {
                 app_name: Some("Finder".to_string()),
                 bundle_id: Some("com.apple.finder".to_string()),
                 behavior: "float".to_string(),
+                title_regex: None,
+                title_substring: None,
+                ax_role: None,
+                ax_subrole: None,
             }],
             hotkeys: vec![HotkeyBindingJson {
                 key: "⌥H".to_string(),
@@ -680,9 +711,30 @@ mod tests {
         assert_eq!(json.bundle_id, Some("com.apple.finder".to_string()));
         assert_eq!(json.behavior, "float");
 
-        let converted = json.to_rule();
+        let converted = json.to_rule().unwrap();
         assert_eq!(converted.conditions.app_id, rule.conditions.app_id);
         assert_eq!(converted.float, rule.float);
+    }
+
+    /// Window rules. Every condition survives the window's JSON, including
+    /// the ones the App Rules pane doesn't show.
+    #[test]
+    fn window_rule_conditions_survive_the_preferences_json() {
+        let rule = WindowRule {
+            conditions: WindowRuleConditions {
+                app_id: Some("com.apple.finder".to_string()),
+                app_name: Some("Finder".to_string()),
+                title_regex: Some("Picture-in-Picture".parse().unwrap()),
+                title_substring: Some("Preferences".to_string()),
+                ax_role: Some("AXWindow".to_string()),
+                ax_subrole: Some("AXDialog".to_string()),
+            },
+            float: true,
+        };
+
+        let json = serde_json::to_string(&WindowRuleJson::from_rule(&rule)).unwrap();
+        let decoded: WindowRuleJson = serde_json::from_str(&json).unwrap();
+        assert_eq!(Some(rule), decoded.to_rule());
     }
 
     #[test]

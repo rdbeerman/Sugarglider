@@ -134,6 +134,27 @@ final class PreferencesViewModelTests: XCTestCase {
     XCTAssertNotNil(model.lastError)
   }
 
+  /// A window rule condition that the App Rules pane doesn't show survives
+  /// a save, in the running config and in the file.
+  func testKeepsWindowRuleConditionsThePaneDoesNotShow() throws {
+    let rule = WindowRuleJson(
+      behavior: "float", titleRegex: "Picture-in-Picture", axSubrole: "AXDialog")
+    let backend = FakePreferencesBackend(PreferencesConfig(windowRules: [rule]))
+    let model = PreferencesViewModel(backend: backend)
+    XCTAssertEqual(model.appRules.first?.titleRegex, "Picture-in-Picture")
+    XCTAssertEqual(model.appRules.first?.axSubrole, "AXDialog")
+
+    model.enableAnimations = false
+    model.saveToConfig()
+
+    let updated = try XCTUnwrap(backend.updated.last)
+    XCTAssertEqual(updated.windowRules.first?.titleRegex, "Picture-in-Picture")
+    XCTAssertEqual(updated.windowRules.first?.axSubrole, "AXDialog")
+    let saved = try XCTUnwrap(backend.saved.last)
+    XCTAssertEqual(saved.windowRules.first?.titleRegex, "Picture-in-Picture")
+    XCTAssertEqual(saved.windowRules.first?.behavior, "float")
+  }
+
   /// The Hotkeys pane shows the Contexts category, and any category it
   /// doesn't know after the others.
   func testGroupsEveryCategoryOfBindings() {
