@@ -37,6 +37,10 @@ pub fn parked_journal_file() -> PathBuf {
     data_dir().join("parked.json")
 }
 
+pub fn contexts_file() -> PathBuf {
+    data_dir().join("contexts.json")
+}
+
 pub fn config_path() -> PathBuf {
     let try_paths = default_config_paths();
     for path in &try_paths {
@@ -800,6 +804,11 @@ mod tests {
             parked_journal_file()
         );
         assert_eq!(data_dir().join("parked.json"), parked_journal_file());
+    }
+
+    #[test]
+    fn contexts_live_next_to_the_layout() {
+        assert_eq!(data_dir().join("contexts.json"), contexts_file());
     }
 
     #[test]

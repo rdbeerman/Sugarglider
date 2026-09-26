@@ -256,7 +256,9 @@ fn read(path: &Path) -> anyhow::Result<Vec<JournalEntry>> {
     Ok(file.entries)
 }
 
-fn unreadable_path(path: &Path, now: SystemTime) -> PathBuf {
+/// Where a file at `path` that can't be read is moved:
+/// `<name>.unreadable-<unix time>.json` next to it.
+pub(crate) fn unreadable_path(path: &Path, now: SystemTime) -> PathBuf {
     let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("parked");
     let secs = now.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
     path.with_file_name(format!("{stem}.unreadable-{secs}.json"))
