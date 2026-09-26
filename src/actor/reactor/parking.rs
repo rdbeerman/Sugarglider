@@ -40,28 +40,42 @@ fn same_app(journal: &Option<String>, running: &Option<String>) -> bool {
     matches!((journal, running), (Some(journal), Some(running)) if journal == running)
 }
 
+/// A window whose journal entry is written, with the frame it has before it
+/// is parked and the corner that parks it.
+pub(super) struct Parking {
+    wid: WindowId,
+    frame: CGRect,
+    corner: CGRect,
+}
+
 impl Reactor {
     /// Parks each window in a corner of the screen it is on, and returns the
-    /// windows it parked.
-    ///
-    /// The journal entries of all the windows are written first. If that
-    /// write fails, no window is parked. Windows that are already parked, that
-    /// have no window server id, or that are on no screen are left where they
-    /// are, and are not returned. A window listed more than once is parked
-    /// once.
-    ///
-    /// A window that shows 1 square point or less of its screen, as a parked
-    /// window does, keeps the frame in its journal entry. Without an entry it
-    /// is left where it is, because no frame is known to put it back to.
+    /// windows it parked. See [`Reactor::journal_parking`] for the windows
+    /// that are left where they are.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "only tests park windows until context switching")
     )]
     pub(super) fn park_windows(&mut self, wids: &[WindowId]) -> io::Result<Vec<WindowId>> {
+        let parking = self.journal_parking(wids)?;
+        Ok(self.move_to_corners(parking))
+    }
+
+    /// Writes the journal entries of the windows that can be parked, and
+    /// returns where each goes. No window moves yet.
+    ///
+    /// If the write fails, nothing changes. Windows that are already parked,
+    /// that have no window server id, or that are on no screen are left out.
+    /// A window listed more than once is taken once.
+    ///
+    /// A window that shows 1 square point or less of its screen, as a parked
+    /// window does, keeps the frame in its journal entry. Without an entry it
+    /// is left out, because no frame is known to put it back to.
+    pub(super) fn journal_parking(&mut self, wids: &[WindowId]) -> io::Result<Vec<Parking>> {
         let mut entries = vec![];
-        let mut parking: Vec<(WindowId, CGRect, CGRect)> = vec![];
+        let mut parking: Vec<Parking> = vec![];
         for &wid in wids {
-            if self.parked.contains_key(&wid) || parking.iter().any(|&(other, ..)| other == wid) {
+            if self.parked.contains_key(&wid) || parking.iter().any(|p| p.wid == wid) {
                 continue;
             }
             let Some(window) = self.windows.get(&wid) else { continue };
@@ -71,7 +85,7 @@ impl Reactor {
                 continue;
             };
             let current = window.frame_monotonic;
-            let Some(parked_frame) = self.parked_frame(current) else {
+            let Some(corner) = self.parked_frame(current) else {
                 debug!(?wid, ?current, "Not parking a window that is on no screen");
                 continue;
             };
@@ -96,19 +110,24 @@ impl Reactor {
                 title: window.title.expose_secret().clone(),
                 frame: frame.into(),
             });
-            parking.push((wid, frame, parked_frame));
+            parking.push(Parking { wid, frame, corner });
         }
-        if parking.is_empty() {
-            return Ok(vec![]);
+        if !parking.is_empty() {
+            self.journal.record(entries)?;
         }
-        self.journal.record(entries)?;
+        Ok(parking)
+    }
+
+    /// Moves windows whose journal entries are written into their corners,
+    /// and returns them.
+    pub(super) fn move_to_corners(&mut self, parking: Vec<Parking>) -> Vec<WindowId> {
         let mut writes = vec![];
-        for (wid, frame, parked_frame) in parking {
+        for Parking { wid, frame, corner } in parking {
             self.parked.insert(wid, frame);
-            writes.push((wid, parked_frame));
+            writes.push((wid, corner));
         }
         self.write_frames_now(&writes);
-        Ok(writes.into_iter().map(|(wid, _)| wid).collect())
+        writes.into_iter().map(|(wid, _)| wid).collect()
     }
 
     /// Puts parked windows back. A window that the layout places goes to its
@@ -120,7 +139,16 @@ impl Reactor {
         expect(dead_code, reason = "only tests park windows until context switching")
     )]
     pub(super) fn unpark_windows(&mut self, wids: &[WindowId]) {
-        let laid_out = self.windows_in_layout();
+        let released = self.release_parked(wids);
+        self.put_back_unplaced(&released);
+        self.update_layout(&[], true);
+    }
+
+    /// Clears the parked state of the windows and returns each with the frame
+    /// it had before it was parked. The next layout pass writes each one's
+    /// frame.
+    pub(super) fn release_parked(&mut self, wids: &[WindowId]) -> Vec<(WindowId, CGRect)> {
+        let mut released = vec![];
         for wid in wids {
             let Some(frame) = self.parked.remove(wid) else { continue };
             self.frame_attempts.remove(wid);
@@ -129,13 +157,26 @@ impl Reactor {
             if self.resizing_window == Some(*wid) {
                 self.resizing_window = None;
             }
-            if !laid_out.contains(wid) {
-                let current = self.windows.get(wid).map_or(frame, |window| window.frame_monotonic);
-                let frame = self.on_a_screen(frame, current);
-                self.pending_frame_overrides.insert(*wid, frame);
-            }
+            released.push((*wid, frame));
         }
-        self.update_layout(&[], true);
+        released
+    }
+
+    /// Sends the released windows that the layout doesn't place, such as
+    /// floating ones, back to their frames from before parking.
+    pub(super) fn put_back_unplaced(&mut self, released: &[(WindowId, CGRect)]) {
+        if released.is_empty() {
+            return;
+        }
+        let laid_out = self.windows_in_layout();
+        for &(wid, frame) in released {
+            if laid_out.contains(&wid) {
+                continue;
+            }
+            let current = self.windows.get(&wid).map_or(frame, |window| window.frame_monotonic);
+            let frame = self.on_a_screen(frame, current);
+            self.pending_frame_overrides.insert(wid, frame);
+        }
     }
 
     /// `frame`, or, if `frame` is on no screen, `frame` moved onto the screen
