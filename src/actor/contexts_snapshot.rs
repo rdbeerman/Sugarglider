@@ -118,6 +118,22 @@ pub struct ContextSummary {
     /// context and count too.
     #[serde(default)]
     pub windows: usize,
+    /// Every member record, in the model's order. The switcher's edit view
+    /// and its `remove_records` check read these.
+    #[serde(default)]
+    pub members: Vec<MemberSummary>,
+}
+
+/// A member record of a context, as the switcher reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemberSummary {
+    /// The app name, as [`app_name`] derives it.
+    pub app: String,
+    /// The record's title.
+    pub title: String,
+    /// The record's open window, or `None` when the window is gone.
+    pub window: Option<WindowId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,6 +276,15 @@ impl ContextSummary {
                 apps.push(app);
             }
         }
+        let members = context
+            .members
+            .iter()
+            .map(|record| MemberSummary {
+                app: app_name(record),
+                title: record.title.clone(),
+                window: record.window(),
+            })
+            .collect();
         ContextSummary {
             id: context.id,
             name: context.name.clone(),
@@ -267,6 +292,7 @@ impl ContextSummary {
             last_used: context.last_used,
             apps,
             windows: open.len(),
+            members,
         }
     }
 }
@@ -379,6 +405,38 @@ mod tests {
                     UNKNOWN_APP.into()
                 ],
                 windows: 4,
+                members: vec![
+                    MemberSummary {
+                        app: "WhatsApp".into(),
+                        title: "Window1".into(),
+                        window: Some(WindowId::new(1, 1)),
+                    },
+                    MemberSummary {
+                        app: "com.microsoft.teams2".into(),
+                        title: "Window2".into(),
+                        window: Some(WindowId::new(2, 2)),
+                    },
+                    MemberSummary {
+                        app: "WhatsApp".into(),
+                        title: "Window3".into(),
+                        window: Some(WindowId::new(1, 3)),
+                    },
+                    MemberSummary {
+                        app: UNKNOWN_APP.into(),
+                        title: "Window4".into(),
+                        window: Some(WindowId::new(3, 4)),
+                    },
+                    MemberSummary {
+                        app: "Mail".into(),
+                        title: "Window5".into(),
+                        window: None,
+                    },
+                    MemberSummary {
+                        app: "Calendar".into(),
+                        title: "Window6".into(),
+                        window: None,
+                    },
+                ],
             }],
             snapshot.contexts
         );
@@ -580,6 +638,16 @@ mod tests {
         assert_eq!(
             ("Comms", 0),
             (&*snapshot.contexts[0].name, snapshot.contexts[0].windows)
+        );
+        // The newer server's member records read, with the keys this version
+        // doesn't know left at their defaults.
+        assert_eq!(
+            vec![MemberSummary {
+                app: String::new(),
+                title: "Inbox".into(),
+                window: None,
+            }],
+            snapshot.contexts[0].members
         );
         assert!(snapshot.unsorted.listed);
         assert_eq!(

@@ -77,7 +77,7 @@ mod tests {
     use crate::actor::app::{Quiet, WindowId};
     use crate::actor::contexts_snapshot::{
         CONTEXTS_OFF, CommandResult, ContextSummary, ContextsSnapshot, MAX_COMMAND_RESULTS,
-        RequestId, ScreenContext,
+        MemberSummary, RequestId, ScreenContext, app_name,
     };
     use crate::actor::layout::{LayoutCommand, LayoutEvent, LayoutManager};
     use crate::actor::parked_journal::FailingWrites;
@@ -170,6 +170,11 @@ mod tests {
         s.create("Work");
         let work = s.id("Work");
         let created = last(&published);
+        let member = |idx: u32| MemberSummary {
+            app: "TestApp1".into(),
+            title: format!("Window{idx}"),
+            window: Some(wid(idx)),
+        };
         assert_eq!(
             vec![ContextSummary {
                 id: work,
@@ -178,6 +183,7 @@ mod tests {
                 last_used: 1,
                 apps: vec!["TestApp1".into()],
                 windows: 3,
+                members: vec![member(1), member(2), member(3)],
             }],
             created.contexts
         );
@@ -282,6 +288,15 @@ mod tests {
                 vec![]
             },
             windows,
+            members: context
+                .members
+                .iter()
+                .map(|record| MemberSummary {
+                    app: app_name(record),
+                    title: record.title.clone(),
+                    window: record.window(),
+                })
+                .collect(),
         }
     }
 

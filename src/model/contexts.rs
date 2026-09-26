@@ -654,7 +654,8 @@ fn fold_latin_extended_additional(c: char) -> Option<&'static str> {
 }
 
 /// How well a query matches a context name, from weakest to strongest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NameMatch {
     /// The query is empty, so every entry is listed.
     EmptyQuery,
@@ -682,25 +683,45 @@ pub fn rank(
     contexts: &Contexts,
     unsorted_has_windows: bool,
 ) -> Vec<(ContextKey, NameMatch)> {
-    let query = fold(query.trim());
-    let mut entries: Vec<(ContextKey, &str)> = contexts
+    let unsorted = unsorted_has_windows.then(|| {
+        (
+            ContextKey::Unsorted,
+            UNSORTED_NAME.to_string(),
+            contexts.last_used(ContextKey::Unsorted),
+        )
+    });
+    let entries = contexts
         .contexts
         .iter()
-        .map(|c| (ContextKey::Named(c.id), c.name.as_str()))
-        .collect();
-    if unsorted_has_windows {
-        entries.push((ContextKey::Unsorted, UNSORTED_NAME));
-    }
-    entries.push((ContextKey::Everything, EVERYTHING_NAME));
-    let mut ranked: Vec<(ContextKey, NameMatch)> = entries
+        .map(|c| (ContextKey::Named(c.id), c.name.clone(), c.last_used))
+        .chain(unsorted)
+        .chain([(
+            ContextKey::Everything,
+            EVERYTHING_NAME.to_string(),
+            contexts.last_used(ContextKey::Everything),
+        )]);
+    rank_entries(query, entries)
+}
+
+/// Ranks `(key, name, last_used)` entries for a query, best first, as
+/// [`rank`] does. A caller that has no `Contexts`, such as the switcher
+/// bridge reading the published snapshot, builds the entries itself.
+///
+/// Ties go to the most recently used entry, and entries that are still tied
+/// keep the order they came in.
+pub fn rank_entries(
+    query: &str,
+    entries: impl IntoIterator<Item = (ContextKey, String, u64)>,
+) -> Vec<(ContextKey, NameMatch)> {
+    let query = fold(query.trim());
+    let mut ranked: Vec<(ContextKey, NameMatch, u64)> = entries
         .into_iter()
-        .filter_map(|(key, name)| match_name(&query, &fold(name)).map(|m| (key, m)))
+        .filter_map(|(key, name, last_used)| {
+            match_name(&query, &fold(&name)).map(|found| (key, found, last_used))
+        })
         .collect();
-    ranked.sort_by(|(a_key, a), (b_key, b)| {
-        b.cmp(a)
-            .then_with(|| contexts.last_used(*b_key).cmp(&contexts.last_used(*a_key)))
-    });
-    ranked
+    ranked.sort_by(|(_, a, a_used), (_, b, b_used)| b.cmp(a).then_with(|| b_used.cmp(a_used)));
+    ranked.into_iter().map(|(key, found, _)| (key, found)).collect()
 }
 
 /// Names a context in a command: by its number, its id, or its name.
@@ -4172,6 +4193,42 @@ mod tests {
         cx.add_window(a, &w).unwrap();
         cx.delete(a).unwrap();
         assert_eq!(state(&cx), (true, true));
+    }
+
+    /// Switcher ranking from entries the caller builds, as the switcher
+    /// bridge does from the published snapshot: the kind of match decides
+    /// first, recent use second, and equal entries keep their order.
+    #[test]
+    fn rank_entries_ranks_by_match_then_recent_use_and_keeps_the_entry_order() {
+        let mut cx = Contexts::new();
+        let crew = cx.create("Crew").unwrap();
+        let client = cx.create("Client work").unwrap();
+        let comms = cx.create("Comms").unwrap();
+        cx.switch_to(named(comms)).unwrap();
+        let entries = |cx: &Contexts| -> Vec<(ContextKey, String, u64)> {
+            cx.contexts()
+                .iter()
+                .map(|c| (named(c.id), c.name.clone(), c.last_used))
+                .chain([(
+                    ContextKey::Everything,
+                    EVERYTHING_NAME.to_string(),
+                    cx.last_used(ContextKey::Everything),
+                )])
+                .collect()
+        };
+        assert_eq!(
+            rank_entries("c", entries(&cx)),
+            vec![
+                (named(comms), NameMatch::NamePrefix),
+                (named(crew), NameMatch::NamePrefix),
+                (named(client), NameMatch::NamePrefix),
+            ]
+        );
+        assert_eq!(
+            rank_entries("client", entries(&cx)),
+            vec![(named(client), NameMatch::NamePrefix)]
+        );
+        assert_eq!(rank_entries("zzz", entries(&cx)), vec![]);
     }
 
     /// Switcher ranking: the kind of match decides first, recent use second.

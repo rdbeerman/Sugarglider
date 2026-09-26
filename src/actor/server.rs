@@ -593,6 +593,7 @@ mod tests {
                     last_used: 0,
                     apps: vec![],
                     windows: 0,
+                    members: vec![],
                 },
                 ContextSummary {
                     id: context_id(2),
@@ -601,6 +602,7 @@ mod tests {
                     last_used: 7,
                     apps: vec!["Zed".into(), "Microsoft Teams (work or school)".into()],
                     windows: 3,
+                    members: vec![],
                 },
             ],
             unsorted: UnsortedSummary {
