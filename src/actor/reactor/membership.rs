@@ -6,7 +6,7 @@
 //! The design is in `docs/specs/contexts.md`.
 
 use redact::Secret;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use super::{ContextRef, Reactor};
 use crate::actor::app::{WindowId, pid_t};
@@ -249,30 +249,18 @@ impl Reactor {
     }
 
     /// The windows that a membership command for `window` acts on: the window's
-    /// native tab group. None, and the command does nothing, while contexts are
-    /// off or Sugarglider quits, and when there is no window, or it is
-    /// Sugarglider's own, untracked, or parked.
-    fn command_windows(&self, window: Option<WindowId>, command: &str) -> Option<Vec<WindowId>> {
-        if !self.contexts_enabled() {
-            debug!(command, "Ignoring a context command while contexts are off");
-            return None;
-        }
-        if self.pending_exit.is_some() {
-            info!(command, "Ignoring a context command while quitting");
-            return None;
-        }
-        let Some(wid) = window else {
-            info!(command, "No window has focus");
-            return None;
-        };
+    /// native tab group. Fails when there is no window, or it is Sugarglider's
+    /// own, untracked, or parked. The caller checks that contexts are on and
+    /// that Sugarglider isn't quitting.
+    fn command_windows(&self, window: Option<WindowId>) -> Result<Vec<WindowId>, String> {
+        let wid = window.ok_or("No window has focus")?;
         let own_pid = std::process::id() as pid_t;
         let untracked =
             self.layout_window_info(wid).is_none_or(|info| self.layout.is_untracked(&info));
         if wid.pid == own_pid || untracked || self.parked.contains_key(&wid) {
-            info!(command, ?wid, "The window can't be in a context");
-            return None;
+            return Err("The focused window can't be in a context".to_string());
         }
-        Some(self.tabs_of(wid))
+        Ok(self.tabs_of(wid))
     }
 
     /// Adds the window and its tabs to the context. They take effect at the
@@ -282,14 +270,9 @@ impl Reactor {
         &mut self,
         window: Option<WindowId>,
         reference: &ContextRef,
-    ) {
-        let Some(tabs) = self.command_windows(window, "add_window_to_context") else {
-            return;
-        };
-        let Some(id) = self.resolve_named(reference) else {
-            warn!(?reference, "No context to add the window to");
-            return;
-        };
+    ) -> Result<(), String> {
+        let tabs = self.command_windows(window)?;
+        let id = self.resolve_named(reference)?;
         for &tab in &tabs {
             if let Some(desc) = self.window_desc(tab) {
                 _ = self.contexts.add_window(id, &desc);
@@ -298,6 +281,7 @@ impl Reactor {
         }
         info!(?tabs, ?id, "Added the window to a context");
         self.save_contexts();
+        Ok(())
     }
 
     /// Moves the window and its tabs out of the active context and into the
@@ -306,14 +290,9 @@ impl Reactor {
         &mut self,
         window: Option<WindowId>,
         reference: &ContextRef,
-    ) {
-        let Some(tabs) = self.command_windows(window, "move_window_to_context") else {
-            return;
-        };
-        let Some(id) = self.resolve_named(reference) else {
-            warn!(?reference, "No context to move the window to");
-            return;
-        };
+    ) -> Result<(), String> {
+        let tabs = self.command_windows(window)?;
+        let id = self.resolve_named(reference)?;
         for &tab in &tabs {
             if let Some(desc) = self.window_desc(tab) {
                 _ = self.contexts.move_window(id, &desc);
@@ -323,17 +302,18 @@ impl Reactor {
         info!(?tabs, ?id, "Moved the window to a context");
         self.save_contexts();
         self.park_windows_that_left(&tabs);
+        Ok(())
     }
 
     /// Removes the window and its tabs from the active context, at once. If
     /// they no longer show, they are parked.
-    pub(super) fn remove_window_from_context(&mut self, window: Option<WindowId>) {
-        let Some(tabs) = self.command_windows(window, "remove_window_from_context") else {
-            return;
-        };
+    pub(super) fn remove_window_from_context(
+        &mut self,
+        window: Option<WindowId>,
+    ) -> Result<(), String> {
+        let tabs = self.command_windows(window)?;
         let ContextKey::Named(id) = self.contexts.active() else {
-            info!("No named context is active to remove the window from");
-            return;
+            return Err("No named context is active to remove the window from".to_string());
         };
         for &tab in &tabs {
             _ = self.contexts.remove_window(id, tab);
@@ -342,14 +322,13 @@ impl Reactor {
         info!(?tabs, ?id, "Removed the window from the active context");
         self.save_contexts();
         self.park_windows_that_left(&tabs);
+        Ok(())
     }
 
     /// Pins the window and its tabs, which makes them members of every context,
     /// or unpins them. Unpinned windows that no longer show are parked.
-    pub(super) fn toggle_window_pinned(&mut self, window: Option<WindowId>) {
-        let Some(tabs) = self.command_windows(window, "toggle_window_pinned") else {
-            return;
-        };
+    pub(super) fn toggle_window_pinned(&mut self, window: Option<WindowId>) -> Result<(), String> {
+        let tabs = self.command_windows(window)?;
         let unpin = self.contexts.is_pinned(tabs[0]);
         for &tab in &tabs {
             if unpin {
@@ -363,6 +342,7 @@ impl Reactor {
         if unpin {
             self.park_windows_that_left(&tabs);
         }
+        Ok(())
     }
 
     /// Parks the windows that left the active context and no longer show, with

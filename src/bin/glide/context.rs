@@ -5,10 +5,11 @@
 //! sets. The design is in `docs/specs/contexts.md`, section "Command line".
 
 use std::io::Write;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use serde::Serialize;
-use sugarglider::actor::contexts_snapshot::{ContextsSnapshot, Scope};
+use sugarglider::actor::contexts_snapshot::{ContextsSnapshot, RequestId, Scope};
 use sugarglider::actor::reactor::{ContextCommand, ContextRef};
 use sugarglider::actor::server::{ContextRequest, Request, Response};
 use sugarglider::model::contexts::ContextKey;
@@ -17,6 +18,16 @@ use sugarglider::sys::message_port::SendError;
 /// What the command says when the server replies with nothing, which is how
 /// a server that doesn't know contexts answers (I4).
 const OLD_SERVER: &str = "The running Sugarglider doesn't support contexts. Restart it.";
+
+/// What a command says when Sugarglider took it but published no result in
+/// time.
+const NOT_CONFIRMED: &str = "Sugarglider did not confirm the command";
+
+/// How long a command waits between asks for its result.
+const RESULT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// How many times a command asks for its result, about a second in all.
+const RESULT_POLLS: u32 = 50;
 
 #[derive(Subcommand, Clone, Debug, PartialEq)]
 pub enum CmdContext {
@@ -48,6 +59,11 @@ pub struct Output {
 /// Sends a message to the server and returns its reply.
 pub trait Transport {
     fn request(&mut self, message: &[u8]) -> Result<Vec<u8>, SendError>;
+
+    /// Waits before the next ask for a command's result.
+    fn pause(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 /// Runs the command on the server that `connect` reaches, or fails with
@@ -75,16 +91,14 @@ fn execute<T: Transport>(
     command: &CmdContext,
     connect: impl FnOnce() -> Option<T>,
 ) -> Result<String, String> {
+    let id = new_request_id();
+    let run = |command| ContextRequest::Run(id, command);
     let request = match command {
         CmdContext::List(_) => ContextRequest::List,
         CmdContext::Current(_) => ContextRequest::Current,
-        CmdContext::Create { name } => {
-            ContextRequest::Run(ContextCommand::CreateContext(name.clone()))
-        }
-        CmdContext::Switch { query } => {
-            ContextRequest::Run(ContextCommand::SwitchContext(parse_query(query)?))
-        }
-        CmdContext::Everything => ContextRequest::Run(ContextCommand::ShowEverything),
+        CmdContext::Create { name } => run(ContextCommand::CreateContext(name.clone())),
+        CmdContext::Switch { query } => run(ContextCommand::SwitchContext(parse_query(query)?)),
+        CmdContext::Everything => run(ContextCommand::ShowEverything),
     };
     let mut transport = connect().ok_or("Sugarglider isn't running.")?;
     match (send(&mut transport, request)?, command) {
@@ -99,10 +113,36 @@ fn execute<T: Transport>(
         (
             Response::Success,
             CmdContext::Create { .. } | CmdContext::Switch { .. } | CmdContext::Everything,
-        ) => Ok(String::new()),
+        ) => wait_for_result(&mut transport, id).map(|()| String::new()),
         (Response::Error(reason), _) => Err(reason),
-        (response, _) => Err(format!("Unexpected reply from Sugarglider: {response:?}")),
+        (response, _) => Err(unexpected(&response)),
     }
+}
+
+/// A request id that another run of the command is unlikely to pick: the
+/// time in nanoseconds, mixed with the process id.
+fn new_request_id() -> RequestId {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_nanos());
+    RequestId((nanos as u64) ^ (u64::from(std::process::id()) << 32))
+}
+
+/// Asks for the result of the command sent with `request` until the reactor
+/// has run it, for about a second.
+fn wait_for_result(transport: &mut impl Transport, request: RequestId) -> Result<(), String> {
+    for _ in 0..RESULT_POLLS {
+        transport.pause(RESULT_POLL_INTERVAL);
+        match send(transport, ContextRequest::Result(request))? {
+            Response::Success => return Ok(()),
+            Response::Error(reason) => return Err(reason),
+            Response::Pending => {}
+            response => return Err(unexpected(&response)),
+        }
+    }
+    Err(NOT_CONFIRMED.to_string())
+}
+
+fn unexpected(response: &Response) -> String {
+    format!("Unexpected reply from Sugarglider: {response:?}")
 }
 
 /// A whole number names a context by its number, from 1 to 9. Any other
@@ -276,6 +316,7 @@ mod tests {
             ],
             unsorted: UnsortedSummary { windows: 3, last_used: 0 },
             everything: EverythingSummary { last_used: 0 },
+            results: vec![],
         }
     }
 
@@ -287,19 +328,34 @@ mod tests {
         }
     }
 
-    /// A server that answers every request with the same bytes.
+    /// A server that answers every request with the same bytes, except
+    /// that it answers each ask for a command's result with the next of
+    /// `results`, and then with the last one again.
     struct Server {
         reply: Vec<u8>,
+        results: Vec<Response>,
         requests: Vec<ContextRequest>,
+        pauses: Vec<Duration>,
     }
 
     impl Transport for &mut Server {
         fn request(&mut self, message: &[u8]) -> Result<Vec<u8>, SendError> {
-            match ron::de::from_bytes(message).unwrap() {
-                Request::Context(request) => self.requests.push(request),
+            let request = match ron::de::from_bytes(message).unwrap() {
+                Request::Context(request) => request,
                 other => panic!("{other:?}"),
+            };
+            let is_result = matches!(request, ContextRequest::Result(_));
+            self.requests.push(request);
+            if !is_result {
+                return Ok(self.reply.clone());
             }
-            Ok(self.reply.clone())
+            let asked = self.requests.iter().filter(|r| matches!(r, ContextRequest::Result(_)));
+            let result = &self.results[(asked.count() - 1).min(self.results.len() - 1)];
+            Ok(ron::ser::to_string(result).unwrap().into_bytes())
+        }
+
+        fn pause(&mut self, duration: Duration) {
+            self.pauses.push(duration);
         }
     }
 
@@ -308,29 +364,79 @@ mod tests {
         out: String,
         err: String,
         requests: Vec<ContextRequest>,
+        pauses: Vec<Duration>,
+    }
+
+    impl Ran {
+        /// The commands sent with `Run`. Each ask for a result names the id
+        /// of the command sent before it.
+        fn commands(&self) -> Vec<ContextCommand> {
+            let mut sent = None;
+            let mut commands = Vec::new();
+            for request in &self.requests {
+                match request {
+                    ContextRequest::Run(id, command) => {
+                        sent = Some(*id);
+                        commands.push(command.clone());
+                    }
+                    ContextRequest::Result(id) => assert_eq!(sent, Some(*id)),
+                    ContextRequest::List | ContextRequest::Current => {}
+                }
+            }
+            commands
+        }
+
+        /// How many times the command asked for its result.
+        fn asks(&self) -> usize {
+            let asks = self.requests.iter().filter(|r| matches!(r, ContextRequest::Result(_)));
+            asks.count()
+        }
     }
 
     /// Runs `sugarglider context <args>` against a server that replies with
-    /// `reply`, or with no server when `reply` is `None`.
-    fn run_raw(args: &[&str], reply: Option<Vec<u8>>) -> Ran {
+    /// `reply`, and with `results` to each ask for a command's result, or
+    /// with no server when `reply` is `None`.
+    fn run_against(args: &[&str], reply: Option<Vec<u8>>, results: Vec<Response>) -> Ran {
         let command = parse(args).unwrap();
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let mut server = reply.map(|reply| Server { reply, requests: Vec::new() });
+        let mut server = reply.map(|reply| Server {
+            reply,
+            results,
+            requests: Vec::new(),
+            pauses: Vec::new(),
+        });
         let status = run(&command, || server.as_mut(), &mut out, &mut err);
+        let (requests, pauses) =
+            server.map(|server| (server.requests, server.pauses)).unwrap_or_default();
         Ran {
             status,
             out: String::from_utf8(out).unwrap(),
             err: String::from_utf8(err).unwrap(),
-            requests: server.map(|server| server.requests).unwrap_or_default(),
+            requests,
+            pauses,
         }
+    }
+
+    /// Runs `sugarglider context <args>` against a server that replies with
+    /// `reply`, or with no server when `reply` is `None`. A command that the
+    /// server takes has run by the first ask for its result.
+    fn run_raw(args: &[&str], reply: Option<Vec<u8>>) -> Ran {
+        run_against(args, reply, vec![Response::Success])
     }
 
     fn run_with(args: &[&str], reply: Response) -> Ran {
         run_raw(args, Some(ron::ser::to_string(&reply).unwrap().into_bytes()))
     }
 
-    fn switch(reference: ContextRef) -> ContextRequest {
-        ContextRequest::Run(ContextCommand::SwitchContext(reference))
+    /// Runs `sugarglider context <args>` against a server that takes the
+    /// command and gives `results` to the asks for its result.
+    fn run_with_results(args: &[&str], results: Vec<Response>) -> Ran {
+        let reply = ron::ser::to_string(&Response::Success).unwrap().into_bytes();
+        run_against(args, Some(reply), results)
+    }
+
+    fn switch(reference: ContextRef) -> ContextCommand {
+        ContextCommand::SwitchContext(reference)
     }
 
     #[test]
@@ -460,25 +566,89 @@ mod tests {
         assert_eq!(1, printed["contexts"].as_array().unwrap().len());
     }
 
-    /// Commands print nothing when the server takes them.
+    /// A command sends its request, asks for its result after a pause, and
+    /// prints nothing when the command ran.
     #[test]
     fn commands_send_their_request_and_print_nothing() {
-        for (args, request) in [
+        for (args, command) in [
             (
                 &["create", "Client work"][..],
-                ContextRequest::Run(ContextCommand::CreateContext("Client work".into())),
+                ContextCommand::CreateContext("Client work".into()),
             ),
             (&["switch", "2"], switch(ContextRef::Number(2))),
             (&["switch", "cli"], switch(ContextRef::Name("cli".into()))),
-            (
-                &["everything"],
-                ContextRequest::Run(ContextCommand::ShowEverything),
-            ),
+            (&["everything"], ContextCommand::ShowEverything),
         ] {
             let ran = run_with(args, Response::Success);
             assert_eq!(("", "", 0), (&*ran.out, &*ran.err, ran.status), "{args:?}");
-            assert_eq!(vec![request], ran.requests);
+            assert_eq!(vec![command], ran.commands());
+            assert_eq!(1, ran.asks());
+            assert_eq!(vec![RESULT_POLL_INTERVAL], ran.pauses);
         }
+    }
+
+    /// A command asks for its result every 20 ms until the reactor has run
+    /// it, and then exits with status 0.
+    #[test]
+    fn a_command_waits_for_its_result() {
+        let ran = run_with_results(
+            &["switch", "Comms"],
+            vec![Response::Pending, Response::Pending, Response::Success],
+        );
+
+        assert_eq!((0, "", ""), (ran.status, &*ran.out, &*ran.err));
+        assert_eq!(3, ran.asks());
+        assert_eq!(vec![Duration::from_millis(20); 3], ran.pauses);
+        assert_eq!(vec![switch(ContextRef::Name("Comms".into()))], ran.commands());
+    }
+
+    /// A command that the reactor ran but that did nothing prints the
+    /// reason on stderr and exits with status 1.
+    #[test]
+    fn a_command_that_did_nothing_prints_the_reason() {
+        let reason = "No context matches \"xyz\"";
+        let ran = run_with_results(
+            &["switch", "xyz"],
+            vec![Response::Pending, Response::Error(reason.into())],
+        );
+
+        assert_eq!(2, ran.asks());
+        assert_eq!((1, "", format!("{reason}\n")), (ran.status, &*ran.out, ran.err));
+    }
+
+    /// A command whose result doesn't come within about a second says that
+    /// Sugarglider did not confirm it, and exits with status 1.
+    #[test]
+    fn a_command_without_a_result_in_a_second_fails() {
+        for args in [
+            &["switch", "Comms"][..],
+            &["create", "Work"],
+            &["everything"],
+        ] {
+            let ran = run_with_results(args, vec![Response::Pending]);
+
+            assert_eq!(
+                (1, "", "Sugarglider did not confirm the command\n"),
+                (ran.status, &*ran.out, &*ran.err),
+                "{args:?}"
+            );
+            assert_eq!(50, ran.asks());
+            assert_eq!(Duration::from_secs(1), ran.pauses.iter().sum::<Duration>());
+        }
+    }
+
+    /// A reply to the ask for a result that doesn't fit fails with status 1.
+    #[test]
+    fn a_result_that_does_not_fit_fails() {
+        let ran = run_with_results(&["everything"], vec![Response::Contexts(snapshot())]);
+
+        assert_eq!((1, ""), (ran.status, &*ran.out));
+        assert!(
+            ran.err.starts_with("Unexpected reply from Sugarglider: "),
+            "{}",
+            ran.err
+        );
+        assert_eq!(1, ran.asks());
     }
 
     /// Failures print the reason to stderr and exit with status 1.
@@ -888,7 +1058,7 @@ mod tests {
         ] {
             let ran = run_with(&["switch", query], Response::Success);
             assert_eq!((0, "", ""), (ran.status, &*ran.out, &*ran.err), "{query:?}");
-            assert_eq!(vec![switch(reference)], ran.requests, "{query:?}");
+            assert_eq!(vec![switch(reference)], ran.commands(), "{query:?}");
         }
         for query in ["00", "256", "99999999999"] {
             let ran = run_with(&["switch", query], Response::Success);
@@ -900,21 +1070,19 @@ mod tests {
         }
     }
 
-    /// The name of a new context is sent as it was typed, and a reason the
-    /// server gives goes to stderr.
+    /// The name of a new context is sent as it was typed, and the reason
+    /// the reactor refuses it goes to stderr.
     #[test]
     fn create_sends_the_name_and_prints_a_refusal() {
         let ran = run_with(&["create", " Café \"A\" "], Response::Success);
         assert_eq!((0, "", ""), (ran.status, &*ran.out, &*ran.err));
         assert_eq!(
-            vec![ContextRequest::Run(ContextCommand::CreateContext(
-                " Café \"A\" ".into()
-            ))],
-            ran.requests
+            vec![ContextCommand::CreateContext(" Café \"A\" ".into())],
+            ran.commands()
         );
 
         let reason = "\"Everything\" is a reserved name";
-        let ran = run_with(&["create", "Everything"], Response::Error(reason.into()));
+        let ran = run_with_results(&["create", "Everything"], vec![Response::Error(reason.into())]);
         assert_eq!((1, "", format!("{reason}\n")), (ran.status, &*ran.out, ran.err));
     }
 
@@ -929,7 +1097,7 @@ mod tests {
         assert_eq!((0, "", ""), (ran.status, &*ran.out, &*ran.err));
         assert_eq!(1, ran.requests.len());
         assert!(
-            matches!(ran.requests[0], ContextRequest::Run(_)),
+            matches!(ran.requests[0], ContextRequest::Run(..)),
             "{:?}",
             ran.requests
         );

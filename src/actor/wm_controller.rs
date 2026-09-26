@@ -23,6 +23,7 @@ pub type StartupToken = mpsc::UnboundedSender<()>;
 type StartupReceiver = mpsc::UnboundedReceiver<()>;
 
 use crate::actor::app::AppInfo;
+use crate::actor::contexts_snapshot::RequestId;
 use crate::actor::{self, mouse, reactor, space_manager, status, window_server};
 use crate::sys;
 use crate::sys::bundle::CommandOutput;
@@ -38,6 +39,9 @@ pub enum WmEvent {
     AppGloballyDeactivated(pid_t),
     AppTerminated(pid_t),
     Command(WmCommand),
+    /// A context command from the command line. The reactor publishes its
+    /// result under the request's id.
+    ContextCommandRequested(RequestId, reactor::ContextCommand),
     ConfigUpdated(Arc<crate::config::Config>),
     /// Sent by SpaceManager to register or unregister hotkeys.
     HotkeysActive(bool),
@@ -215,6 +219,9 @@ impl WmController {
             }
             Command(ReactorCommand(cmd)) => {
                 self.sm_tx.send(space_manager::Event::ReactorCommand(cmd));
+            }
+            ContextCommandRequested(request, command) => {
+                self.send_reactor_event(reactor::Event::ContextCommandRequested(request, command));
             }
             ConfigUpdated(config) => {
                 // Update the global config state for FFI access

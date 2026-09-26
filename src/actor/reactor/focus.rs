@@ -138,7 +138,7 @@ impl Reactor {
         }
         let target = self.contexts.focus_target(self.membership_window(wid));
         info!(?wid, ?target, "Focus from outside the active context; switching");
-        self.switch_context_focusing(target, Some(wid));
+        _ = self.switch_context_focusing(target, Some(wid));
         FocusOutcome::Switched
     }
 

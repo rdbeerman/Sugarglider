@@ -6,11 +6,23 @@
 use std::sync::Arc;
 
 use super::Reactor;
-use crate::actor::contexts_snapshot::{ContextsSnapshot, ScreenContext};
+use crate::actor::contexts_snapshot::{
+    CommandResult, ContextsSnapshot, MAX_COMMAND_RESULTS, RequestId, ScreenContext,
+};
 
 impl Reactor {
-    /// The contexts as the command line and the switcher see them.
+    /// The contexts as the command line and the switcher see them, with the
+    /// results of the last commands from the command line.
     fn contexts_snapshot(&self) -> ContextsSnapshot {
+        ContextsSnapshot {
+            results: self.command_results.iter().cloned().collect(),
+            ..self.contexts_state()
+        }
+    }
+
+    /// The contexts, with the facts that only the reactor knows: what each
+    /// visible screen shows, and how many windows are unsorted.
+    fn contexts_state(&self) -> ContextsSnapshot {
         if !self.contexts_enabled() {
             return ContextsSnapshot::off();
         }
@@ -27,6 +39,16 @@ impl Reactor {
             .collect();
         let unsorted = self.windows_on_visible_spaces(|wid| self.contexts.is_unsorted(wid)).len();
         ContextsSnapshot::new(&self.contexts, screens, unsorted)
+    }
+
+    /// Keeps the result of a command from the command line for the next
+    /// snapshots, and drops the oldest results beyond
+    /// [`MAX_COMMAND_RESULTS`].
+    pub(super) fn record_command_result(&mut self, request: RequestId, error: Option<String>) {
+        self.command_results.push_back(CommandResult { request, error });
+        while self.command_results.len() > MAX_COMMAND_RESULTS {
+            self.command_results.pop_front();
+        }
     }
 
     /// Publishes the snapshot of the contexts when it differs from the one
@@ -53,7 +75,10 @@ mod tests {
     use super::super::testing::*;
     use super::super::{Command, ContextCommand, ContextRef, Event, Reactor, ReactorCommand};
     use crate::actor::app::WindowId;
-    use crate::actor::contexts_snapshot::{ContextSummary, ContextsSnapshot, ScreenContext};
+    use crate::actor::contexts_snapshot::{
+        CONTEXTS_OFF, CommandResult, ContextSummary, ContextsSnapshot, MAX_COMMAND_RESULTS,
+        RequestId, ScreenContext,
+    };
     use crate::actor::layout::{LayoutCommand, LayoutEvent, LayoutManager};
     use crate::actor::parked_journal::FailingWrites;
     use crate::actor::server::{ContextRequest, Response, answer_context_request};
@@ -437,15 +462,12 @@ mod tests {
         for request in [
             ContextRequest::List,
             ContextRequest::Current,
-            ContextRequest::Run(ContextCommand::ShowEverything),
-            ContextRequest::Run(ContextCommand::CreateContext("Other".into())),
+            ContextRequest::Run(RequestId(1), ContextCommand::ShowEverything),
+            ContextRequest::Run(RequestId(2), ContextCommand::CreateContext("Other".into())),
         ] {
             let (reply, sent) = answer_context_request(request, Some(&off));
             assert_eq!(None, sent);
-            assert!(
-                matches!(&reply, Response::Error(reason) if reason.starts_with("Contexts are off.")),
-                "{reply:?}"
-            );
+            assert_eq!(Response::Error(CONTEXTS_OFF.into()), reply);
         }
 
         s.reactor.handle_event(Event::ConfigChanged(config(true)));
@@ -471,5 +493,124 @@ mod tests {
         let quitting = last(&published);
         assert_eq!(ContextKey::Named(c), quitting.active);
         assert_eq!(shows(ContextKey::Everything), quitting.screens);
+    }
+
+    /// Sends a context command from the command line with request id
+    /// `request`, and lets the apps answer.
+    fn request(s: &mut Setup, request: u64, command: ContextCommand) {
+        s.reactor
+            .handle_event(Event::ContextCommandRequested(RequestId(request), command));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+    }
+
+    fn ran(request: u64) -> CommandResult {
+        CommandResult {
+            request: RequestId(request),
+            error: None,
+        }
+    }
+
+    fn failed(request: u64, reason: &str) -> CommandResult {
+        CommandResult {
+            request: RequestId(request),
+            error: Some(reason.to_string()),
+        }
+    }
+
+    /// A command from the command line publishes its result under its
+    /// request id: nothing when it ran, and the reason when it did nothing.
+    /// The server gives the command line the result from the snapshot.
+    #[test]
+    fn a_command_from_the_command_line_publishes_its_result() {
+        let mut s = Setup::new(2);
+        s.create("Work");
+        let published = capture(&mut s.reactor);
+        let switch = |name: &str| ContextCommand::SwitchContext(ContextRef::Name(name.into()));
+
+        request(&mut s, 1, ContextCommand::ShowEverything);
+        request(&mut s, 2, switch("wrk"));
+        request(&mut s, 3, switch("nothing"));
+        request(&mut s, 4, ContextCommand::CreateContext("work".into()));
+        request(&mut s, 5, ContextCommand::PreviousContext);
+
+        assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+        assert_eq!(
+            vec![
+                ran(1),
+                ran(2),
+                failed(3, "No context matches \"nothing\""),
+                failed(4, "A context named \"Work\" already exists"),
+                ran(5),
+            ],
+            last(&published).results
+        );
+        assert_eq!(5, count(&published));
+        assert_eq!(Response::Success, result_of(&s, 2));
+        assert_eq!(
+            Response::Error("No context matches \"nothing\"".into()),
+            result_of(&s, 3)
+        );
+        assert_eq!(Response::Pending, result_of(&s, 6));
+    }
+
+    /// R28. With contexts off, a command from the command line does nothing
+    /// and publishes that contexts are off, in the snapshot of contexts
+    /// that are off. So a command that the server took just before contexts
+    /// were turned off gets that answer.
+    #[test]
+    fn a_command_while_contexts_are_off_publishes_that_they_are_off() {
+        let mut s = Setup::new(2);
+        s.create("Work");
+        s.run(ContextCommand::ShowEverything);
+        s.reactor.handle_event(Event::ConfigChanged(config(false)));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let published = capture(&mut s.reactor);
+
+        request(
+            &mut s,
+            1,
+            ContextCommand::SwitchContext(ContextRef::Name("Work".into())),
+        );
+
+        assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+        assert!(s.parked().is_empty());
+        assert_eq!(
+            ContextsSnapshot {
+                results: vec![failed(1, CONTEXTS_OFF)],
+                ..ContextsSnapshot::off()
+            },
+            last(&published)
+        );
+        assert_eq!(Response::Error(CONTEXTS_OFF.into()), result_of(&s, 1));
+    }
+
+    /// The snapshot keeps the newest 32 results. The command line gets no
+    /// answer for an older one, and so stops asking after about a second.
+    #[test]
+    fn the_snapshot_keeps_the_newest_results() {
+        let mut s = Setup::new(1);
+        s.create("Work");
+
+        for id in 1..=40 {
+            request(&mut s, id, ContextCommand::ShowEverything);
+        }
+
+        let results = s.reactor.published_contexts.clone().unwrap().results.clone();
+        assert_eq!((9..=40).map(ran).collect::<Vec<_>>(), results);
+        assert_eq!(MAX_COMMAND_RESULTS, results.len());
+        assert_eq!(Response::Pending, result_of(&s, 8));
+        assert_eq!(Response::Success, result_of(&s, 9));
+    }
+
+    /// A command from a key binding or the menu, which has no request id,
+    /// publishes no result.
+    #[test]
+    fn a_command_without_a_request_id_publishes_no_result() {
+        let mut s = Setup::new(1);
+        s.create("Work");
+        s.run(ContextCommand::ShowEverything);
+        s.run(ContextCommand::SwitchContext(ContextRef::Name("nothing".into())));
+
+        assert!(s.reactor.published_contexts.clone().unwrap().results.is_empty());
     }
 }

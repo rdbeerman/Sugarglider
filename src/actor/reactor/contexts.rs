@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{ContextCommand, ContextRef, Reactor};
 use crate::actor::app::{WindowId, pid_t};
+use crate::actor::contexts_snapshot::CONTEXTS_OFF;
 use crate::actor::contexts_store::{ContextsStore, Loaded, empty_contexts_after};
 use crate::actor::layout::{ActiveContext, EventResponse, LayoutEvent};
 use crate::model::contexts::{
@@ -20,6 +21,9 @@ use crate::model::contexts::{
     SwitchScreen, SwitchWindow, WindowDesc, plan_switch, resolve,
 };
 use crate::sys::screen::SpaceId;
+
+/// Why a context command does nothing while a quit waits for parked windows.
+const QUITTING: &str = "Sugarglider is quitting";
 
 /// A visible screen, with its Space and size, and the context it shows.
 #[derive(Clone, Copy, Debug)]
@@ -300,33 +304,33 @@ impl Reactor {
     /// Switches to `target` on every screen. The switch focuses the most
     /// recently focused window that shows. If the journal can't be written,
     /// the old context stays.
-    fn switch_context(&mut self, target: ContextKey) {
-        self.switch_context_focusing(target, None);
+    pub(super) fn switch_context(&mut self, target: ContextKey) -> Result<(), String> {
+        self.switch_context_focusing(target, None)
     }
 
     /// Switches to `target` on every screen, and focuses `focused`, the
     /// window whose focus started the switch, or else the most
     /// recently focused window that shows. When no window can take focus,
     /// Finder is activated. Focus from outside counts again
-    /// when the switch ends.
+    /// when the switch ends. Returns why nothing changed.
     pub(super) fn switch_context_focusing(
         &mut self,
         target: ContextKey,
         focused: Option<WindowId>,
-    ) {
+    ) -> Result<(), String> {
         if !self.contexts_enabled() {
             debug!(?target, "Ignoring a context switch while contexts are off");
-            return;
+            return Err(CONTEXTS_OFF.to_string());
         }
         if self.pending_exit.is_some() {
             info!(?target, "Ignoring a context switch while quitting");
-            return;
+            return Err(QUITTING.to_string());
         }
         if let ContextKey::Named(id) = target
             && self.contexts.get(id).is_none()
         {
             warn!(?target, "Ignoring a switch to a context that doesn't exist");
-            return;
+            return Err(ContextError::NoSuchContext.to_string());
         }
         let start = Instant::now();
         self.layout.cancel_interactive_state();
@@ -357,14 +361,16 @@ impl Reactor {
                     elapsed = ?start.elapsed(),
                     "Switched context"
                 );
+                Ok(())
             }
             Err(err) => {
                 self.added_since_switch = added;
                 self.contexts = contexts;
-                error!(
-                    ?target,
+                let reason = format!(
                     "Could not write the parked-window journal, so the context stays: {err}"
                 );
+                error!(?target, "{reason}");
+                Err(reason)
             }
         }
     }
@@ -398,17 +404,34 @@ impl Reactor {
         self.apply_again();
     }
 
+    /// Runs a context command from a key binding or the menu, and logs why
+    /// it did nothing.
     pub(super) fn handle_context_command(&mut self, command: ContextCommand) {
+        if let Err(reason) = self.run_context_command(command) {
+            info!("The context command did nothing: {reason}");
+        }
+    }
+
+    /// Runs a context command, or returns why it can't run. The command
+    /// names its context as the user wrote it, and it is resolved here,
+    /// against the reactor's own state.
+    pub(super) fn run_context_command(&mut self, command: ContextCommand) -> Result<(), String> {
+        if !self.contexts_enabled() {
+            return Err(CONTEXTS_OFF.to_string());
+        }
+        if self.pending_exit.is_some() {
+            return Err(QUITTING.to_string());
+        }
         match command {
-            ContextCommand::SwitchContext(reference) => match self.resolve(&reference) {
-                Ok(key) => self.switch_context(key),
-                Err(err) => warn!(?reference, "{err}"),
-            },
+            ContextCommand::SwitchContext(reference) => {
+                let key = self.resolve(&reference).map_err(|err| err.to_string())?;
+                self.switch_context(key)
+            }
             ContextCommand::ShowEverything => self.switch_context(ContextKey::Everything),
-            ContextCommand::PreviousContext => match self.contexts.previous() {
-                Some(key) => self.switch_context(key),
-                None => debug!("There is no previous context"),
-            },
+            ContextCommand::PreviousContext => {
+                let key = self.contexts.previous().ok_or("There is no previous context")?;
+                self.switch_context(key)
+            }
             ContextCommand::AddWindowToContext(reference) => {
                 self.add_window_to_context(self.main_window(), &reference)
             }
@@ -423,11 +446,14 @@ impl Reactor {
         }
     }
 
-    /// The named context that a command names.
-    pub(super) fn resolve_named(&self, reference: &ContextRef) -> Option<ContextId> {
-        match self.resolve(reference) {
-            Ok(ContextKey::Named(id)) => Some(id),
-            _ => None,
+    /// The named context that a command names. Everything and Unsorted
+    /// can't take a window, so naming them fails too.
+    pub(super) fn resolve_named(&self, reference: &ContextRef) -> Result<ContextId, String> {
+        match self.resolve(reference).map_err(|err| err.to_string())? {
+            ContextKey::Named(id) => Ok(id),
+            ContextKey::Everything | ContextKey::Unsorted => {
+                Err("Only a named context can take a window".to_string())
+            }
         }
     }
 

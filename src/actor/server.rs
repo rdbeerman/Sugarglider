@@ -13,8 +13,10 @@ use objc2_service_management::SMAppService;
 use serde::{Deserialize, Serialize};
 use tracing::{Span, error, info, instrument, warn};
 
-use crate::actor::contexts_snapshot::{self, ContextsSnapshot};
-use crate::actor::reactor::{self, ContextCommand};
+use crate::actor::contexts_snapshot::{
+    self, CONTEXTS_OFF, CommandResult, ContextsSnapshot, RequestId,
+};
+use crate::actor::reactor::ContextCommand;
 use crate::actor::wm_controller;
 use crate::config::Config;
 use crate::sys::message_port::{LocalMessagePort, LocalPortCreateError};
@@ -39,8 +41,11 @@ pub enum ContextRequest {
     List,
     /// The active context.
     Current,
-    /// Runs a command that switches or changes contexts.
-    Run(ContextCommand),
+    /// Runs a command that switches or changes contexts. The client picks
+    /// the id, and asks for the command's result with it.
+    Run(RequestId, ContextCommand),
+    /// The result of the command that `Run` sent with this id.
+    Result(RequestId),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -55,6 +60,8 @@ pub enum Response {
     Success,
     Error(String),
     Contexts(ContextsSnapshot),
+    /// The command that `Result` asks about hasn't run yet.
+    Pending,
 }
 
 pub struct MessageServer {
@@ -137,12 +144,10 @@ impl State {
             Request::Context(request) => {
                 let snapshot = (self.contexts)();
                 let (response, command) = answer_context_request(request, snapshot.as_deref());
-                if let Some(command) = command {
+                if let Some((request, command)) = command {
                     _ = self.wm_tx.send((
                         Span::current(),
-                        wm_controller::WmEvent::Command(wm_controller::WmCommand::ReactorCommand(
-                            reactor::Command::Context(command),
-                        )),
+                        wm_controller::WmEvent::ContextCommandRequested(request, command),
                     ));
                 }
                 response
@@ -169,28 +174,32 @@ impl State {
 
 /// Answers a request about contexts from `snapshot`, the snapshot the
 /// reactor published last, without waiting for the reactor (I3). Also
-/// returns the command to send to the reactor, which runs it after the
-/// reply.
+/// returns the command to send to the reactor, as the client sent it. The
+/// reactor resolves the context the command names, runs it after the reply,
+/// and publishes its result under the request's id.
 pub(crate) fn answer_context_request(
     request: ContextRequest,
     snapshot: Option<&ContextsSnapshot>,
-) -> (Response, Option<ContextCommand>) {
+) -> (Response, Option<(RequestId, ContextCommand)>) {
     let Some(snapshot) = snapshot else {
         let reason = "Sugarglider hasn't loaded its contexts yet. Try again in a moment.";
         return (Response::Error(reason.to_string()), None);
     };
-    if !snapshot.enabled {
-        let reason = "Contexts are off. Turn them on with enable = true under \
-                      [settings.experimental.contexts] in the config file.";
-        return (Response::Error(reason.to_string()), None);
-    }
     match request {
+        // A command that the server took before contexts were turned off
+        // still has its result.
+        ContextRequest::Result(request) => {
+            let response = match snapshot.result(request) {
+                None => Response::Pending,
+                Some(CommandResult { error: None, .. }) => Response::Success,
+                Some(CommandResult { error: Some(reason), .. }) => Response::Error(reason.clone()),
+            };
+            (response, None)
+        }
+        _ if !snapshot.enabled => (Response::Error(CONTEXTS_OFF.to_string()), None),
         ContextRequest::List => (Response::Contexts(snapshot.clone()), None),
         ContextRequest::Current => (Response::Contexts(snapshot.current()), None),
-        ContextRequest::Run(command) => match snapshot.resolve_command(command) {
-            Ok(command) => (Response::Success, Some(command)),
-            Err(reason) => (Response::Error(reason), None),
-        },
+        ContextRequest::Run(request, command) => (Response::Success, Some((request, command))),
     }
 }
 
@@ -224,7 +233,7 @@ mod tests {
     }
 
     fn run(command: ContextCommand) -> ContextRequest {
-        ContextRequest::Run(command)
+        ContextRequest::Run(RequestId(7), command)
     }
 
     fn switch(reference: ContextRef) -> ContextCommand {
@@ -233,6 +242,13 @@ mod tests {
 
     fn name(name: &str) -> ContextRef {
         ContextRef::Name(name.to_string())
+    }
+
+    fn result(request: u64, error: Option<&str>) -> CommandResult {
+        CommandResult {
+            request: RequestId(request),
+            error: error.map(str::to_string),
+        }
     }
 
     /// Comms (1) and Client work (2), with Comms active and 2 unsorted
@@ -248,10 +264,6 @@ mod tests {
         }];
         let snapshot = ContextsSnapshot::new(&contexts, screens, 2);
         (contexts, snapshot)
-    }
-
-    fn id(contexts: &Contexts, name: &str) -> ContextId {
-        contexts.by_name(name).unwrap().id
     }
 
     /// I2. Each context request, and each form of the tagged `ContextRef`,
@@ -271,6 +283,8 @@ mod tests {
             run(ContextCommand::ShowEverything),
             run(ContextCommand::PreviousContext),
             run(ContextCommand::CreateContext("Client work".into())),
+            run(ContextCommand::AddWindowToContext(name("Comms"))),
+            ContextRequest::Result(RequestId(u64::MAX)),
         ] {
             let text = ron::ser::to_string(&Request::Context(request.clone())).unwrap();
             assert_eq!(request, read(&text), "{text}");
@@ -278,20 +292,21 @@ mod tests {
         assert_eq!(ContextRequest::List, read("Context(List)"));
         assert_eq!(
             run(switch(ContextRef::Number(7))),
-            read("Context(Run(switch_context(7)))")
+            read("Context(Run(7, switch_context(7)))")
         );
         assert_eq!(
             run(switch(name("7"))),
-            read("Context(Run(switch_context(\"7\")))")
+            read("Context(Run(7, switch_context(\"7\")))")
         );
         assert_eq!(
             run(switch(ContextRef::Id(seven))),
-            read("Context(Run(switch_context(Id(7))))")
+            read("Context(Run(7, switch_context(Id(7))))")
         );
         assert_eq!(
             run(ContextCommand::CreateContext("X".into())),
-            read("Context(Run(create_context(\"X\")))")
+            read("Context(Run(7, create_context(\"X\")))")
         );
+        assert_eq!(ContextRequest::Result(RequestId(7)), read("Context(Result(7))"));
     }
 
     /// I2. The replies survive the RON round trip, the snapshot included.
@@ -300,6 +315,7 @@ mod tests {
         let (_, snapshot) = contexts();
         for response in [
             Response::Success,
+            Response::Pending,
             Response::Error("No context has the number 4".into()),
             Response::Contexts(snapshot),
             Response::Contexts(ContextsSnapshot::off()),
@@ -325,58 +341,78 @@ mod tests {
         );
     }
 
-    /// I3. `Run` replies at once and sends the command with the context the
-    /// snapshot resolves. A name that matches nothing goes to the reactor
-    /// as it is.
+    /// `Run` replies at once that the server took the command, and sends it
+    /// with its request id as the client wrote it. The server resolves no
+    /// name, number, or id and checks no new name, because the snapshot can
+    /// be older than the reactor's state: the reactor does both when it runs
+    /// the command.
     #[test]
-    fn run_sends_the_command_with_the_resolved_context() {
-        let (contexts, snapshot) = contexts();
-        let client = ContextRef::Id(id(&contexts, "Client work"));
-        let answer = |command| answer_context_request(run(command), Some(&snapshot));
+    fn run_takes_the_command_at_once_and_sends_it_as_written() {
+        let (_, snapshot) = contexts();
+        let gone: ContextId = serde_json::from_value(serde_json::json!(99)).unwrap();
 
-        for (command, sent) in [
-            (switch(name("cli")), switch(client.clone())),
-            (switch(ContextRef::Number(2)), switch(client.clone())),
-            (switch(name("New")), switch(name("New"))),
-            (switch(name("unsorted")), switch(name("Unsorted"))),
-            (switch(name("everything")), ContextCommand::ShowEverything),
-            (ContextCommand::ShowEverything, ContextCommand::ShowEverything),
-            (
-                ContextCommand::CreateContext("New".into()),
-                ContextCommand::CreateContext("New".into()),
-            ),
+        for command in [
+            switch(name("cli")),
+            switch(name("uns")),
+            switch(name("Sugarglider")),
+            switch(name(" ")),
+            switch(ContextRef::Number(2)),
+            switch(ContextRef::Number(9)),
+            switch(ContextRef::Id(gone)),
+            ContextCommand::ShowEverything,
+            ContextCommand::PreviousContext,
+            ContextCommand::CreateContext("comms".into()),
+            ContextCommand::CreateContext("Everything".into()),
+            ContextCommand::AddWindowToContext(name("Comms")),
+            ContextCommand::MoveWindowToContext(ContextRef::Number(2)),
+            ContextCommand::RemoveWindowFromContext,
+            ContextCommand::ToggleWindowPinned,
         ] {
-            assert_eq!((Response::Success, Some(sent)), answer(command));
+            let request = ContextRequest::Run(RequestId(3), command.clone());
+            assert_eq!(
+                (Response::Success, Some((RequestId(3), command))),
+                answer_context_request(request, Some(&snapshot))
+            );
         }
     }
 
-    /// I3. A lookup that fails other than by name, and a name that R4
-    /// refuses, reply with the reason and send nothing.
+    /// `Result` replies with the result the reactor published for the
+    /// request id: `Success` when the command ran, the reason when it did
+    /// nothing, and `Pending` while the snapshot has no result for the id,
+    /// either because the command hasn't run yet or because newer results
+    /// pushed its result out. It sends nothing.
     #[test]
-    fn run_replies_with_the_reason_when_the_command_cant_run() {
+    fn result_replies_with_the_published_result_or_pending() {
         let (_, snapshot) = contexts();
-        let answer = |command| answer_context_request(run(command), Some(&snapshot));
-        let error = |reason: &str| (Response::Error(reason.to_string()), None);
+        let snapshot = ContextsSnapshot {
+            results: vec![
+                result(1, None),
+                result(2, Some("No context matches \"x\"")),
+                result(3, Some("No Space is managed right now")),
+            ],
+            ..snapshot
+        };
+        let answer =
+            |request| answer_context_request(ContextRequest::Result(request), Some(&snapshot));
 
+        assert_eq!((Response::Success, None), answer(RequestId(1)));
         assert_eq!(
-            error("No context has the number 3"),
-            answer(switch(ContextRef::Number(3)))
+            (Response::Error("No context matches \"x\"".into()), None),
+            answer(RequestId(2))
         );
         assert_eq!(
-            error("A context named \"Comms\" already exists"),
-            answer(ContextCommand::CreateContext("comms".into()))
+            (Response::Error("No Space is managed right now".into()), None),
+            answer(RequestId(3))
         );
-        assert_eq!(
-            error("\"Everything\" is a reserved name"),
-            answer(ContextCommand::CreateContext("Everything".into()))
-        );
+        assert_eq!((Response::Pending, None), answer(RequestId(4)));
     }
 
-    /// I3. The server sends a resolved command to the window manager, which
-    /// passes it to the reactor. A read sends nothing.
+    /// I3. The server sends the command to the window manager with its
+    /// request id, and the window manager passes both to the reactor. A read
+    /// sends nothing.
     #[test]
     fn run_sends_the_command_to_the_window_manager() {
-        let (contexts, snapshot) = contexts();
+        let (_, snapshot) = contexts();
         let snapshot = Arc::new(snapshot);
         let (wm_tx, mut wm_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = State {
@@ -388,20 +424,24 @@ mod tests {
 
         assert_eq!(Response::Success, response);
         let (_, event) = wm_rx.try_recv().unwrap();
-        let wm_controller::WmEvent::Command(wm_controller::WmCommand::ReactorCommand(
-            reactor::Command::Context(command),
-        )) = event
-        else {
+        let wm_controller::WmEvent::ContextCommandRequested(request, command) = event else {
             panic!("{event:?}");
         };
-        assert_eq!(switch(ContextRef::Id(id(&contexts, "Client work"))), command);
-        let response = state.on_request(Request::Context(ContextRequest::List));
-        assert!(matches!(response, Response::Contexts(_)), "{response:?}");
+        assert_eq!((RequestId(7), switch(name("cli"))), (request, command));
+        for read in [
+            ContextRequest::List,
+            ContextRequest::Current,
+            ContextRequest::Result(RequestId(7)),
+        ] {
+            state.on_request(Request::Context(read));
+        }
         assert!(wm_rx.try_recv().is_err());
     }
 
     /// R28. With contexts off, or before the reactor published anything,
-    /// every request fails and sends nothing.
+    /// every request but `Result` fails and sends nothing. While contexts
+    /// are off, `Result` still gives the result of a command that the
+    /// server took before they were turned off.
     #[test]
     fn contexts_that_are_off_or_not_loaded_answer_nothing() {
         let off = ContextsSnapshot::off();
@@ -412,14 +452,28 @@ mod tests {
         ] {
             let (response, sent) = answer_context_request(request.clone(), Some(&off));
             assert_eq!(None, sent);
-            assert!(
-                matches!(&response, Response::Error(reason) if reason.starts_with("Contexts are off.")),
-                "{response:?}"
-            );
+            assert_eq!(Response::Error(CONTEXTS_OFF.into()), response);
             let (response, sent) = answer_context_request(request, None);
             assert_eq!(None, sent);
             assert!(matches!(response, Response::Error(_)), "{response:?}");
         }
+        assert!(CONTEXTS_OFF.starts_with("Contexts are off."));
+
+        let turned_off = ContextsSnapshot {
+            results: vec![result(5, Some(CONTEXTS_OFF))],
+            ..ContextsSnapshot::off()
+        };
+        let answer =
+            |request| answer_context_request(ContextRequest::Result(request), Some(&turned_off));
+        assert_eq!(
+            (Response::Error(CONTEXTS_OFF.into()), None),
+            answer(RequestId(5))
+        );
+        assert_eq!((Response::Pending, None), answer(RequestId(6)));
+        assert!(matches!(
+            answer_context_request(ContextRequest::Result(RequestId(5)), None),
+            (Response::Error(_), None)
+        ));
     }
 
     /// The requests of Sugarglider before contexts, as an older client sends
@@ -471,6 +525,9 @@ mod tests {
             run(ContextCommand::CreateContext("Client work".into())),
             run(ContextCommand::CreateContext(ODD_NAME.into())),
             run(ContextCommand::CreateContext(String::new())),
+            run(ContextCommand::AddWindowToContext(name("Client work"))),
+            ContextRequest::Result(RequestId(0)),
+            ContextRequest::Result(RequestId(u64::MAX)),
         ]
     }
 
@@ -493,7 +550,7 @@ mod tests {
         }
         assert_eq!(
             run(switch(name("Id(7)"))),
-            read("Context(Run(switch_context(\"Id(7)\")))")
+            read("Context(Run(7, switch_context(\"Id(7)\")))")
         );
 
         let config = Config::default();
@@ -508,7 +565,7 @@ mod tests {
     }
 
     /// A snapshot with every kind of entry on some screen, a context without
-    /// a number, and names that need escaping.
+    /// a number, names that need escaping, and command results.
     fn snapshot_of_every_kind() -> ContextsSnapshot {
         ContextsSnapshot {
             enabled: true,
@@ -548,6 +605,7 @@ mod tests {
             ],
             unsorted: UnsortedSummary { windows: 4, last_used: 6 },
             everything: EverythingSummary { last_used: 5 },
+            results: vec![result(1, None), result(u64::MAX, Some(ODD_NAME))],
         }
     }
 
@@ -562,6 +620,7 @@ mod tests {
         for response in [
             Response::Pong(ODD_NAME.into()),
             Response::Success,
+            Response::Pending,
             Response::Error(ODD_NAME.into()),
             Response::Contexts(snapshot_of_every_kind()),
             Response::Contexts(snapshot.current()),
@@ -664,13 +723,18 @@ mod tests {
         }
     }
 
-    /// I3. The server reads context requests in RON and replies in RON.
-    /// `List` and `Current` reply from the snapshot, and `Run` sends one
-    /// command. A message it can't read gets an empty reply and sends
-    /// nothing.
+    /// I3, I4. The server reads context requests in RON and replies in RON.
+    /// `List`, `Current`, and `Result` reply from the snapshot, and `Run`
+    /// sends one command. A message it can't read gets an empty reply and
+    /// sends nothing. That includes a `Run` without a request id, as the
+    /// command line before command results sends it.
     #[test]
     fn the_server_answers_context_requests_in_ron() {
-        let (contexts, snapshot) = contexts();
+        let (_, snapshot) = contexts();
+        let snapshot = ContextsSnapshot {
+            results: vec![result(4, Some("No context matches \"x\""))],
+            ..snapshot
+        };
         let published = Arc::new(snapshot.clone());
         let (wm_tx, mut wm_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut state = State {
@@ -689,17 +753,20 @@ mod tests {
             reply(send(b"Context(Current)"))
         );
         assert_eq!(
-            Response::Error("No context has the number 5".into()),
-            reply(send(b"Context(Run(switch_context(5)))"))
-        );
-        assert_eq!(
             Response::Success,
-            reply(send(b"Context(Run(switch_context(\"cli\")))"))
+            reply(send(b"Context(Run(9, switch_context(\"cli\")))"))
+        );
+        assert_eq!(Response::Pending, reply(send(b"Context(Result(9))")));
+        assert_eq!(
+            Response::Error("No context matches \"x\"".into()),
+            reply(send(b"Context(Result(4))"))
         );
         for unreadable in [
             &b"Context(Delete)"[..],
-            b"Context(Run(delete_context(1)))",
-            b"Context(Run(switch_context(300)))",
+            b"Context(Run(switch_context(\"cli\")))",
+            b"Context(Run(9, delete_context(1)))",
+            b"Context(Run(9, switch_context(300)))",
+            b"Context(Result(-1))",
             b"",
             b"\xff\xfe",
         ] {
@@ -707,99 +774,10 @@ mod tests {
         }
 
         let (_, event) = wm_rx.try_recv().unwrap();
-        let wm_controller::WmEvent::Command(wm_controller::WmCommand::ReactorCommand(
-            reactor::Command::Context(command),
-        )) = event
-        else {
+        let wm_controller::WmEvent::ContextCommandRequested(request, command) = event else {
             panic!("{event:?}");
         };
-        assert_eq!(switch(ContextRef::Id(id(&contexts, "Client work"))), command);
+        assert_eq!((RequestId(9), switch(name("cli"))), (request, command));
         assert!(wm_rx.try_recv().is_err());
-    }
-
-    /// Comms (1, active), Client work (2), and Relax (no number), with 2
-    /// unsorted windows, and the id of a deleted context.
-    fn three_contexts() -> (Contexts, ContextsSnapshot, ContextId) {
-        let mut contexts = Contexts::new();
-        let comms = contexts.create("Comms").unwrap();
-        contexts.create("Client work").unwrap();
-        let relax = contexts.create("Relax").unwrap();
-        let gone = contexts.create("Gone").unwrap();
-        contexts.delete(gone).unwrap();
-        contexts.set_number(relax, None).unwrap();
-        contexts.switch_to(ContextKey::Named(comms)).unwrap();
-        let screens = vec![ScreenContext {
-            id: 1,
-            shows: ContextKey::Named(comms),
-        }];
-        let snapshot = ContextsSnapshot::new(&contexts, screens, 2);
-        (contexts, snapshot, gone)
-    }
-
-    /// I3, R4, R29. How the server resolves each form of reference against
-    /// the snapshot, and which names it refuses for a new context. A name
-    /// that matches nothing goes to the reactor as it is, and every other
-    /// failed lookup fails at once.
-    #[test]
-    fn run_resolves_each_form_of_reference_as_this_table_gives() {
-        let (contexts, snapshot, gone) = three_contexts();
-        let comms = switch(ContextRef::Id(id(&contexts, "Comms")));
-        let client = switch(ContextRef::Id(id(&contexts, "Client work")));
-        let relax = switch(ContextRef::Id(id(&contexts, "Relax")));
-        let unsorted = switch(name("Unsorted"));
-        let everything = ContextCommand::ShowEverything;
-        let create = |name: &str| ContextCommand::CreateContext(name.to_string());
-        let no_name = "Give the name or the number of a context";
-        let taken = "A context named \"Comms\" already exists";
-        let table: Vec<(ContextCommand, Result<ContextCommand, &str>)> = vec![
-            (switch(ContextRef::Number(1)), Ok(comms.clone())),
-            (switch(ContextRef::Number(2)), Ok(client.clone())),
-            (switch(ContextRef::Number(3)), Err("No context has the number 3")),
-            (switch(ContextRef::Number(0)), Err("No context has the number 0")),
-            (switch(ContextRef::Number(9)), Err("No context has the number 9")),
-            (switch(ContextRef::Id(id(&contexts, "Relax"))), Ok(relax.clone())),
-            (switch(ContextRef::Id(gone)), Err("No such context")),
-            (switch(name("Comms")), Ok(comms.clone())),
-            (switch(name("  COMMS  ")), Ok(comms.clone())),
-            (switch(name("cómms")), Ok(comms.clone())),
-            (switch(name("Client work")), Ok(client.clone())),
-            (switch(name("cli")), Ok(client.clone())),
-            (switch(name("cw")), Ok(client.clone())),
-            (switch(name("work")), Ok(client.clone())),
-            (switch(name("rlx")), Ok(relax.clone())),
-            (switch(name("Everything")), Ok(everything.clone())),
-            (switch(name("ÉVERYTHING")), Ok(everything.clone())),
-            (switch(name("Unsorted")), Ok(unsorted.clone())),
-            (switch(name("uns")), Ok(unsorted.clone())),
-            (switch(name("Sugarglider")), Ok(switch(name("Sugarglider")))),
-            (switch(name("7")), Ok(switch(name("7")))),
-            (switch(name("--")), Ok(switch(name("--")))),
-            (switch(name("")), Err(no_name)),
-            (switch(name(" \t ")), Err(no_name)),
-            (everything.clone(), Ok(everything.clone())),
-            (
-                ContextCommand::PreviousContext,
-                Ok(ContextCommand::PreviousContext),
-            ),
-            (create("Work"), Ok(create("Work"))),
-            (create(ODD_NAME), Ok(create(ODD_NAME))),
-            (create("comms"), Err(taken)),
-            (create(" Cómms "), Err(taken)),
-            (create("everything"), Err("\"everything\" is a reserved name")),
-            (create(" UNSORTED "), Err("\"UNSORTED\" is a reserved name")),
-            (create(""), Err("A context name can't be empty")),
-            (create(" \t "), Err("A context name can't be empty")),
-        ];
-        for (command, expected) in table {
-            let expected = match expected {
-                Ok(sent) => (Response::Success, Some(sent)),
-                Err(reason) => (Response::Error(reason.to_string()), None),
-            };
-            assert_eq!(
-                expected,
-                answer_context_request(run(command.clone()), Some(&snapshot)),
-                "{command:?}"
-            );
-        }
     }
 }

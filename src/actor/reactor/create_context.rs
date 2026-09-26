@@ -3,33 +3,20 @@
 
 //! Creating a context from the windows on screen.
 
-use tracing::{debug, info, warn};
+use tracing::info;
 
-use super::{ContextCommand, ContextRef, Reactor};
+use super::Reactor;
 use crate::actor::app::{WindowId, pid_t};
-use crate::model::contexts::WindowDesc;
+use crate::model::contexts::{ContextKey, WindowDesc};
 
 impl Reactor {
     /// Creates a context whose members are the windows that show on the
     /// visible Spaces, and switches to it. Its layout starts as the layout
     /// the Spaces show (L3). Pinned windows get no record, because they are
-    /// members of every context already (R3).
-    pub(super) fn create_context(&mut self, name: &str) {
-        if !self.contexts_enabled() {
-            debug!(name, "Ignoring a new context while contexts are off");
-            return;
-        }
-        if self.pending_exit.is_some() {
-            info!(name, "Ignoring a new context while quitting");
-            return;
-        }
-        let id = match self.contexts.create(name) {
-            Ok(id) => id,
-            Err(err) => {
-                warn!(name, "Could not create a context: {err}");
-                return;
-            }
-        };
+    /// members of every context already (R3). The caller checks that
+    /// contexts are on and that Sugarglider isn't quitting.
+    pub(super) fn create_context(&mut self, name: &str) -> Result<(), String> {
+        let id = self.contexts.create(name).map_err(|err| err.to_string())?;
         let members: Vec<WindowDesc> = self
             .windows_on_visible_spaces(|wid| {
                 !self.parked.contains_key(&wid) && !self.contexts.is_pinned(wid)
@@ -42,7 +29,7 @@ impl Reactor {
         }
         info!(name, members = members.len(), "Created a context");
         self.save_contexts();
-        self.handle_context_command(ContextCommand::SwitchContext(ContextRef::Id(id)));
+        self.switch_context(ContextKey::Named(id))
     }
 
     /// The windows on the visible Spaces for which `keep` returns true, in id
@@ -98,6 +85,7 @@ pub(super) mod tests {
     use super::super::testing::*;
     use super::super::{Command, ContextCommand, ContextRef, Event, Reactor, ReactorCommand};
     use crate::actor::app::WindowId;
+    use crate::actor::contexts_snapshot::{ContextsSnapshot, RequestId};
     use crate::actor::contexts_store::{ContextsStore, Loaded};
     use crate::actor::layout::{LayoutCommand, LayoutEvent, LayoutManager};
     use crate::actor::parked_journal::ParkedJournal;
@@ -356,33 +344,68 @@ pub(super) mod tests {
         assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
     }
 
-    /// M5c, I3. `sugarglider context create "Client work"` followed at once
-    /// by `sugarglider context switch "Client work"`. The server answers
-    /// both from a snapshot that doesn't have the new context yet, so it
-    /// sends the name as it is, and the reactor resolves it to the new
-    /// context.
+    /// Sends `command` to the message server as `sugarglider context` does,
+    /// with request id `request`, while the server has the snapshot
+    /// `published`. Returns the server's reply and what it sends on.
+    pub fn send_to_server(
+        published: &ContextsSnapshot,
+        request: u64,
+        command: ContextCommand,
+    ) -> (Response, Option<(RequestId, ContextCommand)>) {
+        let request = ContextRequest::Run(RequestId(request), command);
+        answer_context_request(request, Some(published))
+    }
+
+    /// Runs what the server sent on, as the window manager passes it to the
+    /// reactor, and lets the apps answer.
+    pub fn run_sent(s: &mut Setup, sent: Option<(RequestId, ContextCommand)>) {
+        let (request, command) = sent.expect("the server sends the command");
+        s.reactor.handle_event(Event::ContextCommandRequested(request, command));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+    }
+
+    /// The server's reply when the command line asks for the result of
+    /// `request`, from the snapshot the reactor published last.
+    pub fn result_of(s: &Setup, request: u64) -> Response {
+        let snapshot = s.reactor.published_contexts.as_deref();
+        answer_context_request(ContextRequest::Result(RequestId(request)), snapshot).0
+    }
+
+    /// M5c, I3. `sugarglider context create Work` followed at once by
+    /// `sugarglider context switch Work`, while "Workshop" exists. The server
+    /// answers both from a snapshot that doesn't have Work yet, where "Work"
+    /// starts Workshop's name. It sends both commands as they were written,
+    /// and the reactor resolves the name after it has created Work.
     #[test]
     fn a_switch_right_after_a_create_goes_to_the_new_context() {
         let mut s = Setup::new(2);
-        s.create("Comms");
+        s.create("Workshop");
         s.run(ContextCommand::ShowEverything);
         let stale = s.reactor.published_contexts.clone().unwrap();
-        let answer = |command| answer_context_request(ContextRequest::Run(command), Some(&stale));
-        let by_name = ContextCommand::SwitchContext(ContextRef::Name("Client work".into()));
+        let by_name = ContextCommand::SwitchContext(ContextRef::Name("Work".into()));
 
-        let (reply, create) = answer(ContextCommand::CreateContext("Client work".into()));
+        let (reply, create) =
+            send_to_server(&stale, 1, ContextCommand::CreateContext("Work".into()));
         assert_eq!(Response::Success, reply);
-        let (reply, switch) = answer(by_name.clone());
-        assert_eq!((Response::Success, Some(by_name)), (reply, switch.clone()));
+        let (reply, switch) = send_to_server(&stale, 2, by_name.clone());
+        assert_eq!(
+            (Response::Success, Some((RequestId(2), by_name))),
+            (reply, switch.clone())
+        );
+        assert_eq!(Response::Pending, result_of(&s, 1));
 
-        s.run(create.unwrap());
-        let client = ContextKey::Named(s.id("Client work"));
-        let created = s.reactor.contexts.last_used(client);
-        s.run(switch.unwrap());
+        run_sent(&mut s, create);
+        let work = ContextKey::Named(s.id("Work"));
+        let created = s.reactor.contexts.last_used(work);
+        run_sent(&mut s, switch);
 
-        assert_eq!(client, s.reactor.contexts.active());
-        assert_eq!(created + 1, s.reactor.contexts.last_used(client));
-        assert_eq!(vec![wid(1), wid(2)], s.members("Client work"));
+        assert_eq!(work, s.reactor.contexts.active());
+        assert_eq!(created + 1, s.reactor.contexts.last_used(work));
+        assert_eq!(vec![wid(1), wid(2)], s.members("Work"));
+        assert_eq!(
+            (Response::Success, Response::Success),
+            (result_of(&s, 1), result_of(&s, 2))
+        );
     }
 
     /// The command survives the RON round trip that recordings use.
@@ -435,12 +458,6 @@ pub(super) mod tests {
         }
         s.reactor.handle_events(events);
         s.apps.simulate_until_quiet(&mut s.reactor);
-    }
-
-    /// Sends the command as the message server does, and lets the apps
-    /// answer.
-    fn run_sent(s: &mut Setup, sent: Option<ContextCommand>) {
-        s.run(sent.expect("the server sends the command"));
     }
 
     /// M5c, L7. A window the user floats and a window that floats by default
@@ -683,20 +700,22 @@ pub(super) mod tests {
     }
 
     /// M5c, I3. The switch after a create names the new context in another
-    /// case and with an accent. The stale snapshot matches it to nothing,
-    /// so the reactor resolves it.
+    /// case and with an accent. The reactor resolves it when it runs it.
     #[test]
     fn a_switch_right_after_a_create_finds_the_new_context_in_another_spelling() {
         let mut s = Setup::new(2);
         s.create("Comms");
         s.run(ContextCommand::ShowEverything);
         let stale = s.reactor.published_contexts.clone().unwrap();
-        let answer = |command| answer_context_request(ContextRequest::Run(command), Some(&stale));
         let by_name = ContextCommand::SwitchContext(ContextRef::Name("CLIENT WÖRK".into()));
 
-        let (_, create) = answer(ContextCommand::CreateContext("Client work".into()));
-        let (reply, switch) = answer(by_name.clone());
-        assert_eq!((Response::Success, Some(by_name)), (reply, switch.clone()));
+        let (_, create) =
+            send_to_server(&stale, 1, ContextCommand::CreateContext("Client work".into()));
+        let (reply, switch) = send_to_server(&stale, 2, by_name.clone());
+        assert_eq!(
+            (Response::Success, Some((RequestId(2), by_name))),
+            (reply, switch.clone())
+        );
         run_sent(&mut s, create);
         s.run(ContextCommand::ShowEverything);
         run_sent(&mut s, switch);
@@ -705,64 +724,56 @@ pub(super) mod tests {
             ContextKey::Named(s.id("Client work")),
             s.reactor.contexts.active()
         );
+        assert_eq!(Response::Success, result_of(&s, 2));
     }
 
-    /// I3. Only names go to the reactor unresolved. A number that the stale
-    /// snapshot doesn't have fails at once and sends nothing. Once the
-    /// reactor has published the new context, its number resolves to it.
+    /// I3. The server sends a number as it was written too, so a number that
+    /// the stale snapshot doesn't have names the new context once the
+    /// reactor has created it.
     #[test]
-    fn a_number_right_after_a_create_fails_until_the_snapshot_has_the_context() {
+    fn a_number_right_after_a_create_names_the_new_context() {
         let mut s = Setup::new(2);
         s.create("Comms");
         let stale = s.reactor.published_contexts.clone().unwrap();
         let number = ContextCommand::SwitchContext(ContextRef::Number(2));
 
-        let (_, create) = answer_context_request(
-            ContextRequest::Run(ContextCommand::CreateContext("Client work".into())),
-            Some(&stale),
-        );
+        let (_, create) =
+            send_to_server(&stale, 1, ContextCommand::CreateContext("Client work".into()));
+        let (reply, switch) = send_to_server(&stale, 2, number.clone());
         assert_eq!(
-            (Response::Error("No context has the number 2".into()), None),
-            answer_context_request(ContextRequest::Run(number.clone()), Some(&stale))
+            (Response::Success, Some((RequestId(2), number))),
+            (reply, switch.clone())
         );
         run_sent(&mut s, create);
         s.run(ContextCommand::SwitchContext(ContextRef::Name("Comms".into())));
-
-        let fresh = s.reactor.published_contexts.clone().unwrap();
-        let (reply, switch) = answer_context_request(ContextRequest::Run(number), Some(&fresh));
-        let client = s.id("Client work");
-        assert_eq!(
-            (
-                Response::Success,
-                Some(ContextCommand::SwitchContext(ContextRef::Id(client)))
-            ),
-            (reply, switch.clone())
-        );
         run_sent(&mut s, switch);
+
+        let client = s.id("Client work");
+        assert_eq!(Some(2), s.reactor.contexts.get(client).unwrap().number);
         assert_eq!(ContextKey::Named(client), s.reactor.contexts.active());
+        assert_eq!(Response::Success, result_of(&s, 2));
     }
 
-    /// I3. The server sends a switch by name with the id it resolved, so
-    /// renaming contexts before the reactor runs it can't send it to
-    /// another context.
+    /// The reactor resolves a name when it runs the command, so a switch by
+    /// name goes to the context that has the name then, also after a
+    /// rename that came between the request and the switch.
     #[test]
-    fn a_rename_before_the_switch_runs_cannot_redirect_it() {
+    fn a_switch_by_name_goes_to_the_context_that_has_the_name_when_it_runs() {
         let mut s = Setup::new(2);
         s.create("Client work");
         s.create("Comms");
         let snapshot = s.reactor.published_contexts.clone().unwrap();
-        let (_, switch) = answer_context_request(
-            ContextRequest::Run(ContextCommand::SwitchContext(ContextRef::Name("cli".into()))),
-            Some(&snapshot),
-        );
+        let by_name = ContextCommand::SwitchContext(ContextRef::Name("cli".into()));
+        let (_, switch) = send_to_server(&snapshot, 1, by_name);
         let client = s.id("Client work");
         let comms = s.id("Comms");
 
         s.reactor.contexts.rename(client, "Old clients").unwrap();
         s.reactor.contexts.rename(comms, "Client work").unwrap();
+        s.run(ContextCommand::SwitchContext(ContextRef::Id(client)));
         run_sent(&mut s, switch);
 
-        assert_eq!(ContextKey::Named(client), s.reactor.contexts.active());
+        assert_eq!(ContextKey::Named(comms), s.reactor.contexts.active());
     }
 
     /// M5c, I3. `sugarglider context create Work` followed at once by
@@ -770,18 +781,20 @@ pub(super) mod tests {
     /// stale snapshot doesn't have Work, and "Work" starts a word of "Client
     /// work".
     #[test]
-    #[ignore = "bug: a switch right after a create goes to an older context that the new name matches in the stale snapshot"]
     fn a_switch_right_after_a_create_goes_to_the_new_context_when_its_name_matches_another() {
         let mut s = Setup::new(2);
         s.create("Client work");
         s.run(ContextCommand::ShowEverything);
         let stale = s.reactor.published_contexts.clone().unwrap();
-        let answer = |command| answer_context_request(ContextRequest::Run(command), Some(&stale));
 
-        let (reply, create) = answer(ContextCommand::CreateContext("Work".into()));
+        let (reply, create) =
+            send_to_server(&stale, 1, ContextCommand::CreateContext("Work".into()));
         assert_eq!(Response::Success, reply);
-        let (reply, switch) =
-            answer(ContextCommand::SwitchContext(ContextRef::Name("Work".into())));
+        let (reply, switch) = send_to_server(
+            &stale,
+            2,
+            ContextCommand::SwitchContext(ContextRef::Name("Work".into())),
+        );
         assert_eq!(Response::Success, reply);
         run_sent(&mut s, create);
         let work = ContextKey::Named(s.id("Work"));
@@ -789,5 +802,6 @@ pub(super) mod tests {
         run_sent(&mut s, switch);
 
         assert_eq!(work, s.reactor.contexts.active());
+        assert_eq!(Response::Success, result_of(&s, 2));
     }
 }

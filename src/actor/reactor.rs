@@ -23,7 +23,7 @@ mod restore_snapshots;
 #[cfg(test)]
 mod testing;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -44,7 +44,7 @@ use tracing::{Span, debug, error, info, instrument, trace, warn};
 
 use super::mouse;
 use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, pid_t};
-use crate::actor::contexts_snapshot::ContextsSnapshot;
+use crate::actor::contexts_snapshot::{CommandResult, ContextsSnapshot, RequestId};
 use crate::actor::contexts_store::{self, ContextsStore};
 use crate::actor::layout::{
     self, DragUpdate, DropAction, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo,
@@ -236,6 +236,9 @@ pub enum Event {
     },
 
     Command(Command),
+    /// A context command from the command line. The reactor publishes its
+    /// result in the contexts snapshot under the request's id.
+    ContextCommandRequested(RequestId, ContextCommand),
     ConfigChanged(Arc<Config>),
 }
 
@@ -435,6 +438,9 @@ pub struct Reactor {
     layout_file: Option<PathBuf>,
     /// Ends the process with an exit code.
     exit: Box<dyn FnMut(i32) + Send>,
+    /// The results of the last context commands from the command line,
+    /// oldest first, which the contexts snapshot carries.
+    command_results: VecDeque<CommandResult>,
     /// The snapshot of the contexts published last.
     published_contexts: Option<Arc<ContextsSnapshot>>,
     /// Where snapshots of the contexts go.
@@ -676,6 +682,7 @@ impl Reactor {
             added_since_switch: HashSet::default(),
             layout_file: None,
             exit: Box::new(|code| info!(code, "Not quitting a reactor that has no exit")),
+            command_results: VecDeque::new(),
             published_contexts: None,
             publish_contexts: Box::new(|_| {}),
         }
@@ -1523,6 +1530,14 @@ impl Reactor {
             Event::Command(Command::Context(cmd)) => {
                 info!(?cmd);
                 self.handle_context_command(cmd);
+            }
+            Event::ContextCommandRequested(request, cmd) => {
+                info!(?request, ?cmd);
+                let result = self.run_context_command(cmd);
+                if let Err(reason) = &result {
+                    info!(?request, "The context command did nothing: {reason}");
+                }
+                self.record_command_result(request, result.err());
             }
             Event::Command(Command::Reactor(ReactorCommand::Debug)) => {
                 for screen in &self.screens {

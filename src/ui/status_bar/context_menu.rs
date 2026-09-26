@@ -939,12 +939,11 @@ mod tests {
 
     /// R4. New Context from Current Windows… names the context "Context
     /// <n>" from one more than the number of contexts, and skips each name
-    /// that a context has in another case or with accents. The name check
-    /// of the command line takes the name it gives, and refuses the names it
-    /// skips. Pins the commit's naming, which no rule states.
+    /// that a context has in another case or with accents. The model's name
+    /// check takes the name it gives, and refuses the names it skips. Pins
+    /// the commit's naming, which no rule states.
     #[test]
     fn new_context_names_skip_case_and_accent_variants() {
-        let create = |name: &str| ContextCommand::CreateContext(name.to_string());
         for (names, skipped, expected) in [
             (&[][..], &[][..], "Context 1"),
             (&["Comms", "Relax"][..], &[][..], "Context 3"),
@@ -975,13 +974,9 @@ mod tests {
                 .collect();
             let expected_action = MenuAction::NewContext(expected.to_string());
             assert_eq!(vec![&expected_action], offered, "{names:?}");
-            assert_eq!(
-                Ok(create(expected)),
-                snapshot.resolve_command(create(expected)),
-                "{names:?}"
-            );
+            assert!(contexts.clone().create(expected).is_ok(), "{names:?}");
             for name in skipped {
-                assert!(snapshot.resolve_command(create(name)).is_err(), "{name}");
+                assert!(contexts.clone().create(name).is_err(), "{name}");
             }
         }
 

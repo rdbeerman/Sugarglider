@@ -96,6 +96,7 @@ impl MainWindowTracker {
             | Event::LeftMouseDown(..)
             | Event::LeftMouseDragged(_)
             | Event::Command(..)
+            | Event::ContextCommandRequested(..)
             | Event::ConfigChanged(_)
             | Event::WindowsOnScreenUpdated { .. } => return None,
         };
