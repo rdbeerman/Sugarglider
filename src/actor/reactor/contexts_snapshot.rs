@@ -67,6 +67,7 @@ impl Reactor {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use objc2_core_foundation::CGPoint;
     use pretty_assertions::assert_eq;
     use test_log::test;
 
@@ -478,6 +479,30 @@ mod tests {
         s.run(ContextCommand::PreviousContext);
         assert_eq!(3, count(&published));
         assert_eq!(ContextKey::Everything, last(&published).active);
+    }
+
+    /// Pointer moves, drags, and scrolls come many times a second and change
+    /// nothing that the snapshot holds, so the reactor builds no snapshot
+    /// for them. The next other event publishes what changed meanwhile.
+    #[test]
+    fn pointer_and_scroll_events_build_no_snapshot() {
+        let mut s = Setup::new(2);
+        let published = capture(&mut s.reactor);
+        s.reactor.contexts.create("Direct").unwrap();
+
+        s.reactor
+            .handle_event(Event::MouseMovedOverWindow(WindowServerId::new(1), None));
+        s.reactor.handle_event(Event::LeftMouseDragged(CGPoint::new(10., 10.)));
+        s.reactor.handle_event(Event::ScrollWheel {
+            delta_x: 0.,
+            delta_y: 1.,
+            alt_held: true,
+        });
+        assert_eq!(0, count(&published));
+
+        s.reactor.handle_event(Event::MouseUp);
+        assert_eq!(1, count(&published));
+        assert_eq!("Direct", last(&published).contexts[0].name);
     }
 
     /// R16, R19. Switching to the active context again is a use of it, so

@@ -766,9 +766,19 @@ impl Reactor {
     }
 
     fn handle_event(&mut self, event: Event) {
+        // These come many times a second and change nothing that the
+        // contexts snapshot holds, so no snapshot is built for them.
+        let pointer = matches!(
+            event,
+            Event::MouseMovedOverWindow(..)
+                | Event::LeftMouseDragged(_)
+                | Event::ScrollWheel { .. }
+        );
         self.on_event(event);
         self.exit_if_windows_are_back();
-        self.publish_contexts_snapshot();
+        if !pointer {
+            self.publish_contexts_snapshot();
+        }
     }
 
     fn on_event(&mut self, event: Event) {
