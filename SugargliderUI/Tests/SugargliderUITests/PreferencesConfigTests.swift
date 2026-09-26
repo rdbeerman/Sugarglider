@@ -34,13 +34,14 @@ final class PreferencesConfigTests: XCTestCase {
     ],
     hotkeys: [
       HotkeyBinding(
-        key: "⌥Z", commandId: "toggle_global_enabled", description: "Toggle tiling globally",
+        key: "⌥Z", command: #""toggle_global_enabled""#, description: "Toggle tiling globally",
         category: "System", defaultKey: "⌥Z"),
       HotkeyBinding(
-        key: "⌃⌥⇧H", commandId: "move_focus_left", description: "Focus left",
+        key: "⌃⌥⇧H", command: #"{"move_focus":"left"}"#, description: "Focus left",
         category: "Focus", defaultKey: "⌃⌥⇧←"),
       HotkeyBinding(
-        key: "⌥T", commandId: "exec", description: "Execute command", category: "Utilities"),
+        key: "⌥T", command: #"{"exec":"open -a Terminal"}"#, description: "Execute command",
+        category: "Utilities"),
     ]
   )
 
@@ -66,7 +67,7 @@ final class PreferencesConfigTests: XCTestCase {
         "dragDropEnable": true, "dragDropLivePreview": true, "defaultLayoutKind": "tree",
         "contextsEnable": true, "windowRules": [],
         "hotkeys": [
-          { "key": "⌥Z", "commandId": "toggle_global_enabled",
+          { "key": "⌥Z", "command": "\\"toggle_global_enabled\\"",
             "description": "Toggle tiling globally", "category": "System",
             "defaultKey": "⌥Z", "sortOrder": 0 }
         ]
@@ -76,7 +77,20 @@ final class PreferencesConfigTests: XCTestCase {
     let config = try JSONDecoder().decode(PreferencesConfig.self, from: Data(json.utf8))
 
     XCTAssertTrue(config.contextsEnable)
-    XCTAssertEqual(config.hotkeys.map(\.commandId), ["toggle_global_enabled"])
+    XCTAssertEqual(config.hotkeys.map(\.command), [#""toggle_global_enabled""#])
     XCTAssertFalse(PreferencesConfig().contextsEnable)
+  }
+
+  /// Each decoded binding is its own row, even when two are alike.
+  func testDecodedBindingsHaveTheirOwnIdentity() throws {
+    let binding = """
+      { "key": "⌥Q", "command": "{\\"exec\\":\\"open -a Terminal\\"}",
+        "description": "Execute command", "category": "Utilities" }
+      """
+    let hotkeys = try JSONDecoder().decode(
+      [HotkeyBinding].self, from: Data("[\(binding), \(binding)]".utf8))
+
+    XCTAssertEqual(hotkeys.count, 2)
+    XCTAssertNotEqual(hotkeys[0].id, hotkeys[1].id)
   }
 }

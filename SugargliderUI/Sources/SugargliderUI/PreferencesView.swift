@@ -209,7 +209,7 @@ struct LayoutPane: View {
 
 struct HotkeysPane: View {
     @ObservedObject var viewModel: PreferencesViewModel
-    @State private var recordingCommandId: String? = nil
+    @State private var recordingBindingId: HotkeyBinding.ID? = nil
 
     var body: some View {
         ScrollView {
@@ -224,12 +224,12 @@ struct HotkeysPane: View {
                         HotkeySection(
                             category: group.category,
                             bindings: group.bindings,
-                            recordingCommandId: $recordingCommandId,
-                            onHotkeyChange: { commandId, newKey in
-                                viewModel.updateHotkey(commandId: commandId, newKey: newKey)
+                            recordingBindingId: $recordingBindingId,
+                            onHotkeyChange: { id, newKey in
+                                viewModel.updateHotkey(id: id, newKey: newKey)
                             },
-                            onResetHotkey: { commandId in
-                                viewModel.resetHotkeyToDefault(commandId: commandId)
+                            onResetHotkey: { id in
+                                viewModel.resetHotkeyToDefault(id: id)
                             }
                         )
                     }
@@ -243,9 +243,9 @@ struct HotkeysPane: View {
 struct HotkeySection: View {
     let category: String
     let bindings: [HotkeyBinding]
-    @Binding var recordingCommandId: String?
-    let onHotkeyChange: (String, String) -> Void
-    let onResetHotkey: (String) -> Void
+    @Binding var recordingBindingId: HotkeyBinding.ID?
+    let onHotkeyChange: (HotkeyBinding.ID, String) -> Void
+    let onResetHotkey: (HotkeyBinding.ID) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -257,19 +257,19 @@ struct HotkeySection: View {
                 ForEach(Array(bindings.enumerated()), id: \.element.id) { index, binding in
                     HotkeyRow(
                         binding: binding,
-                        isRecording: recordingCommandId == binding.commandId,
+                        isRecording: recordingBindingId == binding.id,
                         onStartRecording: {
-                            recordingCommandId = binding.commandId
+                            recordingBindingId = binding.id
                         },
                         onStopRecording: {
-                            recordingCommandId = nil
+                            recordingBindingId = nil
                         },
                         onHotkeyChange: { newKey in
-                            onHotkeyChange(binding.commandId, newKey)
-                            recordingCommandId = nil
+                            onHotkeyChange(binding.id, newKey)
+                            recordingBindingId = nil
                         },
                         onReset: {
-                            onResetHotkey(binding.commandId)
+                            onResetHotkey(binding.id)
                         }
                     )
                     if index < bindings.count - 1 {

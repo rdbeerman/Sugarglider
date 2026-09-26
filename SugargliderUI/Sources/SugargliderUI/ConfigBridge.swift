@@ -63,13 +63,15 @@ public struct PreferencesConfig: Codable {
 
 /// Hotkey binding from the configuration.
 public struct HotkeyBinding: Codable, Identifiable, Equatable {
-    public var id: String { "\(key)-\(commandId)" }
+    /// Identifies the binding while the Preferences window is open. Two
+    /// bindings can have the same command, key, and description.
+    public var id = UUID()
 
     /// The formatted hotkey string (e.g., "⌥H")
     public var key: String
 
-    /// The command identifier for internal use
-    public var commandId: String
+    /// The bound command, as Rust encodes it. Sent back unchanged.
+    public var command: String
 
     /// Human-readable description of what the command does
     public var description: String
@@ -86,12 +88,20 @@ public struct HotkeyBinding: Codable, Identifiable, Equatable {
         return key != defaultKey
     }
 
-    public init(key: String, commandId: String, description: String, category: String, defaultKey: String? = nil) {
+    public init(key: String, command: String, description: String, category: String, defaultKey: String? = nil) {
         self.key = key
-        self.commandId = commandId
+        self.command = command
         self.description = description
         self.category = category
         self.defaultKey = defaultKey
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case key
+        case command
+        case description
+        case category
+        case defaultKey
     }
 }
 

@@ -8,21 +8,21 @@
   "hotkeys": [
     {
       "category": "System",
-      "commandId": "toggle_global_enabled",
+      "command": "\"toggle_global_enabled\"",
       "defaultKey": "⌥Z",
       "description": "Toggle tiling globally",
       "key": "⌥Z"
     },
     {
       "category": "Focus",
-      "commandId": "move_focus_left",
+      "command": "{\"move_focus\":\"left\"}",
       "defaultKey": "⌃⌥⇧←",
       "description": "Focus left",
       "key": "⌃⌥⇧H"
     },
     {
       "category": "Utilities",
-      "commandId": "exec",
+      "command": "{\"exec\":\"open -a Terminal\"}",
       "description": "Execute command",
       "key": "⌥T"
     }

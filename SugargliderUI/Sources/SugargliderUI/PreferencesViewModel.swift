@@ -102,8 +102,8 @@ public class PreferencesViewModel: ObservableObject {
     }
 
     /// Update a hotkey binding and save to config
-    public func updateHotkey(commandId: String, newKey: String) {
-        guard let index = hotkeys.firstIndex(where: { $0.commandId == commandId }) else {
+    public func updateHotkey(id: HotkeyBinding.ID, newKey: String) {
+        guard let index = hotkeys.firstIndex(where: { $0.id == id }) else {
             return
         }
 
@@ -115,8 +115,8 @@ public class PreferencesViewModel: ObservableObject {
     }
 
     /// Reset a hotkey to its default value
-    public func resetHotkeyToDefault(commandId: String) {
-        guard let index = hotkeys.firstIndex(where: { $0.commandId == commandId }),
+    public func resetHotkeyToDefault(id: HotkeyBinding.ID) {
+        guard let index = hotkeys.firstIndex(where: { $0.id == id }),
               let defaultKey = hotkeys[index].defaultKey else {
             return
         }

@@ -49,6 +49,48 @@ final class PreferencesViewModelTests: XCTestCase {
     XCTAssertNil(model.lastError)
   }
 
+  /// Two bindings of the same kind of command, with the same description,
+  /// stay apart: a change to one leaves the other alone, and each keeps its
+  /// command.
+  func testChangesOnlyTheBindingItIsGiven() throws {
+    let terminal = HotkeyBinding(
+      key: "⌥Q", command: #"{"exec":"open -a Terminal"}"#, description: "Execute command",
+      category: "Utilities")
+    let safari = HotkeyBinding(
+      key: "⌥W", command: #"{"exec":"open -a Safari"}"#, description: "Execute command",
+      category: "Utilities")
+    let backend = FakePreferencesBackend(PreferencesConfig(hotkeys: [terminal, safari]))
+    let model = PreferencesViewModel(backend: backend)
+    let second = try XCTUnwrap(model.hotkeys.last)
+
+    model.updateHotkey(id: second.id, newKey: "⌥E")
+
+    let saved = try XCTUnwrap(backend.saved.last)
+    XCTAssertEqual(saved.hotkeys.map(\.key), ["⌥Q", "⌥E"])
+    XCTAssertEqual(saved.hotkeys.map(\.command), [terminal.command, safari.command])
+    XCTAssertEqual(backend.updated.last?.hotkeys.map(\.key), ["⌥Q", "⌥E"])
+  }
+
+  /// Resetting a binding resets only that binding.
+  func testResetsOnlyTheBindingItIsGiven() throws {
+    let bindings = [5, 10].map { percent in
+      HotkeyBinding(
+        key: "⌃⌥⇧\(percent == 5 ? "H" : "J")",
+        command: #"{"resize":{"direction":"left","percent":\#(percent).0}}"#,
+        description: "Resize left by \(percent)%", category: "Resize",
+        defaultKey: percent == 5 ? "⌃⌥H" : nil)
+    }
+    let backend = FakePreferencesBackend(PreferencesConfig(hotkeys: bindings))
+    let model = PreferencesViewModel(backend: backend)
+    let first = try XCTUnwrap(model.hotkeys.first)
+
+    model.resetHotkeyToDefault(id: first.id)
+
+    let saved = try XCTUnwrap(backend.saved.last)
+    XCTAssertEqual(saved.hotkeys.map(\.key), ["⌃⌥H", "⌃⌥⇧J"])
+    XCTAssertEqual(saved.hotkeys.map(\.command), bindings.map(\.command))
+  }
+
   /// Rust refuses to save over a config file with an error. The window's
   /// banner shows `lastError`: Rust's message once, without a second
   /// "Failed to save config", until a save succeeds.

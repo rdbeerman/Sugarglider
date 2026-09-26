@@ -566,6 +566,8 @@ fn write_preferences_to_path(
     use annotate_snippets::Renderer;
     use toml_edit::{DocumentMut, value};
 
+    use crate::ui::preferences_json::command_json;
+
     let existing = match fs::read_to_string(path) {
         Ok(existing) => existing,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -579,7 +581,7 @@ fn write_preferences_to_path(
     };
     // toml_edit reads TOML 1.0 and the config reader TOML 1.1, so a file can
     // pass one and fail the other.
-    let current_config = Config::parse(&existing)
+    Config::parse(&existing)
         .map_err(|e| has_error(format_toml_error(e, &existing, path, Renderer::plain())))?;
     let mut doc = existing
         .parse::<DocumentMut>()
@@ -652,65 +654,10 @@ fn write_preferences_to_path(
     }
 
     // Update [keys] section
-    // We need to convert macOS symbol format back to TOML format
     if !prefs.hotkeys.is_empty() {
-        // Build a new keys table
         let mut keys_table = toml_edit::Table::new();
-
-        // Build command serializations from BOTH default config AND current loaded config.
-        // This ensures we have serializations for all standard commands (from defaults)
-        // plus any custom commands like `exec` (from the loaded config).
-        let default_config = Config::default();
-
-        let mut command_serializations: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-
-        // Add all commands from the default config first
-        for (_hotkey, cmd) in &default_config.keys {
-            let (_, _, command_id) = crate::ui::preferences_json::describe_command_for_toml(cmd);
-            if let Ok(serialized) = serde_json::to_string(cmd) {
-                command_serializations.insert(command_id, serialized);
-            }
-        }
-
-        // Override/extend with commands from the current config (for custom exec commands, etc.)
-        for (_hotkey, cmd) in &current_config.keys {
-            let (_, _, command_id) = crate::ui::preferences_json::describe_command_for_toml(cmd);
-            if let Ok(serialized) = serde_json::to_string(cmd) {
-                command_serializations.insert(command_id, serialized);
-            }
-        }
-
-        for hk in &prefs.hotkeys {
-            // Convert macOS symbol format to TOML key format
-            let toml_key = macos_symbols_to_toml_key(&hk.key);
-
-            // Validate that the hotkey can actually be parsed before writing.
-            // This prevents writing invalid keys that will fail to load on restart.
-            if Hotkey::from_str(&toml_key).is_err() {
-                tracing::warn!(
-                    "Skipping invalid hotkey format for {}: '{}' (converted from '{}')",
-                    hk.command_id,
-                    toml_key,
-                    hk.key
-                );
-                continue;
-            }
-
-            // Get the command serialization for this command_id
-            if let Some(cmd_json) = command_serializations.get(&hk.command_id) {
-                // Parse the command JSON and convert to TOML value
-                if let Ok(cmd_value) = serde_json::from_str::<serde_json::Value>(cmd_json) {
-                    let toml_value = json_to_toml_value(&cmd_value);
-                    keys_table[&toml_key] = toml_value;
-                }
-            } else {
-                tracing::warn!(
-                    "Unknown command_id '{}' for hotkey '{}', skipping",
-                    hk.command_id,
-                    hk.key
-                );
-            }
+        for (hotkey, cmd) in prefs.bindings() {
+            keys_table[&hotkey.to_string()] = json_to_toml_value(&command_json(&cmd));
         }
 
         if !keys_table.is_empty() {
@@ -729,65 +676,6 @@ fn write_preferences_to_path(
     tmp.persist(path)?;
 
     Ok(())
-}
-
-/// Convert macOS symbol hotkey format (⌥⇧H) to TOML key format (Alt + Shift + KeyH).
-fn macos_symbols_to_toml_key(s: &str) -> String {
-    let mut modifiers = Vec::new();
-    let mut key_part = String::new();
-
-    for c in s.chars() {
-        match c {
-            '⌃' => modifiers.push("Ctrl"),
-            '⌥' => modifiers.push("Alt"),
-            '⇧' => modifiers.push("Shift"),
-            '⌘' => modifiers.push("Cmd"),
-            _ => key_part.push(c),
-        }
-    }
-
-    // Convert special key symbols back to names that livesplit_hotkey understands
-    let key_name: String = match key_part.as_str() {
-        "←" => "ArrowLeft".to_string(),
-        "→" => "ArrowRight".to_string(),
-        "↑" => "ArrowUp".to_string(),
-        "↓" => "ArrowDown".to_string(),
-        "⌫" => "Backspace".to_string(),
-        "↩" => "Return".to_string(),
-        "⇥" => "Tab".to_string(),
-        "\\" => "Backslash".to_string(),
-        "/" => "Slash".to_string(),
-        "=" => "Equal".to_string(),
-        "-" => "Minus".to_string(),
-        "[" => "BracketLeft".to_string(),
-        "]" => "BracketRight".to_string(),
-        "'" => "Quote".to_string(),
-        ";" => "Semicolon".to_string(),
-        "," => "Comma".to_string(),
-        "." => "Period".to_string(),
-        "`" => "Backquote".to_string(),
-        "Space" => "Space".to_string(),
-        "Esc" => "Escape".to_string(),
-        other => {
-            // Single letters need "Key" prefix, single digits need "Digit" prefix
-            if other.len() == 1 {
-                let c = other.chars().next().unwrap();
-                if c.is_ascii_alphabetic() {
-                    format!("Key{}", c.to_ascii_uppercase())
-                } else if c.is_ascii_digit() {
-                    format!("Digit{}", c)
-                } else {
-                    other.to_string()
-                }
-            } else {
-                other.to_string()
-            }
-        }
-    };
-
-    let mut parts: Vec<String> = modifiers.iter().map(|s| s.to_string()).collect();
-    parts.push(key_name);
-    parts.join(" + ")
 }
 
 /// Convert a JSON value to a TOML value.
@@ -835,7 +723,7 @@ mod tests {
     use crate::actor::reactor::Command as ReactorCommand;
     use crate::actor::wm_controller::{ExecCmd, WmCmd};
     use crate::model::Direction;
-    use crate::ui::preferences_json::PreferencesJson;
+    use crate::ui::preferences_json::{PreferencesJson, command_json};
 
     /// The JSON that `ConfigBridge` in `SugargliderUI` sends to
     /// `sugarglider_update_config` and `sugarglider_save_config_to_file`.
@@ -1417,68 +1305,6 @@ mod tests {
     }
 
     #[test]
-    fn macos_symbols_to_toml_key_converts_letters() {
-        // Single letters should be converted to "Key" + uppercase
-        assert_eq!(macos_symbols_to_toml_key("⌥H"), "Alt + KeyH");
-        assert_eq!(macos_symbols_to_toml_key("⌥⇧J"), "Alt + Shift + KeyJ");
-        assert_eq!(macos_symbols_to_toml_key("⌃⌥K"), "Ctrl + Alt + KeyK");
-
-        // Converted keys should be parseable
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥H")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥⇧J")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌃⌥K")).is_ok());
-    }
-
-    #[test]
-    fn macos_symbols_to_toml_key_converts_digits() {
-        assert_eq!(macos_symbols_to_toml_key("⌥1"), "Alt + Digit1");
-        assert_eq!(macos_symbols_to_toml_key("⌥⇧0"), "Alt + Shift + Digit0");
-
-        // Converted keys should be parseable
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥1")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥⇧0")).is_ok());
-    }
-
-    #[test]
-    fn macos_symbols_to_toml_key_converts_arrows() {
-        assert_eq!(macos_symbols_to_toml_key("⌥←"), "Alt + ArrowLeft");
-        assert_eq!(macos_symbols_to_toml_key("⌥→"), "Alt + ArrowRight");
-        assert_eq!(macos_symbols_to_toml_key("⌥↑"), "Alt + ArrowUp");
-        assert_eq!(macos_symbols_to_toml_key("⌥↓"), "Alt + ArrowDown");
-
-        // All should be parseable
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥←")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥→")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥↑")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥↓")).is_ok());
-    }
-
-    #[test]
-    fn macos_symbols_to_toml_key_converts_special_keys() {
-        assert_eq!(macos_symbols_to_toml_key("⌥\\"), "Alt + Backslash");
-        assert_eq!(macos_symbols_to_toml_key("⌥/"), "Alt + Slash");
-        assert_eq!(macos_symbols_to_toml_key("⌥="), "Alt + Equal");
-        assert_eq!(macos_symbols_to_toml_key("⌥Space"), "Alt + Space");
-
-        // All should be parseable
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥\\")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥/")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥=")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥Space")).is_ok());
-    }
-
-    #[test]
-    fn macos_symbols_without_modifiers_still_parseable() {
-        // Note: livesplit_hotkey accepts keys without modifiers (like "KeyH")
-        // but these will be rejected by parse_hotkey_string in preferences_json.rs
-        // which requires at least one modifier for a valid hotkey
-        let toml_key = macos_symbols_to_toml_key("H");
-        assert_eq!(toml_key, "KeyH");
-        // This parses successfully with livesplit_hotkey
-        assert!(Hotkey::from_str(&toml_key).is_ok());
-    }
-
-    #[test]
     fn parse_hotkey_string_requires_modifiers() {
         // parse_hotkey_string (in preferences_json.rs) requires at least one modifier
         // This test verifies that behavior through the public API
@@ -1495,15 +1321,16 @@ mod tests {
                     || hk.key.contains('⌃')
                     || hk.key.contains('⇧')
                     || hk.key.contains('⌘'),
-                "Hotkey '{}' for command '{}' should have at least one modifier",
+                "Hotkey '{}' for command {} should have at least one modifier",
                 hk.key,
-                hk.command_id
+                hk.command
             );
         }
     }
 
     /// The Swift `HotkeyBinding` has no sort order, so the key bindings in
-    /// the Preferences window's JSON have none.
+    /// the Preferences window's JSON have none. Each binding carries its
+    /// command, which the file then holds.
     #[test]
     fn preferences_from_the_swift_ui_save_with_their_key_bindings() {
         let dir = tempfile::tempdir().unwrap();
@@ -1576,6 +1403,93 @@ mod tests {
             assert!(error.contains("has an error, so it was not changed"), "{error}");
             assert!(!error.contains('\u{1b}'), "{error}");
         }
+    }
+
+    /// Key bindings as sorted pairs of a hotkey and a command.
+    fn sorted_bindings(config: &Config) -> Vec<(String, String)> {
+        let mut bindings: Vec<_> = config
+            .keys
+            .iter()
+            .map(|(hotkey, cmd)| (hotkey.to_string(), command_json(cmd).to_string()))
+            .collect();
+        bindings.sort();
+        bindings
+    }
+
+    /// The Preferences window's JSON for `config`, as Swift sends it back.
+    fn preferences_for(config: &Config) -> PreferencesJson {
+        let json = serde_json::to_string(&PreferencesJson::from_config(config)).unwrap();
+        let mut prefs: PreferencesJson = serde_json::from_str(&json).unwrap();
+        for hotkey in &mut prefs.hotkeys {
+            hotkey.sort_order = 0;
+        }
+        prefs
+    }
+
+    /// Changes the key of the binding on `from` to `to`.
+    fn rebind(prefs: &mut PreferencesJson, from: &str, to: &str) {
+        let binding = prefs.hotkeys.iter_mut().find(|hk| hk.key == from);
+        binding.unwrap_or_else(|| panic!("{from} is not bound")).key = to.to_string();
+    }
+
+    /// Two `exec` bindings, and two `resize` bindings that differ only in
+    /// their percent, stay apart when Preferences changes a key, in the
+    /// running config and in the saved file.
+    #[test]
+    fn preferences_keep_bindings_of_the_same_command_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [keys]
+            "Alt + Q" = { exec = "open -a Terminal" }
+            "Alt + W" = { exec = "open -a Safari" }
+            "Alt + Ctrl + H" = { resize = { direction = "left", percent = 5 } }
+            "Alt + Ctrl + Shift + H" = { resize = { direction = "left", percent = 10 } }
+            "#,
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        let expected = Config::parse(
+            r#"
+            [keys]
+            "Alt + E" = { exec = "open -a Terminal" }
+            "Alt + W" = { exec = "open -a Safari" }
+            "Alt + Ctrl + H" = { resize = { direction = "left", percent = 5 } }
+            "Alt + Ctrl + Shift + Y" = { resize = { direction = "left", percent = 10 } }
+            "#,
+        )
+        .unwrap();
+
+        let mut prefs = preferences_for(&config);
+        rebind(&mut prefs, "⌥Q", "⌥E");
+        rebind(&mut prefs, "⌃⌥⇧H", "⌃⌥⇧Y");
+
+        let running = prefs.apply_to_config(&config);
+        assert_eq!(sorted_bindings(&expected), sorted_bindings(&running));
+        write_preferences_to_path(&prefs, &path).unwrap();
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(sorted_bindings(&expected), sorted_bindings(&saved));
+
+        // The window keeps its bindings for the next change.
+        rebind(&mut prefs, "⌥W", "⌥R");
+        let expected = Config::parse(
+            r#"
+            [keys]
+            "Alt + E" = { exec = "open -a Terminal" }
+            "Alt + R" = { exec = "open -a Safari" }
+            "Alt + Ctrl + H" = { resize = { direction = "left", percent = 5 } }
+            "Alt + Ctrl + Shift + Y" = { resize = { direction = "left", percent = 10 } }
+            "#,
+        )
+        .unwrap();
+
+        let running = prefs.apply_to_config(&running);
+        assert_eq!(sorted_bindings(&expected), sorted_bindings(&running));
+        write_preferences_to_path(&prefs, &path).unwrap();
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(sorted_bindings(&expected), sorted_bindings(&saved));
     }
 
     fn leaf_keys(prefix: &str, table: &toml::Table, keys: &mut Vec<String>) {
