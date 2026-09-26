@@ -1205,9 +1205,7 @@ impl LayoutManager {
                 };
             } else {
                 self.add_floating_window(wid, space);
-                if let Some(layout) = space.and_then(|space| self.try_layout(space)) {
-                    self.tree.remove_window_from(layout, wid);
-                }
+                self.remove_window_from_shown_context(wid, space);
                 self.last_floating_focus = Some(wid);
                 return EventResponse {
                     frame_overrides: self
@@ -1698,8 +1696,8 @@ impl LayoutManager {
     fn remove_floating_window(&mut self, wid: WindowId, space: Option<SpaceId>) {
         if let Some(space) = space {
             let layout = self.layout(space);
-            // Floating removes the window only from the layout it floated in,
-            // so this layout can still have its node.
+            // Floating removes the window only from the layouts of the context
+            // it floated in, so this layout can still have its node.
             let node = self.tree.window_node(layout, wid).unwrap_or_else(|| {
                 let selection = self.tree.selection(layout);
                 self.tree.add_window_after(layout, selection, wid)
@@ -1708,6 +1706,30 @@ impl LayoutManager {
             self.active_floating_windows.remove(space, wid);
         }
         self.floating_windows.remove(&wid);
+    }
+
+    /// Removes the window from every layout of the context the Space shows,
+    /// on every Space and screen size. Without a Space, removes it from every
+    /// layout.
+    fn remove_window_from_shown_context(&mut self, wid: WindowId, space: Option<SpaceId>) {
+        let Some(space) = space else {
+            self.tree.remove_window(wid);
+            return;
+        };
+        let layouts: Vec<LayoutId> = match self.shown_context(space) {
+            ContextKey::Everything => {
+                self.layout_mapping.values().flat_map(|mapping| mapping.layouts()).collect()
+            }
+            key => self
+                .context_layouts
+                .iter()
+                .filter(|((_, other), _)| *other == key)
+                .flat_map(|(_, mapping)| mapping.layouts())
+                .collect(),
+        };
+        for layout in layouts {
+            self.tree.remove_window_from(layout, wid);
+        }
     }
 }
 
@@ -5114,10 +5136,10 @@ mod tests {
         );
     }
 
-    /// A window floated in one layout still has its node in the layouts of
-    /// other screen sizes. Unfloating it there reuses that node.
+    /// A floating window gets no tile at another screen size, even before the
+    /// next update of the windows on screen.
     #[test]
-    fn unfloating_a_window_keeps_one_node_per_layout() {
+    fn floating_a_window_removes_it_from_the_layouts_of_every_size() {
         use LayoutCommand::*;
         use LayoutEvent::*;
         let mut mgr = LayoutManager::new_for_test();
@@ -5137,14 +5159,47 @@ mod tests {
         _ = mgr.handle_event(WindowFocused(vec![space], w(2)));
         _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
         _ = mgr.handle_event(SpaceExposed(space, screen2.size, EVERYTHING));
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 600, 1200)),
+                (w(3), rect(600, 0, 600, 1200)),
+            ],
+            mgr.layout_sorted(space, screen2),
+        );
+    }
+
+    /// A window floated in one context keeps its node in another until that
+    /// context's windows are sent again. Unfloating it there reuses the node.
+    #[test]
+    fn unfloating_a_window_keeps_one_node_per_layout() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c, d] = named_contexts(["C", "D"]);
+
+        switch(&mut mgr, space, screen.size, ContextKey::Everything, &all);
+        switch(&mut mgr, space, screen.size, d, &all);
+        switch(&mut mgr, space, screen.size, c, &all);
+        _ = mgr.handle_event(WindowFocused(vec![space], w(2)));
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+
+        let d_context = ActiveContext {
+            key: d,
+            members: all.into_iter().collect(),
+        };
+        _ = mgr.handle_event(SpaceExposed(space, screen.size, d_context));
         _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
         assert_eq!(
             vec![
-                (w(1), rect(0, 0, 400, 1200)),
-                (w(2), rect(400, 0, 400, 1200)),
-                (w(3), rect(800, 0, 400, 1200)),
+                (w(1), rect(0, 0, 40, 120)),
+                (w(2), rect(40, 0, 40, 120)),
+                (w(3), rect(80, 0, 40, 120)),
             ],
-            mgr.layout_sorted(space, screen2),
+            mgr.layout_sorted(space, screen),
         );
     }
 
