@@ -160,6 +160,11 @@ pub enum Event {
     // TODO: Consider replacing with WindowsOnScreenUpdated.
     WindowBecameVisible(WindowId),
     WindowDestroyed(WindowId),
+    /// The window's title changed. The title is recorded in the clear.
+    WindowTitleChanged(
+        WindowId,
+        #[serde(serialize_with = "redact::expose_secret")] Secret<String>,
+    ),
     WindowFrameChanged(
         WindowId,
         #[serde(with = "CGRectDef")] CGRect,
@@ -469,7 +474,6 @@ pub struct TransactionId(u32);
 
 #[derive(Debug)]
 struct WindowState {
-    #[allow(unused)]
     title: Secret<String>,
     /// The last known frame of the window. Always includes the last write.
     ///
@@ -865,6 +869,7 @@ impl Reactor {
                     self.send_layout_event(LayoutEvent::WindowRemoved(wid));
                 }
             }
+            Event::WindowTitleChanged(wid, title) => self.title_changed(wid, title),
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
                 if mouse_state == Some(MouseState::Up) {
                     // The button is up, so any resize we were holding off on is

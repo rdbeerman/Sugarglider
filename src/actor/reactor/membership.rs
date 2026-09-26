@@ -5,6 +5,7 @@
 //! when it first sees a window, and keeps it current as windows change and
 //! close. The design is in `docs/specs/contexts.md`.
 
+use redact::Secret;
 use tracing::{debug, error, info};
 
 use super::Reactor;
@@ -102,6 +103,19 @@ impl Reactor {
             .flat_map(|context| &context.members)
             .chain(self.contexts.pinned())
             .any(|record| link(record.link).is_some_and(|wid| wid.pid == pid))
+    }
+
+    /// The window's title changed. Its member records take the new title,
+    /// so a window that appears with it after a relaunch can match them
+    /// (R22). A title change alone doesn't write `contexts.json`.
+    pub(super) fn title_changed(&mut self, wid: WindowId, title: Secret<String>) {
+        if self.contexts_enabled() && self.windows.contains_key(&wid) {
+            self.contexts.title_changed(wid, title.expose_secret());
+        }
+        match self.windows.get_mut(&wid) {
+            Some(window) => window.title = title,
+            None => debug!(?wid, "Title change of an unknown window"),
+        }
     }
 
     /// A window closed. Its records wait, pending, until its app shows

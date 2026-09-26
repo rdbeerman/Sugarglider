@@ -434,3 +434,56 @@ fn r21_r22_r23_an_app_that_quits_and_relaunches_rejoins_its_context_by_title() {
         assert!(s.parked().is_empty());
     }
 }
+
+/// R22. A title change updates the window's member records, and doesn't
+/// write `contexts.json`. After its app quits, the record keeps the last
+/// title, and the relaunched window with that title rejoins C.
+#[test]
+fn r22_a_title_change_updates_the_member_records_and_a_relaunch_matches_it() {
+    let mut s = Setup::new(1);
+    let events = doc_app(&mut s, 2, 21);
+    s.reactor.handle_events(events);
+    let doc = WindowId::new(2, 1);
+    report_visible(&mut s, &[wid(1), doc]);
+    let c = s.create("C", &[wid(1), doc]);
+    let d = s.create("D", &[wid(1)]);
+    s.reactor.contexts.pin(&s.desc(doc));
+    s.switch(c);
+    let path = s.dir.path().join("contexts.json");
+    fs::remove_file(&path).unwrap();
+
+    s.reactor
+        .handle_event(Event::WindowTitleChanged(doc, "Doc — edited".to_string().into()));
+
+    assert_eq!(
+        vec![
+            ("Window1".to_string(), RecordLink::Live(wid(1))),
+            ("Doc — edited".to_string(), RecordLink::Live(doc)),
+        ],
+        records(&s, c)
+    );
+    assert_eq!("Doc — edited", s.reactor.contexts.pinned()[0].title);
+    assert_eq!("Doc — edited", s.desc(doc).title);
+    assert!(!path.exists(), "a title change alone writes nothing");
+    s.reactor.contexts.unpin(doc);
+    s.switch(d);
+    assert_eq!(vec![doc], s.parked());
+
+    s.reactor.handle_event(Event::ApplicationTerminated(2));
+    s.reactor.handle_event(Event::ApplicationThreadTerminated(2));
+    s.apps.windows.remove(&doc);
+    assert_eq!(vec!["Window1", "Doc — edited"], saved_members(&s, c));
+    let window = WindowInfo {
+        title: "Doc — edited".to_string().into(),
+        sys_id: Some(WindowServerId::new(51)),
+        frame: rect(700., 100., 50., 50.),
+        ..make_window(1)
+    };
+    let events = s.apps.make_app_with_info(5, test_app_info(2), vec![window], None, false);
+    s.reactor.handle_events(events);
+    let relaunched = WindowId::new(5, 1);
+    report_visible(&mut s, &[wid(1), relaunched]);
+
+    assert!(s.reactor.contexts.is_member(c, relaunched));
+    assert_eq!(vec![relaunched], s.parked());
+}
