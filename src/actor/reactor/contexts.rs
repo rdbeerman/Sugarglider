@@ -2291,6 +2291,8 @@ mod tests {
         s.apps.simulate_until_quiet(&mut s.reactor);
         assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
         assert_eq!(Some(b), s.reactor.contexts.previous());
+        let used = |key| s.reactor.contexts.last_used(key);
+        assert!(used(ContextKey::Unsorted) > used(b), "R19");
         // Window 3 was only in C, so it is unsorted now.
         assert_eq!(vec![(wid(3), screen())], s.tiles());
         assert_eq!(vec![wid(1), wid(2)], s.parked());
@@ -2376,5 +2378,1472 @@ mod tests {
         assert_eq!(everything, s.frames(&[wid(1), wid(2), wid(3)]));
         assert!(s.parked().is_empty());
         assert!(s.journal_on_disk().is_empty());
+    }
+
+    /// Answers the requests in order, as the apps do.
+    fn answer(s: &mut Setup, requests: Vec<Request>) {
+        for event in s.apps.simulate_events_for_requests(requests) {
+            s.reactor.handle_event(event);
+        }
+    }
+
+    /// The displays change to `frames`, which show `spaces`, and the window
+    /// server lists `wids` at the frames their apps report.
+    fn displays(
+        s: &Setup,
+        frames: Vec<CGRect>,
+        spaces: Vec<Option<SpaceId>>,
+        wids: &[WindowId],
+    ) -> Event {
+        Event::ScreenParametersChanged {
+            bounds: frames.clone(),
+            scale_factors: vec![1.0; frames.len()],
+            frames,
+            spaces,
+            converter: CoordinateConverter::default(),
+            on_screen: on_screen(s, wids),
+        }
+    }
+
+    /// The journal entry of window `window` of app `pid`, whose window server
+    /// id is `wsid`.
+    fn journal_entry(pid: i32, wsid: u32, window: usize, frame: CGRect) -> JournalEntry {
+        JournalEntry {
+            pid,
+            bundle_id: Some(format!("com.testapp{pid}")),
+            window_server_id: WindowServerId::new(wsid),
+            title: format!("Window{window}"),
+            frame: frame.into(),
+        }
+    }
+
+    fn right() -> CGRect {
+        rect(1200., 0., 1200., 1000.)
+    }
+
+    /// Two displays side by side, showing Spaces 1 and 2. Apps 1 and 2 each
+    /// have window 1 on the left display and window 2 on the right one. App
+    /// 2's window server ids are 21 and 22.
+    fn two_displays_two_apps() -> Setup {
+        let mut s = Setup::on(
+            vec![screen(), right()],
+            vec![Some(space()), Some(SpaceId::new(2))],
+        );
+        let window = |idx: usize, wsid: u32, x: f64| WindowInfo {
+            sys_id: Some(WindowServerId::new(wsid)),
+            frame: rect(x, 100., 50., 50.),
+            ..make_window(idx)
+        };
+        let apps = [
+            (1, vec![window(1, 1, 100.), window(2, 2, 1300.)]),
+            (2, vec![window(1, 21, 200.), window(2, 22, 1400.)]),
+        ];
+        // The window server lists every visible window each time.
+        let listed = WindowsOnScreen::new(
+            apps.iter()
+                .flat_map(|(pid, windows)| {
+                    windows.iter().map(|info| WindowServerInfo {
+                        id: info.sys_id.unwrap(),
+                        pid: *pid,
+                        layer: 0,
+                        frame: info.frame,
+                    })
+                })
+                .collect(),
+        );
+        for (pid, windows) in apps {
+            let mut launch = s.apps.make_app(pid, windows);
+            for event in &mut launch {
+                if let Event::WindowsOnScreenUpdated { on_screen, .. } = event {
+                    *on_screen = listed.clone();
+                }
+            }
+            s.reactor.handle_events(launch);
+        }
+        s.reactor.handle_event(Event::StartupComplete);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s
+    }
+
+    /// Windows 1 and 2 of apps 1 and 2 in `two_displays_two_apps`.
+    fn four_windows() -> [WindowId; 4] {
+        [wid(1), wid(2), WindowId::new(2, 1), WindowId::new(2, 2)]
+    }
+
+    /// The frames of `four_windows` under Everything.
+    fn four_windows_under_everything() -> Vec<(WindowId, CGRect)> {
+        vec![
+            (wid(1), rect(0., 0., 600., 1000.)),
+            (wid(2), rect(1200., 0., 600., 1000.)),
+            (WindowId::new(2, 1), rect(600., 0., 600., 1000.)),
+            (WindowId::new(2, 2), rect(1800., 0., 600., 1000.)),
+        ]
+    }
+
+    /// R12, R14, H4, L4. App 2 launches while Everything shows, and a switch
+    /// comes before app 2 has answered the frame that tiles its window. The
+    /// window is parked, and the journal holds its tile. App 3 launches
+    /// while the window server doesn't list its window yet, so that window
+    /// is neither tiled nor parked.
+    #[test]
+    fn a_switch_while_an_app_is_launching_parks_its_window_at_its_first_tile() {
+        let mut s = Setup::new(1);
+        let c = s.create("C", &[wid(1)]);
+        let launching = WindowId::new(2, 1);
+        let first_frame = rect(700., 100., 50., 50.);
+        let window = WindowInfo {
+            sys_id: Some(WindowServerId::new(21)),
+            frame: first_frame,
+            ..make_window(1)
+        };
+        let mut launch = s.apps.make_app(2, vec![window]);
+        for event in &mut launch {
+            if let Event::WindowsOnScreenUpdated { on_screen, .. } = event {
+                on_screen.info.insert(0, on_screen_info(&s, wid(1)));
+                on_screen.visible.insert(0, WindowServerId::new(1));
+            }
+        }
+        s.reactor.handle_events(launch);
+        let tiling = s.apps.requests();
+        let tile = rect(600., 0., 600., 1000.);
+        assert_eq!(vec![tile], frame_writes(&tiling, launching));
+        assert_eq!(first_frame, s.frame(launching));
+
+        s.command(c);
+        let switching = s.apps.requests();
+        answer(&mut s, tiling);
+        answer(&mut s, switching);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+        assert_eq!(screen(), s.frame(wid(1)));
+        assert_eq!(vec![launching], s.parked());
+        assert_eq!(corner(tile.size), s.frame(launching));
+        assert_eq!(vec![journal_entry(2, 21, 1, tile)], s.journal_on_disk());
+
+        let unlisted = WindowId::new(3, 1);
+        let unlisted_frame = rect(900., 100., 50., 50.);
+        let window = WindowInfo {
+            sys_id: Some(WindowServerId::new(31)),
+            frame: unlisted_frame,
+            ..make_window(1)
+        };
+        s.reactor
+            .handle_events(s.apps.make_app_without_ws_info(3, vec![window], None, false));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s.switch(c);
+        assert_eq!(unlisted_frame, s.frame(unlisted));
+        assert_eq!(vec![launching], s.parked());
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+
+        s.switch(ContextKey::Everything);
+        let everything = vec![(wid(1), rect(0., 0., 600., 1000.)), (launching, tile)];
+        assert_eq!(everything, s.tiles());
+        assert_eq!(everything, s.frames(&[wid(1), launching]));
+        assert_eq!(unlisted_frame, s.frame(unlisted));
+        assert!(s.parked().is_empty());
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    /// How the window server lists the window at the frame its app reports.
+    fn on_screen_info(s: &Setup, wid: WindowId) -> WindowServerInfo {
+        WindowServerInfo {
+            id: s.reactor.windows[&wid].window_server_id.unwrap(),
+            pid: wid.pid,
+            layer: 0,
+            frame: s.frame(wid),
+        }
+    }
+
+    /// R10, L2, H4. The user changes Space before the apps have answered a
+    /// switch's frames. The new Space shows the context, the late answers
+    /// move nothing, and the first Space keeps the context's layout.
+    #[test]
+    fn r10_a_space_change_during_a_switch_shows_the_context_on_the_new_space() {
+        let mut s = Setup::new(3);
+        // Window 3 is on Space 2.
+        report_visible(&mut s, &[wid(1), wid(2)]);
+        assert_eq!(
+            vec![
+                (wid(1), rect(0., 0., 600., 1000.)),
+                (wid(2), rect(600., 0., 600., 1000.)),
+            ],
+            s.tiles()
+        );
+        assert_eq!(rect(800., 0., 400., 1000.), s.frame(wid(3)));
+        let c = s.create("C", &[wid(1), wid(3)]);
+
+        s.command(c);
+        let switching = s.apps.requests();
+        let space2 = SpaceId::new(2);
+        let snapshot = on_screen(&s, &[wid(3)]);
+        s.reactor.handle_event(Event::SpaceChanged(vec![Some(space2)], snapshot));
+        let changing = s.apps.requests();
+        answer(&mut s, switching);
+        answer(&mut s, changing);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(vec![(wid(3), screen())], s.tiles_on(space2, screen()));
+        assert_eq!(screen(), s.frame(wid(3)));
+        assert_eq!(screen(), s.frame(wid(1)));
+        assert_eq!(vec![wid(2)], s.parked());
+        assert_eq!(corner(CGSize::new(600., 1000.)), s.frame(wid(2)));
+        assert_eq!(vec![entry(2, rect(600., 0., 600., 1000.))], s.journal_on_disk());
+
+        let snapshot = on_screen(&s, &[wid(1), wid(2)]);
+        s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], snapshot));
+        assert!(all_frame_writes(s.apps.requests()).is_empty());
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+        assert_eq!(screen(), s.frame(wid(1)));
+        assert_eq!(vec![wid(2)], s.parked());
+        assert_eq!(corner(CGSize::new(600., 1000.)), s.frame(wid(2)));
+    }
+
+    /// L2, H1, H4. The display gets shorter before the apps have answered a
+    /// switch's frames. The members are tiled for the new size, the parked
+    /// window moves to the corner of the new size, and its journal entry
+    /// keeps its frame from before parking.
+    #[test]
+    fn l2_a_display_change_during_a_switch_ends_at_the_new_sizes_frames() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let everything = s.frames(&all);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        let shorter = rect(0., 0., 1200., 800.);
+
+        s.command(c);
+        let switching = s.apps.requests();
+        // The window server still lists the frames from before the switch.
+        let event = displays(&s, vec![shorter], vec![Some(space())], &all);
+        s.reactor.handle_event(event);
+        let changing = s.apps.requests();
+        answer(&mut s, switching);
+        answer(&mut s, changing);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        let in_c = vec![
+            (wid(1), rect(0., 0., 600., 800.)),
+            (wid(2), rect(600., 0., 600., 800.)),
+        ];
+        assert_eq!(in_c, s.tiles_on(space(), shorter));
+        assert_eq!(in_c, s.frames(&[wid(1), wid(2)]));
+        assert_eq!(vec![wid(3)], s.parked());
+        assert_eq!(rect(1199., 799., 400., 1000.), s.frame(wid(3)));
+        assert_eq!(vec![entry(3, rect(800., 0., 400., 1000.))], s.journal_on_disk());
+
+        s.reactor.handle_event(displays(&s, vec![screen()], vec![Some(space())], &all));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let in_c = vec![
+            (wid(1), rect(0., 0., 600., 1000.)),
+            (wid(2), rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(in_c, s.tiles());
+        assert_eq!(in_c, s.frames(&[wid(1), wid(2)]));
+        assert_eq!(corner(CGSize::new(400., 1000.)), s.frame(wid(3)));
+        s.switch(ContextKey::Everything);
+        assert_eq!(everything, s.frames(&all));
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    /// L2, H1. After a switch, each screen size keeps its own arrangement of
+    /// the context, and Everything's layout doesn't change.
+    #[test]
+    fn l2_a_context_keeps_an_arrangement_per_screen_size_across_display_changes() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let everything = s.frames(&all);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        s.switch(c);
+        s.move_window(wid(1), Direction::Right);
+        let full_c = vec![
+            (wid(1), rect(600., 0., 600., 1000.)),
+            (wid(2), rect(0., 0., 600., 1000.)),
+        ];
+        assert_eq!(full_c, s.tiles());
+        let shorter = rect(0., 0., 1200., 800.);
+        let change_to = |s: &mut Setup, frame: CGRect| {
+            let event = displays(s, vec![frame], vec![Some(space())], &all);
+            s.reactor.handle_event(event);
+            s.apps.simulate_until_quiet(&mut s.reactor);
+        };
+
+        change_to(&mut s, shorter);
+        // The new size starts from the arrangement the context showed.
+        let short_c = vec![
+            (wid(1), rect(600., 0., 600., 800.)),
+            (wid(2), rect(0., 0., 600., 800.)),
+        ];
+        assert_eq!(short_c, s.tiles_on(space(), shorter));
+        assert_eq!(short_c, s.frames(&[wid(1), wid(2)]));
+        assert_eq!(rect(1199., 799., 400., 1000.), s.frame(wid(3)));
+        s.move_window(wid(1), Direction::Left);
+        let short_c = vec![
+            (wid(1), rect(0., 0., 600., 800.)),
+            (wid(2), rect(600., 0., 600., 800.)),
+        ];
+        assert_eq!(short_c, s.frames(&[wid(1), wid(2)]));
+
+        change_to(&mut s, screen());
+        assert_eq!(full_c, s.tiles());
+        assert_eq!(full_c, s.frames(&[wid(1), wid(2)]));
+        assert_eq!(corner(CGSize::new(400., 1000.)), s.frame(wid(3)));
+        change_to(&mut s, shorter);
+        assert_eq!(short_c, s.tiles_on(space(), shorter));
+        assert_eq!(short_c, s.frames(&[wid(1), wid(2)]));
+        change_to(&mut s, screen());
+        assert_eq!(vec![entry(3, rect(800., 0., 400., 1000.))], s.journal_on_disk());
+
+        s.switch(ContextKey::Everything);
+        assert_eq!(everything, s.frames(&all));
+        assert!(s.parked().is_empty());
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    /// R7, H1. A switch changes both displays. Each window stays on its
+    /// display, and each parked window keeps 1 point in a corner of its own
+    /// display that doesn't reach into the other one.
+    #[test]
+    fn r7_a_switch_changes_both_displays_and_keeps_each_window_on_its_own() {
+        let mut s = two_displays_two_apps();
+        let all = four_windows();
+        assert_eq!(four_windows_under_everything(), s.frames(&all));
+        let [w1, w2, v1, v2] = all;
+        let c = s.create("C", &[w1, v2]);
+        let d = s.create("D", &[w2, v1]);
+        let space2 = SpaceId::new(2);
+
+        s.switch(c);
+        assert_eq!(vec![(w1, screen())], s.tiles_on(space(), screen()));
+        assert_eq!(vec![(v2, right())], s.tiles_on(space2, right()));
+        assert_eq!(vec![(w1, screen()), (v2, right())], s.frames(&[w1, v2]));
+        assert_eq!(vec![w2, v1], s.parked());
+        assert_eq!(rect(2399., 999., 600., 1000.), s.frame(w2));
+        assert_eq!(rect(-599., 999., 600., 1000.), s.frame(v1));
+        // The journal lists the windows of the left display first.
+        assert_eq!(
+            vec![
+                journal_entry(2, 21, 1, rect(600., 0., 600., 1000.)),
+                entry(2, rect(1200., 0., 600., 1000.)),
+            ],
+            s.journal_on_disk()
+        );
+
+        s.switch(d);
+        assert_eq!(vec![(v1, screen())], s.tiles_on(space(), screen()));
+        assert_eq!(vec![(w2, right())], s.tiles_on(space2, right()));
+        assert_eq!(vec![(w2, right()), (v1, screen())], s.frames(&[w2, v1]));
+        assert_eq!(vec![w1, v2], s.parked());
+        assert_eq!(rect(-1199., 999., 1200., 1000.), s.frame(w1));
+        assert_eq!(rect(2399., 999., 1200., 1000.), s.frame(v2));
+        assert_eq!(
+            vec![entry(1, screen()), journal_entry(2, 22, 2, right())],
+            s.journal_on_disk()
+        );
+
+        s.switch(ContextKey::Everything);
+        assert_eq!(four_windows_under_everything(), s.frames(&all));
+        assert!(s.parked().is_empty());
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    /// Splits `requests` into the requests to app 1 and those to app 2.
+    fn by_app(requests: Vec<Request>) -> (Vec<Request>, Vec<Request>) {
+        requests.into_iter().partition(|request| match request {
+            Request::SetWindowFrame(wid, ..) => wid.pid == 1,
+            other => panic!("{other:?}"),
+        })
+    }
+
+    /// R32, R7. Quitting with windows parked on two displays puts each back
+    /// on its own display, and quits once both apps have confirmed.
+    #[test]
+    fn r32_quitting_with_windows_parked_on_two_displays_waits_for_both_apps() {
+        let mut s = two_displays_two_apps();
+        let all = four_windows();
+        let [w1, w2, v1, v2] = all;
+        let c = s.create("C", &[w1, v2]);
+        s.switch(c);
+        assert_eq!(vec![w2, v1], s.parked());
+        let exits = catch_exits(&mut s);
+
+        save_and_exit(&mut s);
+
+        let (app1, app2) = by_app(s.apps.requests());
+        assert_eq!(
+            vec![
+                (w1, rect(0., 0., 600., 1000.)),
+                (w2, rect(1200., 0., 600., 1000.))
+            ],
+            all_frame_writes(app1.iter().map(copy_request).collect())
+        );
+        assert_eq!(
+            vec![
+                (v1, rect(600., 0., 600., 1000.)),
+                (v2, rect(1800., 0., 600., 1000.))
+            ],
+            all_frame_writes(app2.iter().map(copy_request).collect())
+        );
+        answer(&mut s, app1);
+        assert!(exits.lock().unwrap().is_empty());
+        assert_eq!(
+            vec![journal_entry(2, 21, 1, rect(600., 0., 600., 1000.))],
+            s.journal_on_disk()
+        );
+        answer(&mut s, app2);
+
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert_eq!(four_windows_under_everything(), s.frames(&all));
+        assert!(s.journal_on_disk().is_empty());
+        assert_eq!(c, s.saved_active());
+    }
+
+    fn copy_request(request: &Request) -> Request {
+        match request {
+            Request::SetWindowFrame(wid, frame, txid) => {
+                Request::SetWindowFrame(*wid, *frame, *txid)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// R32. Quitting with windows parked on two displays, when app 2 never
+    /// confirms its window's frame. The quit happens at the deadline, and
+    /// the journal keeps exactly app 2's entry.
+    #[test]
+    fn r32_quitting_on_two_displays_when_one_app_never_confirms_keeps_its_entry() {
+        let mut s = two_displays_two_apps();
+        let [w1, w2, v1, v2] = four_windows();
+        let c = s.create("C", &[w1, v2]);
+        s.switch(c);
+        assert_eq!(vec![w2, v1], s.parked());
+        let exits = catch_exits(&mut s);
+        let start = Instant::now();
+
+        save_and_exit(&mut s);
+        let (app1, _app2) = by_app(s.apps.requests());
+        answer(&mut s, app1);
+        s.reactor.exit_deadline_tick(start + Duration::from_millis(1900));
+        assert!(exits.lock().unwrap().is_empty());
+        s.reactor.exit_deadline_tick(Instant::now() + Duration::from_secs(2));
+
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert_eq!(
+            vec![journal_entry(2, 21, 1, rect(600., 0., 600., 1000.))],
+            s.journal_on_disk()
+        );
+        assert_eq!(rect(1200., 0., 600., 1000.), s.frame(w2));
+        assert_eq!(rect(-599., 999., 600., 1000.), s.frame(v1));
+        assert_eq!(c, s.saved_active());
+        assert!(s.dir.path().join("layout.ron").exists());
+        s.reactor.exit_deadline_tick(Instant::now() + Duration::from_secs(10));
+        assert_eq!(vec![0], *exits.lock().unwrap(), "the quit happens once");
+    }
+
+    /// R32, step 2. While the quit waits, a Space change, a display change,
+    /// and turning contexts off and on park nothing, and context commands
+    /// do nothing. The quit happens once every window is back.
+    #[test]
+    fn r32_while_the_quit_waits_nothing_is_parked_and_context_commands_do_nothing() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let everything = s.frames(&all);
+        let c = s.create("C", &[wid(1)]);
+        let d = s.create("D", &[wid(2)]);
+        s.switch(c);
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+        let exits = catch_exits(&mut s);
+
+        save_and_exit(&mut s);
+        let mut requests = s.apps.requests();
+        s.command(d);
+        s.command(ContextKey::Everything);
+        previous(&mut s);
+        let snapshot = on_screen(&s, &all);
+        s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], snapshot));
+        s.reactor.handle_event(displays(&s, vec![screen()], vec![Some(space())], &all));
+        s.reactor.handle_event(Event::ConfigChanged(config(false)));
+        s.reactor.handle_event(Event::ConfigChanged(config(true)));
+        requests.extend(s.apps.requests());
+
+        let parking = CGPoint::new(1199., 999.);
+        let writes = all_frame_writes(requests.iter().map(copy_or_keep).collect());
+        assert!(
+            writes.iter().all(|(_, frame)| frame.origin != parking),
+            "{writes:?}"
+        );
+        assert!(exits.lock().unwrap().is_empty());
+        answer_every_write(&mut s, requests);
+
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert_eq!(everything, s.frames(&all));
+        assert!(s.parked().is_empty());
+        assert!(s.journal_on_disk().is_empty());
+        assert_eq!(c, s.reactor.contexts.active());
+        assert_eq!(c, s.saved_active());
+    }
+
+    /// Answers the requests in order, and then every request that follows,
+    /// as apps do: an app reports the frame after every write, even one
+    /// that doesn't move the window. The test apps report only a change.
+    fn answer_every_write(s: &mut Setup, mut requests: Vec<Request>) {
+        while !requests.is_empty() {
+            for request in requests {
+                let echo = match &request {
+                    Request::SetWindowFrame(wid, frame, txid) => Some((*wid, *frame, *txid)),
+                    _ => None,
+                };
+                let mut events = s.apps.simulate_events_for_requests(vec![request]);
+                if let Some((wid, frame, txid)) = echo
+                    && events.is_empty()
+                {
+                    events.push(Event::WindowFrameChanged(
+                        wid,
+                        frame,
+                        txid,
+                        Requested(true),
+                        None,
+                    ));
+                }
+                for event in events {
+                    s.reactor.handle_event(event);
+                }
+            }
+            requests = s.apps.requests();
+        }
+    }
+
+    fn copy_or_keep(request: &Request) -> Request {
+        match request {
+            Request::SetWindowFrame(wid, frame, txid) => {
+                Request::SetWindowFrame(*wid, *frame, *txid)
+            }
+            _ => Request::GetVisibleWindows,
+        }
+    }
+
+    /// R33, R28. Turning contexts off by a config reload shows every window
+    /// in Everything's layout. While they are off, context commands and a
+    /// Space change change nothing, and `contexts.json` isn't written.
+    /// Turning them on again shows the active context as it was, with its
+    /// floating member at its frame.
+    #[test]
+    fn r33_turning_contexts_off_and_on_by_config_reload_keeps_the_contexts_arrangement() {
+        let mut s = Setup::new(4);
+        float_window_1(&mut s);
+        let floating = rect(100., 100., 50., 50.);
+        let all = [wid(1), wid(2), wid(3), wid(4)];
+        let tiled = [wid(2), wid(3), wid(4)];
+        let everything = vec![
+            (wid(2), rect(0., 0., 400., 1000.)),
+            (wid(3), rect(400., 0., 400., 1000.)),
+            (wid(4), rect(800., 0., 400., 1000.)),
+        ];
+        assert_eq!(everything, s.frames(&tiled));
+        let c = s.create("C", &[wid(1), wid(2), wid(3)]);
+        let d = s.create("D", &[wid(4)]);
+        s.switch(d);
+        s.switch(c);
+        s.move_window(wid(2), Direction::Right);
+        let in_c = vec![
+            (wid(2), rect(600., 0., 600., 1000.)),
+            (wid(3), rect(0., 0., 600., 1000.)),
+        ];
+        assert_eq!(in_c, s.tiles());
+        assert_eq!(floating, s.frame(wid(1)));
+        assert_eq!(vec![wid(4)], s.parked());
+        let path = s.dir.path().join("contexts.json");
+        let saved = fs::read(&path).unwrap();
+
+        s.reactor.handle_event(Event::ConfigChanged(config(false)));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(everything, s.tiles());
+        assert_eq!(everything, s.frames(&tiled));
+        assert_eq!(floating, s.frame(wid(1)));
+        assert!(s.parked().is_empty());
+        assert!(s.journal_on_disk().is_empty());
+        for command in [
+            ContextCommand::SwitchContext(ContextRef::Id(id_of(d))),
+            ContextCommand::ShowEverything,
+            ContextCommand::PreviousContext,
+        ] {
+            s.reactor.handle_event(Event::Command(Command::Context(command)));
+            assert!(s.apps.requests().is_empty());
+        }
+        let snapshot = on_screen(&s, &all);
+        s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], snapshot));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(everything, s.frames(&tiled));
+        assert!(s.parked().is_empty());
+        assert_eq!(c, s.reactor.contexts.active());
+        assert_eq!(saved, fs::read(&path).unwrap());
+
+        s.reactor.handle_event(Event::ConfigChanged(config(true)));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(in_c, s.tiles());
+        assert_eq!(in_c, s.frames(&[wid(2), wid(3)]));
+        assert_eq!(floating, s.frame(wid(1)));
+        assert_eq!(vec![wid(4)], s.parked());
+        assert_eq!(corner(CGSize::new(400., 1000.)), s.frame(wid(4)));
+        assert_eq!(vec![entry(4, rect(800., 0., 400., 1000.))], s.journal_on_disk());
+    }
+
+    /// R33, H1, L2. The login window, and the screens coming back from it
+    /// with window lists that name no window, move no window on either
+    /// display. Neither does the full list that follows. The context keeps
+    /// the arrangement the user made.
+    #[test]
+    fn r33_the_login_window_moves_no_window_on_either_display() {
+        let mut s = two_displays_two_apps();
+        let all = four_windows();
+        let [w1, _, v1, v2] = all;
+        let c = s.create("C", &[w1, v1, v2]);
+        s.switch(c);
+        s.move_window(v1, Direction::Left);
+        let left = vec![
+            (w1, rect(600., 0., 600., 1000.)),
+            (v1, rect(0., 0., 600., 1000.)),
+        ];
+        assert_eq!(left, s.tiles_on(space(), screen()));
+        let frames = s.frames(&all);
+        let parked = s.parked();
+        let journal = s.journal_on_disk();
+        let space2 = SpaceId::new(2);
+        let spaces = vec![Some(space()), Some(space2)];
+
+        s.reactor
+            .handle_event(screens(vec![CGRect::ZERO, CGRect::ZERO], vec![None, None]));
+        s.reactor
+            .handle_event(Event::SpaceChanged(vec![None, None], Default::default()));
+        s.reactor.handle_event(screens(vec![screen(), right()], spaces.clone()));
+        s.reactor.handle_event(Event::SpaceChanged(spaces, Default::default()));
+        let snapshot = on_screen(&s, &all);
+        s.reactor
+            .handle_event(Event::WindowsOnScreenUpdated { pid: None, on_screen: snapshot });
+        // The accessibility API still reports no windows.
+        let mut writes = vec![];
+        for request in s.apps.requests() {
+            match request {
+                Request::GetVisibleWindows => {
+                    for pid in [1, 2] {
+                        s.reactor.handle_event(Event::WindowsDiscovered {
+                            pid,
+                            new: vec![],
+                            known_visible: vec![],
+                        });
+                    }
+                }
+                Request::SetWindowFrame(wid, frame, _) => writes.push((wid, frame)),
+                other => panic!("{other:?}"),
+            }
+        }
+        writes.extend(all_frame_writes(s.apps.requests()));
+
+        assert_eq!(Vec::<(WindowId, CGRect)>::new(), writes);
+        assert_eq!(frames, s.frames(&all));
+        assert_eq!(parked, s.parked());
+        assert_eq!(journal, s.journal_on_disk());
+        assert_eq!(left, s.tiles_on(space(), screen()));
+        assert_eq!(vec![(v2, right())], s.tiles_on(space2, right()));
+    }
+
+    /// R17. A switch writes each window's final frame at once, without an
+    /// animation, even when animations are on.
+    #[test]
+    fn r17_a_switch_has_no_animation() {
+        use super::super::animation::Message as AnimationMessage;
+
+        let mut s = Setup::new(3);
+        let mut config = Config::default();
+        config.settings.default_disable = false;
+        config.settings.animate = true;
+        config.settings.experimental.contexts.enable = true;
+        s.reactor.handle_event(Event::ConfigChanged(Arc::new(config)));
+        let (animation_tx, mut animation_rx) = mpsc::unbounded_channel();
+        s.reactor.animation_tx = Some(animation_tx);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        let mut switch_without_animation = |s: &mut Setup, key: ContextKey| {
+            s.command(key);
+            let mut messages = 0;
+            while let Ok(message) = animation_rx.try_recv() {
+                messages += 1;
+                match message {
+                    AnimationMessage::SkipToEnd(animation) => animation.skip_to_end(),
+                    AnimationMessage::Replace(_) => panic!("{key:?} animates"),
+                }
+            }
+            assert!(messages > 0);
+            s.apps.simulate_until_quiet(&mut s.reactor);
+        };
+
+        switch_without_animation(&mut s, c);
+        let in_c = vec![
+            (wid(1), rect(0., 0., 600., 1000.)),
+            (wid(2), rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(in_c, s.frames(&[wid(1), wid(2)]));
+        assert_eq!(corner(CGSize::new(400., 1000.)), s.frame(wid(3)));
+
+        switch_without_animation(&mut s, ContextKey::Everything);
+        assert_eq!(rect(800., 0., 400., 1000.), s.frame(wid(3)));
+    }
+
+    /// R16. A parked window that its app moves back on screen has drifted
+    /// in, and switching to the active context parks it again. Its journal
+    /// entry keeps the frame from before it was first parked.
+    #[test]
+    #[ignore = "bug: R16 leaves a parked window that its app moved back on screen where it is"]
+    fn r16_switching_to_the_active_context_parks_a_window_its_app_moved_back() {
+        let mut s = Setup::new(2);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        assert_eq!(vec![wid(2)], s.parked());
+        let parked_at = corner(CGSize::new(600., 1000.));
+        assert_eq!(parked_at, s.frame(wid(2)));
+        // The app moves window 2 back on screen by itself.
+        let moved = rect(300., 200., 600., 700.);
+        let txid = s.reactor.windows[&wid(2)].last_sent_txid;
+        s.apps.windows.get_mut(&wid(2)).unwrap().frame = moved;
+        s.reactor.handle_event(Event::WindowFrameChanged(
+            wid(2),
+            moved,
+            txid,
+            Requested(false),
+            None,
+        ));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+
+        s.switch(c);
+
+        assert_eq!(parked_at, s.frame(wid(2)));
+        assert_eq!(vec![wid(2)], s.parked());
+        assert_eq!(vec![entry(2, rect(600., 0., 600., 1000.))], s.journal_on_disk());
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+    }
+
+    /// L4. Under a context, a window that isn't a member and becomes visible,
+    /// here by being unminimized, gets no tile, and the members keep theirs.
+    #[test]
+    fn l4_a_non_member_that_becomes_visible_under_a_context_gets_no_tile() {
+        let mut s = Setup::new(3);
+        // Window 3 is minimized.
+        report_visible(&mut s, &[wid(1), wid(2)]);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        s.switch(c);
+        let in_c = vec![
+            (wid(1), rect(0., 0., 600., 1000.)),
+            (wid(2), rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(in_c, s.tiles());
+        assert!(s.parked().is_empty());
+
+        report_visible(&mut s, &[wid(1), wid(2), wid(3)]);
+
+        assert_eq!(in_c, s.tiles());
+        assert_eq!(in_c, s.frames(&[wid(1), wid(2)]));
+        assert_eq!(rect(800., 0., 400., 1000.), s.frame(wid(3)));
+    }
+
+    /// L5, H4. A window list taken before a switch's frames landed, and a
+    /// refresh right after it, change no tile, and the parked window stays
+    /// parked.
+    #[test]
+    fn l5_a_window_list_from_before_the_switch_landed_changes_no_tile() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let before = on_screen(&s, &all);
+        let c = s.create("C", &[wid(1), wid(2)]);
+
+        s.command(c);
+        let switching = s.apps.requests();
+        s.reactor
+            .handle_event(Event::WindowsOnScreenUpdated { pid: None, on_screen: before });
+        s.reactor.update_visible_windows();
+        let refreshing = s.apps.requests();
+        answer(&mut s, switching);
+        answer(&mut s, refreshing);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        let in_c = vec![
+            (wid(1), rect(0., 0., 600., 1000.)),
+            (wid(2), rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(in_c, s.tiles());
+        assert_eq!(in_c, s.frames(&[wid(1), wid(2)]));
+        assert_eq!(vec![wid(3)], s.parked());
+        assert_eq!(corner(CGSize::new(400., 1000.)), s.frame(wid(3)));
+        assert_eq!(vec![entry(3, rect(800., 0., 400., 1000.))], s.journal_on_disk());
+    }
+
+    /// R29, L1. Unsorted keeps its own layout across switches.
+    #[test]
+    fn r29_unsorted_keeps_its_own_arrangement_across_switches() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let everything = s.frames(&all);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(ContextKey::Unsorted);
+        s.move_window(wid(2), Direction::Right);
+        let unsorted = vec![
+            (wid(2), rect(600., 0., 600., 1000.)),
+            (wid(3), rect(0., 0., 600., 1000.)),
+        ];
+        assert_eq!(unsorted, s.tiles());
+        assert_eq!(vec![wid(1)], s.parked());
+
+        s.switch(c);
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+        s.switch(ContextKey::Everything);
+        assert_eq!(everything, s.frames(&all));
+        s.switch(ContextKey::Unsorted);
+
+        assert_eq!(unsorted, s.tiles());
+        assert_eq!(unsorted, s.frames(&[wid(2), wid(3)]));
+        assert_eq!(vec![wid(1)], s.parked());
+        assert_eq!(corner(CGSize::new(400., 1000.)), s.frame(wid(1)));
+    }
+
+    /// R30, R16. When the journal can't be written as a Space change applies
+    /// the context again, the Space shows the context and nothing is
+    /// parked. Switching to the context again then parks the window that
+    /// must not show.
+    #[test]
+    fn r30_a_failed_journal_write_in_a_space_change_parks_nothing() {
+        let mut s = Setup::new(4);
+        // Windows 3 and 4 are on Space 2.
+        report_visible(&mut s, &[wid(1), wid(2)]);
+        let on_space2 = [wid(3), wid(4)];
+        let frames = s.frames(&on_space2);
+        assert_eq!(
+            vec![
+                (wid(3), rect(600., 0., 300., 1000.)),
+                (wid(4), rect(900., 0., 300., 1000.)),
+            ],
+            frames
+        );
+        let c = s.create("C", &[wid(1), wid(3)]);
+        s.switch(c);
+        assert_eq!(vec![wid(2)], s.parked());
+        let journal = s.journal_on_disk();
+        assert_eq!(vec![entry(2, rect(600., 0., 600., 1000.))], journal);
+        let space2 = SpaceId::new(2);
+
+        let failing = FailingWrites::start(s.dir.path());
+        let snapshot = on_screen(&s, &on_space2);
+        s.reactor.handle_event(Event::SpaceChanged(vec![Some(space2)], snapshot));
+        let requests = s.apps.requests();
+        drop(failing);
+        answer(&mut s, requests);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(vec![(wid(3), screen())], s.tiles_on(space2, screen()));
+        assert_eq!(screen(), s.frame(wid(3)));
+        assert_eq!(frames[1].1, s.frame(wid(4)));
+        assert_eq!(vec![wid(2)], s.parked());
+        assert_eq!(journal, s.journal_on_disk());
+
+        s.switch(c);
+        assert_eq!(vec![wid(2), wid(4)], s.parked());
+        assert_eq!(corner(CGSize::new(300., 1000.)), s.frame(wid(4)));
+        assert_eq!(vec![(wid(3), screen())], s.tiles_on(space2, screen()));
+        assert_eq!(
+            vec![
+                entry(2, rect(600., 0., 600., 1000.)),
+                entry(4, rect(900., 0., 300., 1000.)),
+            ],
+            s.journal_on_disk()
+        );
+    }
+
+    /// R13, R12. A switch to a context without windows parks every window
+    /// and tiles nothing. With no app running, a switch changes only the
+    /// active context.
+    #[test]
+    fn r13_a_switch_to_a_context_without_windows_parks_every_window() {
+        let mut s = Setup::on(vec![screen()], vec![Some(space())]);
+        let empty = s.create("Empty", &[]);
+        s.switch(empty);
+        assert_eq!(empty, s.reactor.contexts.active());
+        assert_eq!(empty, s.saved_active());
+        s.switch(ContextKey::Everything);
+        s.reactor.handle_events(s.apps.make_app(1, make_windows(2)));
+        s.reactor.handle_event(Event::StartupComplete);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let all = [wid(1), wid(2)];
+        let everything = s.frames(&all);
+
+        s.switch(empty);
+
+        assert!(s.tiles().is_empty());
+        assert_eq!(vec![wid(1), wid(2)], s.parked());
+        let parked_at = corner(CGSize::new(600., 1000.));
+        assert_eq!(vec![(wid(1), parked_at), (wid(2), parked_at)], s.frames(&all));
+        assert_eq!(
+            vec![
+                entry(1, rect(0., 0., 600., 1000.)),
+                entry(2, rect(600., 0., 600., 1000.)),
+            ],
+            s.journal_on_disk()
+        );
+        s.switch(ContextKey::Everything);
+        assert_eq!(everything, s.frames(&all));
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    /// R33, R10. Between Sugarglider saying that it will stop managing a
+    /// Space and the Space change that follows, a switch parks nothing
+    /// there. When the Space is managed again, the context chosen in between
+    /// shows.
+    #[test]
+    fn r33_a_switch_while_turning_off_parks_nothing_and_shows_after_turning_on() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let everything = s.frames(&all);
+        let c = s.create("C", &[wid(1)]);
+        let d = s.create("D", &[wid(2)]);
+        s.switch(c);
+
+        s.reactor.handle_event(Event::ShowEverythingOn(vec![space()]));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s.switch(d);
+
+        assert_eq!(d, s.reactor.contexts.active());
+        assert_eq!(everything, s.frames(&all));
+        assert!(s.parked().is_empty());
+        assert!(s.journal_on_disk().is_empty());
+
+        s.reactor.handle_event(Event::SpaceChanged(vec![None], Default::default()));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(everything, s.frames(&all));
+        let snapshot = on_screen(&s, &all);
+        s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], snapshot));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(vec![(wid(2), screen())], s.tiles());
+        assert_eq!(screen(), s.frame(wid(2)));
+        assert_eq!(vec![wid(1), wid(3)], s.parked());
+        assert_eq!(
+            vec![
+                entry(1, rect(0., 0., 400., 1000.)),
+                entry(3, rect(800., 0., 400., 1000.)),
+            ],
+            s.journal_on_disk()
+        );
+    }
+
+    impl Setup {
+        /// A reactor with contexts on whose journal and `contexts.json` are
+        /// in `dir`, read at `now` as the boot `boot`, with app 1's
+        /// `windows` windows tiled side by side on one screen.
+        fn in_dir(dir: TempDir, boot: Option<&str>, now: SystemTime, windows: usize) -> Setup {
+            let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+            reactor.journal = ParkedJournal::open(dir.path().join("parked.json"), now);
+            reactor.open_contexts(
+                ContextsStore::new(dir.path().join("contexts.json")),
+                boot.map(Into::into),
+                now,
+            );
+            reactor.handle_event(Event::ConfigChanged(config(true)));
+            reactor.handle_event(screens(vec![screen()], vec![Some(space())]));
+            let mut s = Setup {
+                reactor,
+                apps: Apps::new(),
+                dir,
+            };
+            s.reactor.handle_events(s.apps.make_app(1, make_windows(windows)));
+            s.reactor.handle_event(Event::StartupComplete);
+            s.apps.simulate_until_quiet(&mut s.reactor);
+            s
+        }
+
+        fn file_names(&self) -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(self.dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        }
+
+        fn saved_json(&self) -> serde_json::Value {
+            serde_json::from_slice(&fs::read(self.dir.path().join("contexts.json")).unwrap())
+                .unwrap()
+        }
+    }
+
+    /// Journal and state files. An unreadable `contexts.json` is moved aside
+    /// unchanged. Sugarglider starts with no contexts and shows every
+    /// window, and the next save writes a new file.
+    #[test]
+    fn an_unreadable_contexts_json_is_moved_aside_and_every_window_shows() {
+        let dir = TempDir::new().unwrap();
+        let contents = br#"{ "version": 1, "contexts": [ { "id": 1, "na"#;
+        fs::write(dir.path().join("contexts.json"), contents).unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+
+        let mut s = Setup::in_dir(dir, Some("boot"), now, 3);
+
+        let aside = "contexts.unreadable-1790000000.json";
+        assert_eq!(vec![aside.to_string()], s.file_names());
+        assert_eq!(contents.to_vec(), fs::read(s.dir.path().join(aside)).unwrap());
+        assert!(s.reactor.contexts.contexts().is_empty());
+        assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+        let everything = vec![
+            (wid(1), rect(0., 0., 400., 1000.)),
+            (wid(2), rect(400., 0., 400., 1000.)),
+            (wid(3), rect(800., 0., 400., 1000.)),
+        ];
+        assert_eq!(everything, s.tiles());
+        assert_eq!(everything, s.frames(&[wid(1), wid(2), wid(3)]));
+        assert!(s.parked().is_empty());
+
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        assert_eq!(c, s.saved_active());
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+        assert_eq!(contents.to_vec(), fs::read(s.dir.path().join(aside)).unwrap());
+    }
+
+    /// Journal and state files, R4, R5. A `contexts.json` with a repeated id,
+    /// names that differ only in case, a reserved name, a blank name,
+    /// numbers out of range or taken, and an active context that doesn't
+    /// exist loads repaired. Every window shows. Commands reach the repaired
+    /// contexts by their new names and numbers, the reserved name still
+    /// names the built-in entry, and the next save writes the repaired
+    /// values.
+    #[test]
+    fn a_contexts_json_with_values_to_repair_loads_repaired() {
+        let dir = TempDir::new().unwrap();
+        let file = r#"{
+            "version": 1, "next_id": 2, "use_seq": 5,
+            "contexts": [
+                { "id": 2, "name": "Work", "number": 2, "last_used": 4 },
+                { "id": 2, "name": "WORK", "number": 2, "last_used": 5 },
+                { "id": 3, "name": "unsorted", "number": 12 },
+                { "id": 4, "name": "  ", "number": 0 }
+            ],
+            "active": { "global": 9 }
+        }"#;
+        fs::write(dir.path().join("contexts.json"), file).unwrap();
+
+        let mut s = Setup::in_dir(dir, Some("boot"), SystemTime::now(), 3);
+
+        let loaded: Vec<(u32, &str, Option<u8>)> = s
+            .reactor
+            .contexts
+            .contexts()
+            .iter()
+            .map(|context| (context.id.get(), context.name.as_str(), context.number))
+            .collect();
+        assert_eq!(
+            vec![
+                (2, "Work", Some(2)),
+                (5, "WORK 2", None),
+                (3, "unsorted 2", None),
+                (4, "Context 1", None),
+            ],
+            loaded
+        );
+        assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+        assert!(s.parked().is_empty());
+        assert_eq!(3, s.tiles().len());
+        let run = |s: &mut Setup, reference: ContextRef| {
+            s.reactor.handle_event(Event::Command(Command::Context(
+                ContextCommand::SwitchContext(reference),
+            )));
+            s.apps.simulate_until_quiet(&mut s.reactor);
+            s.reactor.contexts.active()
+        };
+        let named =
+            |id: u32| ContextKey::Named(serde_json::from_value(serde_json::json!(id)).unwrap());
+        assert_eq!(named(2), run(&mut s, ContextRef::Number(2)));
+        assert_eq!(named(5), run(&mut s, ContextRef::Name("work 2".into())));
+        assert_eq!(named(2), run(&mut s, ContextRef::Name("work".into())));
+        assert_eq!(named(4), run(&mut s, ContextRef::Name("context".into())));
+        assert_eq!(
+            ContextKey::Unsorted,
+            run(&mut s, ContextRef::Name("unsorted".into()))
+        );
+        assert_eq!(named(3), run(&mut s, ContextRef::Name("unsorted 2".into())));
+
+        let saved = s.saved_json();
+        assert_eq!(serde_json::json!(6), saved["next_id"]);
+        let written: Vec<serde_json::Value> = saved["contexts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|context| serde_json::json!([context["id"], context["name"], context["number"]]))
+            .collect();
+        assert_eq!(
+            vec![
+                serde_json::json!([2, "Work", 2]),
+                serde_json::json!([5, "WORK 2", null]),
+                serde_json::json!([3, "unsorted 2", null]),
+                serde_json::json!([4, "Context 1", null]),
+            ],
+            written
+        );
+        assert_eq!(serde_json::json!({ "global": 3 }), saved["active"]);
+    }
+
+    /// Journal and state files, R32. `contexts.json` names the active context
+    /// by id, `"unsorted"`, or `"everything"`, and quitting writes it with
+    /// the active context unchanged.
+    #[test]
+    fn contexts_json_names_the_active_context_and_quitting_writes_it() {
+        let mut s = Setup::new(2);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(ContextKey::Unsorted);
+        assert_eq!(
+            serde_json::json!({ "global": "unsorted" }),
+            s.saved_json()["active"]
+        );
+        s.switch(ContextKey::Everything);
+        assert_eq!(
+            serde_json::json!({ "global": "everything" }),
+            s.saved_json()["active"]
+        );
+        s.switch(c);
+        assert_eq!(
+            serde_json::json!({ "global": id_of(c).get() }),
+            s.saved_json()["active"]
+        );
+        let path = s.dir.path().join("contexts.json");
+        fs::remove_file(&path).unwrap();
+        let exits = catch_exits(&mut s);
+
+        save_and_exit(&mut s);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert_eq!(
+            serde_json::json!({ "global": id_of(c).get() }),
+            s.saved_json()["active"]
+        );
+        assert_eq!(serde_json::json!("boot"), s.saved_json()["boot_id"]);
+    }
+
+    /// Journal and state files, R23. An app quits after its window closed,
+    /// so its record is pending. `contexts.json` is written, with the
+    /// window's last title.
+    #[test]
+    fn contexts_json_is_written_when_an_app_whose_record_is_pending_quits() {
+        let mut s = Setup::new(1);
+        let closing = WindowId::new(2, 1);
+        let window = WindowInfo {
+            sys_id: Some(WindowServerId::new(21)),
+            ..make_window(1)
+        };
+        s.reactor.handle_events(s.apps.make_app(2, vec![window]));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let c = s.create("C", &[wid(1), closing]);
+        s.switch(c);
+        let path = s.dir.path().join("contexts.json");
+        fs::remove_file(&path).unwrap();
+        // The window closes first, as the reactor records it from M5b on.
+        s.reactor.contexts.window_closed(closing);
+        s.close(closing);
+        assert!(!path.exists());
+
+        s.reactor.handle_event(Event::ApplicationThreadTerminated(2));
+
+        let members = &s.saved_json()["contexts"][0]["members"];
+        assert_eq!(serde_json::json!("Window1"), members[1]["title"]);
+        assert_eq!(serde_json::json!("com.testapp2"), members[1]["bundle_id"]);
+    }
+
+    /// Answers the requests until the apps are quiet, and adds each request
+    /// to `trace`.
+    fn settle(reactor: &mut Reactor, apps: &mut Apps, trace: &mut Vec<String>) {
+        loop {
+            let requests = apps.requests();
+            if requests.is_empty() {
+                return;
+            }
+            trace.extend(requests.iter().map(|request| format!("{request:?}")));
+            for event in apps.simulate_events_for_requests(requests) {
+                reactor.handle_event(event);
+            }
+        }
+    }
+
+    /// The scenario of `it_moves_windows_dragged_between_spaces` and
+    /// `it_preserves_layout_after_login_screen` in `reactor.rs`, followed by
+    /// a display size change, a Space change, and the events and commands
+    /// that contexts add. `on_launch` runs once the app has launched.
+    /// Returns every request the reactor sent, in order, and the frames
+    /// after the drag and at the end.
+    fn run_drag_and_login_scenario(
+        reactor: &mut Reactor,
+        config: Arc<Config>,
+        on_launch: impl FnOnce(&mut Reactor),
+    ) -> (Vec<String>, Vec<CGRect>, Vec<CGRect>) {
+        let mut apps = Apps::new();
+        let mut trace = vec![];
+        let screen1 = rect(0., 0., 1000., 1000.);
+        let screen2 = rect(1000., 0., 1000., 1000.);
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let displays =
+            |frames: Vec<CGRect>, spaces: Vec<Option<SpaceId>>| Event::ScreenParametersChanged {
+                scale_factors: vec![2.0; frames.len()],
+                frames,
+                bounds: vec![],
+                spaces,
+                converter: CoordinateConverter::default(),
+                on_screen: Default::default(),
+            };
+        let frames = |apps: &Apps| [wid(1), wid(2)].map(|wid| apps.windows[&wid].frame).to_vec();
+        reactor.handle_event(Event::ConfigChanged(config));
+        reactor.handle_event(displays(
+            vec![screen1, screen2],
+            vec![Some(space1), Some(space2)],
+        ));
+        reactor.handle_events(apps.make_app_with_opts(1, make_windows(2), Some(wid(1)), true));
+        reactor.handle_event(Event::StartupComplete);
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        settle(reactor, &mut apps, &mut trace);
+        on_launch(reactor);
+
+        // The left display gets shorter, and the user changes the layout at
+        // each size, so that Space 1 keeps a layout for each size.
+        let short1 = rect(0., 0., 1000., 800.);
+        let move_node = |reactor: &mut Reactor, direction| {
+            reactor.handle_event(Event::Command(Command::Layout(LayoutCommand::MoveNode(
+                direction,
+            ))));
+        };
+        reactor.handle_event(displays(vec![short1, screen2], vec![Some(space1), Some(space2)]));
+        settle(reactor, &mut apps, &mut trace);
+        move_node(reactor, Direction::Up);
+        settle(reactor, &mut apps, &mut trace);
+        reactor.handle_event(displays(
+            vec![screen1, screen2],
+            vec![Some(space1), Some(space2)],
+        ));
+        settle(reactor, &mut apps, &mut trace);
+        move_node(reactor, Direction::Right);
+        settle(reactor, &mut apps, &mut trace);
+
+        // The user drags window 1 onto the other screen.
+        let dragged = wid(1);
+        let frame = apps.windows[&dragged].frame;
+        reactor.handle_event(Event::WindowFrameChanged(
+            dragged,
+            CGRect::new(CGPoint::new(1100., frame.origin.y), frame.size),
+            apps.windows[&dragged].last_seen_txid,
+            Requested(false),
+            Some(MouseState::Down),
+        ));
+        settle(reactor, &mut apps, &mut trace);
+        reactor.handle_event(Event::MouseUp);
+        settle(reactor, &mut apps, &mut trace);
+        let after_drag = frames(&apps);
+        reactor.handle_event(displays(vec![short1, screen2], vec![Some(space1), Some(space2)]));
+        settle(reactor, &mut apps, &mut trace);
+        reactor.handle_event(displays(
+            vec![screen1, screen2],
+            vec![Some(space1), Some(space2)],
+        ));
+        settle(reactor, &mut apps, &mut trace);
+
+        // The right display gets shorter and then its old size back.
+        let shorter = rect(1000., 0., 1000., 800.);
+        reactor.handle_event(displays(
+            vec![screen1, shorter],
+            vec![Some(space1), Some(space2)],
+        ));
+        settle(reactor, &mut apps, &mut trace);
+        reactor.handle_event(displays(
+            vec![screen1, screen2],
+            vec![Some(space1), Some(space2)],
+        ));
+        settle(reactor, &mut apps, &mut trace);
+
+        // The right display shows Space 3 and then Space 2 again.
+        let listed = |apps: &Apps| {
+            WindowsOnScreen::new(
+                [(1, wid(1)), (2, wid(2))]
+                    .map(|(id, wid)| WindowServerInfo {
+                        id: WindowServerId::new(id),
+                        pid: 1,
+                        layer: 0,
+                        frame: apps.windows[&wid].frame,
+                    })
+                    .to_vec(),
+            )
+        };
+        let snapshot = listed(&apps);
+        reactor.handle_event(Event::SpaceChanged(
+            vec![Some(space1), Some(SpaceId::new(3))],
+            snapshot,
+        ));
+        settle(reactor, &mut apps, &mut trace);
+        let snapshot = listed(&apps);
+        reactor.handle_event(Event::SpaceChanged(vec![Some(space1), Some(space2)], snapshot));
+        settle(reactor, &mut apps, &mut trace);
+
+        // The login window.
+        reactor.handle_event(displays(vec![CGRect::ZERO, CGRect::ZERO], vec![None, None]));
+        reactor.handle_event(displays(
+            vec![screen1, screen2],
+            vec![Some(space1), Some(space2)],
+        ));
+        let snapshot = listed(&apps);
+        reactor.handle_event(Event::WindowsOnScreenUpdated { pid: None, on_screen: snapshot });
+        let requests = apps.requests();
+        trace.extend(requests.iter().map(|request| format!("{request:?}")));
+        for request in requests {
+            match request {
+                Request::GetVisibleWindows => reactor.handle_event(Event::WindowsDiscovered {
+                    pid: 1,
+                    new: vec![],
+                    known_visible: vec![],
+                }),
+                request => {
+                    for event in apps.simulate_events_for_requests(vec![request]) {
+                        reactor.handle_event(event);
+                    }
+                }
+            }
+        }
+        settle(reactor, &mut apps, &mut trace);
+
+        // The events and commands that contexts add.
+        reactor.handle_event(Event::ShowEverythingOn(vec![space1, space2]));
+        for command in [
+            ContextCommand::SwitchContext(ContextRef::Number(1)),
+            ContextCommand::SwitchContext(ContextRef::Name("C".into())),
+            ContextCommand::ShowEverything,
+            ContextCommand::PreviousContext,
+        ] {
+            reactor.handle_event(Event::Command(Command::Context(command)));
+        }
+        settle(reactor, &mut apps, &mut trace);
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_event(Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)));
+        settle(reactor, &mut apps, &mut trace);
+        (trace, after_drag, frames(&apps))
+    }
+
+    /// R28. With contexts off, a scenario from the existing reactor tests
+    /// sends exactly the same requests, and ends at the same frames, when
+    /// `contexts.json` holds an active context whose member is one of the
+    /// windows. No file is written.
+    #[test]
+    fn r28_with_contexts_off_a_saved_active_context_changes_no_request() {
+        let mut plain = Reactor::new_for_test(LayoutManager::new_for_test());
+        let (expected, after_drag, at_end) =
+            run_drag_and_login_scenario(&mut plain, config(false), |_| {});
+        let screen1 = rect(0., 0., 1000., 1000.);
+        let screen2 = rect(1000., 0., 1000., 1000.);
+        assert_eq!(vec![screen2, screen1], after_drag);
+        assert_eq!(vec![screen2, screen1], at_end);
+
+        let dir = TempDir::new().unwrap();
+        let mut saved = crate::model::contexts::Contexts::new();
+        let c = saved.create("C").unwrap();
+        let desc = |idx: u32| WindowDesc {
+            wid: wid(idx),
+            bundle_id: Some("com.testapp1".into()),
+            app_name: Some("TestApp1".into()),
+            title: format!("Window{idx}"),
+            window_server_id: Some(WindowServerId::new(idx)),
+        };
+        saved.add_window(c, &desc(1)).unwrap();
+        saved.switch_to(ContextKey::Named(c)).unwrap();
+        let store = ContextsStore::new(dir.path().join("contexts.json"));
+        store.save(&saved, Some("boot")).unwrap();
+        let file = fs::read(dir.path().join("contexts.json")).unwrap();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        reactor.journal = ParkedJournal::open(dir.path().join("parked.json"), SystemTime::now());
+        reactor.open_contexts(store, Some("boot".into()), SystemTime::now());
+        assert_eq!(ContextKey::Named(c), reactor.contexts.active());
+
+        let (trace, after_drag, at_end) =
+            run_drag_and_login_scenario(&mut reactor, config(false), |reactor| {
+                reactor.contexts.add_window(c, &desc(1)).unwrap();
+            });
+
+        assert_eq!(expected, trace);
+        assert_eq!(vec![screen2, screen1], after_drag);
+        assert_eq!(vec![screen2, screen1], at_end);
+        assert!(reactor.parked.is_empty());
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(vec!["contexts.json"], names);
+        assert_eq!(file, fs::read(dir.path().join("contexts.json")).unwrap());
+    }
+
+    /// R32, H3. Quitting puts a parked floating window back at the frame it
+    /// had before it was parked.
+    #[test]
+    fn r32_quitting_puts_a_parked_floating_window_back_at_its_frame() {
+        let mut s = Setup::new(2);
+        float_window_1(&mut s);
+        let floating = rect(100., 100., 50., 50.);
+        let c = s.create("C", &[wid(2)]);
+        s.switch(c);
+        assert_eq!(vec![wid(1)], s.parked());
+        assert_eq!(corner(floating.size), s.frame(wid(1)));
+        let exits = catch_exits(&mut s);
+
+        save_and_exit(&mut s);
+
+        let requests = s.apps.requests();
+        assert_eq!(vec![floating], frame_writes(&requests, wid(1)));
+        answer(&mut s, requests);
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert_eq!(floating, s.frame(wid(1)));
+        assert_eq!(screen(), s.frame(wid(2)));
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    /// R22, journal and state files. `contexts.json` from another boot keeps
+    /// the contexts, their records, the active context, and their layouts,
+    /// and forgets only the window server ids. The next save names the
+    /// current boot.
+    #[test]
+    fn a_contexts_json_from_another_boot_keeps_everything_but_window_server_ids() {
+        let mut s = Setup::new(2);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        s.switch(ContextKey::Everything);
+        s.reactor.contexts.switch_to(c).unwrap();
+        let store = ContextsStore::new(s.dir.path().join("contexts.json"));
+        store.save(&s.reactor.contexts, Some("earlier boot")).unwrap();
+
+        s.reactor.open_contexts(store, Some("boot".into()), SystemTime::now());
+
+        assert_eq!(c, s.reactor.contexts.active());
+        let context = &s.reactor.contexts.contexts()[0];
+        assert_eq!(("C", Some(1)), (context.name.as_str(), context.number));
+        let record = &context.members[0];
+        assert_eq!(
+            (Some("com.testapp1"), "Window1", None),
+            (
+                record.bundle_id.as_deref(),
+                record.title.as_str(),
+                record.window_server_id
+            )
+        );
+        assert_eq!(
+            vec![id_of(c)],
+            s.reactor.layout.context_ids().collect::<Vec<_>>()
+        );
+        s.reactor.save_contexts();
+        let saved = s.saved_json();
+        assert_eq!(serde_json::json!("boot"), saved["boot_id"]);
+        assert_eq!(
+            None,
+            saved["contexts"][0]["members"][0]
+                .get("window_server_id")
+                .filter(|id| !id.is_null())
+        );
     }
 }
