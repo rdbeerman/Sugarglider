@@ -66,11 +66,16 @@ pub struct MessageServer {
 
 struct State {
     wm_tx: wm_controller::Sender,
+    /// Reads the snapshot of the contexts that the reactor published last.
+    contexts: Box<dyn Fn() -> Option<Arc<ContextsSnapshot>>>,
 }
 
 impl MessageServer {
     pub fn new(name: &str, wm_tx: wm_controller::Sender) -> Result<Self, LocalPortCreateError> {
-        let state = Rc::new(RefCell::new(State { wm_tx }));
+        let state = Rc::new(RefCell::new(State {
+            wm_tx,
+            contexts: Box::new(contexts_snapshot::published),
+        }));
         let state_ = state.clone();
         Ok(MessageServer {
             port: LocalMessagePort::new(name, move |id, msg| {
@@ -130,7 +135,7 @@ impl State {
                 Response::Success
             }
             Request::Context(request) => {
-                let snapshot = contexts_snapshot::published();
+                let snapshot = (self.contexts)();
                 let (response, command) = answer_context_request(request, snapshot.as_deref());
                 if let Some(command) = command {
                     _ = self.wm_tx.send((
@@ -363,6 +368,34 @@ mod tests {
             error("\"Everything\" is a reserved name"),
             answer(ContextCommand::CreateContext("Everything".into()))
         );
+    }
+
+    /// I3. The server sends a resolved command to the window manager, which
+    /// passes it to the reactor. A read sends nothing.
+    #[test]
+    fn run_sends_the_command_to_the_window_manager() {
+        let (contexts, snapshot) = contexts();
+        let snapshot = Arc::new(snapshot);
+        let (wm_tx, mut wm_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = State {
+            wm_tx,
+            contexts: Box::new(move || Some(snapshot.clone())),
+        };
+
+        let response = state.on_request(Request::Context(run(switch(name("cli")))));
+
+        assert_eq!(Response::Success, response);
+        let (_, event) = wm_rx.try_recv().unwrap();
+        let wm_controller::WmEvent::Command(wm_controller::WmCommand::ReactorCommand(
+            reactor::Command::Context(command),
+        )) = event
+        else {
+            panic!("{event:?}");
+        };
+        assert_eq!(switch(ContextRef::Id(id(&contexts, "Client work"))), command);
+        let response = state.on_request(Request::Context(ContextRequest::List));
+        assert!(matches!(response, Response::Contexts(_)), "{response:?}");
+        assert!(wm_rx.try_recv().is_err());
     }
 
     /// R28. With contexts off, or before the reactor published anything,
