@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 
 use crate::actor::parked_journal::unreadable_path;
-use crate::model::contexts::{ContextId, Contexts};
+use crate::model::contexts::{CONTEXTS_FILE_VERSION, ContextId, Contexts};
 
 /// Reads and writes `contexts.json`.
 pub struct ContextsStore {
@@ -123,8 +123,11 @@ fn move_aside(path: &Path, now: SystemTime, err: anyhow::Error) -> Loaded {
 /// context doesn't take the id of a context whose layouts are still saved.
 pub fn empty_contexts_after(after: Option<ContextId>) -> Contexts {
     let next_id = after.map_or(1, |id| id.get().saturating_add(1));
-    serde_json::from_value(serde_json::json!({ "version": 1, "next_id": next_id }))
-        .expect("an empty contexts file loads")
+    serde_json::from_value(serde_json::json!({
+        "version": CONTEXTS_FILE_VERSION,
+        "next_id": next_id,
+    }))
+    .expect("an empty contexts file loads")
 }
 
 /// Names the current boot of the Mac by the time it booted, from
