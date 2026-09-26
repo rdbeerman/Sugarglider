@@ -1062,7 +1062,7 @@ impl LayoutManager {
                         }
                     }
                     if let Some(removed) = removed {
-                        self.tree.remove_window_from(self.layout(removed), wid);
+                        self.remove_window_from_space(removed, wid);
                     }
                 }
             }
@@ -1727,6 +1727,31 @@ impl LayoutManager {
                 .flat_map(|(_, mapping)| mapping.layouts())
                 .collect(),
         };
+        for layout in layouts {
+            self.tree.remove_window_from(layout, wid);
+        }
+    }
+
+    /// Removes a window that left the Space from the Space's layouts. With
+    /// contexts on, those are the layouts of every context on the Space, for
+    /// every screen size. Otherwise only the layout the Space shows loses it.
+    fn remove_window_from_space(&mut self, space: SpaceId, wid: WindowId) {
+        if !self.config.settings.experimental.contexts.enable {
+            self.tree.remove_window_from(self.layout(space), wid);
+            return;
+        }
+        let layouts: Vec<LayoutId> = self
+            .layout_mapping
+            .get(&space)
+            .into_iter()
+            .chain(
+                self.context_layouts
+                    .iter()
+                    .filter(|((other, _), _)| *other == space)
+                    .map(|(_, mapping)| mapping),
+            )
+            .flat_map(|mapping| mapping.layouts())
+            .collect();
         for layout in layouts {
             self.tree.remove_window_from(layout, wid);
         }
@@ -5416,6 +5441,101 @@ mod tests {
 
     fn context_keys(mgr: &LayoutManager) -> HashSet<(SpaceId, ContextKey)> {
         mgr.context_layouts.keys().copied().collect()
+    }
+
+    fn contexts_on() -> Arc<Config> {
+        let mut config = Config::default();
+        config.settings.experimental.contexts.enable = true;
+        Arc::new(config)
+    }
+
+    /// Shows each of `keys` on the Space at each size of `screens`, and moves
+    /// a window in each, so that every pair gets a layout of its own.
+    fn give_each_its_own_layout(
+        mgr: &mut LayoutManager,
+        space: SpaceId,
+        screens: &[CGRect],
+        keys: &[ContextKey],
+        windows: &[WindowId],
+    ) {
+        for &key in keys {
+            for screen in screens {
+                switch(mgr, space, screen.size, key, windows);
+                move_window(mgr, space, windows[1], Direction::Up);
+            }
+        }
+    }
+
+    /// L10.
+    #[test]
+    fn a_window_that_leaves_a_space_leaves_every_layout_there() {
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&contexts_on());
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let small = rect(0, 0, 120, 120);
+        let wide = rect(0, 0, 240, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let [c, d] = named_contexts(["C", "D"]);
+        let keys = [ContextKey::Everything, c, d];
+        switch(&mut mgr, space2, small.size, ContextKey::Everything, &[]);
+        give_each_its_own_layout(&mut mgr, space1, &[small, wide], &keys, &[w(1), w(2)]);
+        assert_eq!(2, mgr.context_layouts[&(space1, c)].layouts().len());
+
+        _ = mgr.handle_event(LayoutEvent::WindowSpaceChanged {
+            wid: w(1),
+            added: Some(space2),
+            removed: Some(space1),
+            info: win_info(),
+        });
+
+        for key in keys {
+            for screen in [small, wide] {
+                assert_eq!(
+                    vec![(w(2), screen)],
+                    shown_frames(&mut mgr, space1, screen, key),
+                    "{key:?} at {screen:?}"
+                );
+            }
+        }
+        assert_eq!(
+            vec![(w(1), small)],
+            shown_frames(&mut mgr, space2, small, ContextKey::Everything)
+        );
+    }
+
+    /// R28. Without contexts, a window that leaves a Space leaves only the
+    /// layout the Space shows.
+    #[test]
+    fn without_contexts_a_window_that_leaves_a_space_leaves_only_the_shown_layout() {
+        let mut mgr = LayoutManager::new_for_test();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let small = rect(0, 0, 120, 120);
+        let wide = rect(0, 0, 240, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let everything = ContextKey::Everything;
+        switch(&mut mgr, space2, small.size, everything, &[]);
+        give_each_its_own_layout(&mut mgr, space1, &[small, wide], &[everything], &[w(1), w(2)]);
+
+        _ = mgr.handle_event(LayoutEvent::WindowSpaceChanged {
+            wid: w(1),
+            added: Some(space2),
+            removed: Some(space1),
+            info: win_info(),
+        });
+
+        assert_eq!(
+            vec![(w(2), wide)],
+            shown_frames(&mut mgr, space1, wide, everything)
+        );
+        assert_eq!(
+            vec![w(1), w(2)],
+            shown_frames(&mut mgr, space1, small, everything)
+                .into_iter()
+                .map(|(wid, _)| wid)
+                .collect::<Vec<_>>()
+        );
     }
 
     /// R2, L1, L2. Each context keeps its own layout on each Space and screen
