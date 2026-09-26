@@ -655,3 +655,68 @@ fn r24_r33_a_screen_that_shows_everything_before_its_space_is_turned_off_never_s
     assert!(raise_requests(&mut raises).is_empty());
     assert!(s.parked().is_empty());
 }
+
+/// R12 steps 5 and 6, R16. C is active when Sugarglider starts, and the
+/// frontmost app's main window, window 2, isn't in C. When startup completes,
+/// the context is applied again, and window 2 is parked. As after a switch
+/// that parks it, the focus moves to C's member, window 1, so keystrokes
+/// don't go to a parked window.
+#[test]
+#[ignore = "bug: the apply at startup parks the focused window and moves the focus nowhere"]
+fn r12_r16_the_apply_at_startup_moves_the_focus_off_the_window_it_parks() {
+    let mut s = Setup::on(vec![screen()], vec![Some(space())]);
+    let c = ContextKey::Named(s.reactor.contexts.create("C").unwrap());
+    let gone = WindowId::new(90, 1);
+    let desc = WindowDesc {
+        wid: gone,
+        bundle_id: Some("com.testapp1".into()),
+        app_name: Some("TestApp1".into()),
+        title: "Window1".into(),
+        window_server_id: None,
+    };
+    s.reactor.contexts.add_window(id_of(c), &desc).unwrap();
+    s.reactor.contexts.window_closed(gone);
+    s.reactor.contexts.app_terminated(gone.pid);
+    s.reactor.contexts.switch_to(c).unwrap();
+    let mut raises = capture_raises(&mut s);
+    let events = s.apps.make_app_with_opts(1, make_windows(2), Some(wid(2)), true);
+    s.reactor.handle_events(events);
+    s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
+    assert_eq!(Some(wid(2)), s.reactor.main_window());
+    raise_requests(&mut raises);
+
+    s.reactor.handle_event(Event::StartupComplete);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    assert_eq!(vec![wid(2)], s.parked());
+    assert_eq!(vec![(wid(1), screen())], s.tiles());
+    let focus: Vec<WindowId> = focused(&mut raises).into_iter().flatten().collect();
+    assert_eq!(vec![wid(1)], focus);
+}
+
+/// R12 step 6, R25. A switch to a context without windows activates Finder.
+/// Finder's activation then arrives labeled as the user's, as it is when it
+/// comes after the app thread stops labeling it quiet. It is the switch's own
+/// activation, which ends the wait, so it doesn't switch back to C, the
+/// context of Finder's parked main window.
+#[test]
+#[ignore = "bug: Finder's own activation ends the wait and then counts as the user's focus, so an unquiet one switches back"]
+fn r12_step_6_r25_finders_own_activation_never_switches_back() {
+    let TwoApps { mut s, c, .. } = two_apps();
+    let finder = launch(&mut s, 9, finder_info(), vec![window_at(91, 900.)], &[wid(1)])[0];
+    assert!(s.reactor.contexts.is_member(c, finder));
+    let empty = s.create("Empty", &[]);
+    let _raises = capture_raises(&mut s);
+    s.command(empty);
+    let requests = s.apps.requests();
+    assert_eq!(vec![Quiet::Yes], activations(&requests));
+    answer(&mut s, requests);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    s.reactor.handle_event(Event::ApplicationGloballyActivated(9));
+    s.reactor
+        .handle_event(Event::ApplicationMainWindowChanged(9, Some(finder), Quiet::No));
+    s.reactor.handle_event(Event::ApplicationActivated(9, Quiet::No));
+
+    assert_eq!(empty, s.reactor.contexts.active());
+}

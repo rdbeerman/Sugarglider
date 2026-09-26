@@ -467,19 +467,28 @@ fn r23_every_order_of_a_quit_keeps_the_records_of_every_window() {
 /// names "Doc B", which is still open. By R23 that shows the app still runs,
 /// so the records of "Doc A" go, and those of "Doc B" stay when the app
 /// terminates. A list that names only other apps' windows, or the window
-/// that closed, shows nothing, and both records stay.
+/// that closed, shows nothing, and both records stay. So does a list that
+/// comes after `ApplicationTerminated`, which has kept the records already.
 #[test]
 fn r23_a_window_list_between_the_closes_of_a_quit_deletes_the_first_windows_records() {
-    for listed in ["Doc B", "other apps", "the closed window"] {
+    for listed in [
+        "Doc B",
+        "other apps",
+        "the closed window",
+        "Doc B, terminated",
+    ] {
         let (mut s, c, d, a, b) = quitting_app();
         let closed = on_screen_info(&s, a);
+        if listed == "Doc B, terminated" {
+            quit_step(&mut s, "terminated", a, b);
+        }
         quit_step(&mut s, "destroy a", a, b);
         s.reactor
             .handle_event(Event::ApplicationMainWindowChanged(2, Some(b), Quiet::No));
         let on_screen = match listed {
-            "Doc B" => on_screen(&s, &[wid(1), b]),
             "other apps" => on_screen(&s, &[wid(1)]),
-            _ => WindowsOnScreen::new(vec![on_screen_info(&s, wid(1)), closed]),
+            "the closed window" => WindowsOnScreen::new(vec![on_screen_info(&s, wid(1)), closed]),
+            _ => on_screen(&s, &[wid(1), b]),
         };
         s.reactor
             .handle_event(Event::WindowsOnScreenUpdated { pid: Some(2), on_screen });
@@ -687,12 +696,15 @@ fn r39_r14_own_untracked_and_pinned_windows_that_become_visible_are_not_parked()
     assert_eq!(thirds, s.frames(&[wid(1), wid(2), wid(3)]));
 }
 
-/// R39. An app moves its parked window back onto the screen ten times. Each
-/// move gets exactly one write, which parks the window again, and nothing
-/// else. Once the write is answered, nothing more happens. The journal keeps
-/// the frame from before the first parking, and C's member keeps its tile.
+/// R39, Q1. An app moves its parked window back onto the screen ten times.
+/// The first move gets exactly one write, which parks the window again. No
+/// move gets more than that one write, or a write to another window, and
+/// once a write is answered nothing more happens, so Sugarglider never
+/// keeps a loop going on its own. Whether later moves are parked again is
+/// left open, because Q1 may put a limit into R39. The journal keeps the
+/// frame from before the first parking, and C's member keeps its tile.
 #[test]
-fn r39_an_app_that_keeps_moving_its_parked_window_back_gets_one_write_per_move() {
+fn r39_an_app_that_keeps_moving_its_parked_window_back_gets_at_most_one_write_per_move() {
     let mut s = Setup::new(2);
     let c = s.create("C", &[wid(1)]);
     s.switch(c);
@@ -705,22 +717,29 @@ fn r39_an_app_that_keeps_moving_its_parked_window_back_gets_one_write_per_move()
         let moved = rect(100. + 10. * f64::from(round), 200., 600., 700.);
         move_by_app(&mut s, wid(2), moved);
         let requests = s.apps.requests();
-        assert_eq!(vec![(wid(2), parked_at)], writes_in(&requests), "round {round}");
+        let writes = writes_in(&requests);
+        if round == 0 {
+            assert_eq!(vec![(wid(2), parked_at)], writes);
+        } else {
+            assert!(
+                writes.is_empty() || writes == vec![(wid(2), parked_at)],
+                "{writes:?}"
+            );
+        }
         answer(&mut s, requests);
         assert!(s.apps.requests().is_empty(), "round {round}");
     }
 
-    assert_eq!(parked_at, s.frame(wid(2)));
     assert_eq!(vec![wid(2)], s.parked());
     assert_eq!(journal, s.journal_on_disk());
     assert_eq!(vec![(wid(1), screen())], s.tiles());
     assert_eq!(screen(), s.frame(wid(1)));
 }
 
-/// R39. An app refuses the corner and answers the write that parks its
+/// R39, Q1. An app refuses the corner and answers the write that parks its
 /// window again with a frame on the screen. That starts no loop of writes:
 /// nothing more is written until the app moves the window again, which gets
-/// one write.
+/// at most one write. The first move gets exactly one.
 #[test]
 fn r39_an_app_that_refuses_the_corner_starts_no_loop_of_writes() {
     let mut s = Setup::new(2);
@@ -732,14 +751,21 @@ fn r39_an_app_that_refuses_the_corner_starts_no_loop_of_writes() {
     for round in 0..3 {
         move_by_app(&mut s, wid(2), kept);
         let requests = s.apps.requests();
-        assert_eq!(vec![(wid(2), parked_at)], writes_in(&requests), "round {round}");
-        let txid = requests
-            .iter()
-            .find_map(|request| match request {
-                Request::SetWindowFrame(wid, _, txid) if *wid == self::wid(2) => Some(*txid),
-                _ => None,
-            })
-            .unwrap();
+        let writes = writes_in(&requests);
+        if round == 0 {
+            assert_eq!(vec![(wid(2), parked_at)], writes);
+        } else {
+            assert!(
+                writes.is_empty() || writes == vec![(wid(2), parked_at)],
+                "{writes:?}"
+            );
+        }
+        let Some(txid) = requests.iter().find_map(|request| match request {
+            Request::SetWindowFrame(wid, _, txid) if *wid == self::wid(2) => Some(*txid),
+            _ => None,
+        }) else {
+            continue;
+        };
         s.apps.windows.get_mut(&wid(2)).unwrap().last_seen_txid = txid;
         s.reactor.handle_event(Event::WindowFrameChanged(
             wid(2),
@@ -928,6 +954,8 @@ fn r37_membership_commands_on_an_own_or_untracked_window_change_nothing() {
     assert!(s.reactor.contexts.is_unsorted(panel));
     assert!(s.parked().is_empty());
     assert!(!path.exists());
+    // R29: neither window keeps Unsorted listed.
+    assert!(!s.reactor.lists_unsorted());
 }
 
 /// R37. A membership command acts on the focused window only, and adding a
@@ -1183,4 +1211,161 @@ fn r3_unpinning_under_unsorted_parks_a_window_of_a_named_context() {
     assert_eq!(vec![wid(1), wid(2)], s.parked());
     assert_eq!(vec![(wid(3), screen())], s.tiles());
     assert_eq!(screen(), s.frame(wid(3)));
+}
+
+/// R37. Under Unsorted, the focused window 2 is added to C. The user then
+/// focuses window 3, so window 2 is no longer the main window. Until the next
+/// switch, window 2 still counts as a member of Unsorted: a window list and
+/// the refresh that asks the apps for their windows leave it where it is,
+/// with its tile.
+#[test]
+fn r37_an_added_window_keeps_showing_after_it_loses_the_focus() {
+    let mut s = Setup::new(3);
+    let c = s.create("C", &[wid(1)]);
+    s.switch(ContextKey::Unsorted);
+    let unsorted = halves(wid(2), wid(3));
+    assert_eq!(unsorted, s.tiles());
+    focus_quietly(&mut s, wid(2));
+    run(
+        &mut s,
+        ContextCommand::AddWindowToContext(ContextRef::Id(id_of(c))),
+    );
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    focus_quietly(&mut s, wid(3));
+
+    report_visible(&mut s, &[wid(1), wid(2), wid(3)]);
+    let on_screen = on_screen(&s, &[wid(1), wid(2), wid(3)]);
+    s.reactor
+        .handle_event(Event::WindowsOnScreenUpdated { pid: Some(1), on_screen });
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    assert_eq!(vec![id_of(c)], s.reactor.contexts.contexts_of(wid(2)));
+    assert_eq!(vec![wid(1)], s.parked());
+    assert_eq!(unsorted, s.tiles());
+    assert_eq!(unsorted, s.frames(&[wid(2), wid(3)]));
+}
+
+/// R20, H5. D holds window 2, which is parked while C is active. App 1 opens
+/// window 3 at window 2's corner, as an app that restores the frame its last
+/// window had can do. Parked windows share a corner without being tabs, so
+/// window 3 matches no record, joins C, the active context, and gets a tile.
+#[test]
+fn r20_h5_a_new_window_at_a_parked_windows_corner_joins_the_active_context() {
+    let mut s = Setup::new(2);
+    let c = s.create("C", &[wid(1)]);
+    s.create("D", &[wid(2)]);
+    s.switch(c);
+    let parked_at = corner(CGSize::new(600., 1000.));
+    assert_eq!(parked_at, s.frame(wid(2)));
+    let info = WindowInfo {
+        frame: parked_at,
+        ..make_window(3)
+    };
+
+    open_window(&mut s, wid(3), info, &[wid(1), wid(2)]);
+
+    assert_eq!(vec![id_of(c)], s.reactor.contexts.contexts_of(wid(3)));
+    assert_eq!(vec![wid(2)], s.parked());
+    let tiles = halves(wid(1), wid(3));
+    assert_eq!(tiles, s.tiles());
+    assert_eq!(tiles, s.frames(&[wid(1), wid(3)]));
+}
+
+/// R20, R36. D holds window 2, which the user minimized while it had the
+/// right half of the screen. Under C, app 1 opens window 3 at that frame, as
+/// an app that restores its last window frame can do. A minimized window
+/// shows no frame, so it is no tab of the new window: window 3 matches no
+/// record, joins C, and shows. It is never parked (R20).
+#[test]
+#[ignore = "bug: the tab check compares frames of windows that aren't on screen, so a new window at a minimized window's frame joins that window's context and is parked"]
+fn r20_r36_a_new_window_at_a_minimized_windows_frame_joins_the_active_context() {
+    let mut s = Setup::new(2);
+    let c = s.create("C", &[wid(1)]);
+    s.create("D", &[wid(2)]);
+    report_visible(&mut s, &[wid(1)]);
+    s.switch(c);
+    assert!(s.parked().is_empty());
+    let info = WindowInfo {
+        frame: s.frame(wid(2)),
+        ..make_window(3)
+    };
+
+    open_window(&mut s, wid(3), info, &[wid(1)]);
+
+    assert_eq!(vec![id_of(c)], s.reactor.contexts.contexts_of(wid(3)));
+    assert!(s.parked().is_empty());
+    let tiles = halves(wid(1), wid(3));
+    assert_eq!(tiles, s.tiles());
+    assert_eq!(tiles, s.frames(&[wid(1), wid(3)]));
+}
+
+/// R36, R13. App 1 has window 1 on another Space, only in D, and window 2 on
+/// the visible Space, only in C. Each fills the screen on its own Space, so
+/// they have the same frame. Window 1 is still the app's main window. A
+/// window on a Space nobody sees is no tab, so a switch to C shows window 2,
+/// its member, and parks nothing.
+#[test]
+#[ignore = "bug: the tab check compares frames of windows that aren't on screen, so a window on another Space decides the membership of a window at the same frame"]
+fn r36_r13_a_window_on_another_space_at_the_same_frame_is_no_tab() {
+    let mut s = Setup::on(vec![screen()], vec![Some(space())]);
+    let full = |idx: usize| WindowInfo {
+        frame: screen(),
+        ..make_window(idx)
+    };
+    let mut launch = s.apps.make_app_with_opts(1, vec![full(1), full(2)], Some(wid(1)), false);
+    for event in &mut launch {
+        if let Event::WindowsOnScreenUpdated { on_screen, .. } = event {
+            on_screen.info.remove(0);
+            on_screen.visible.remove(0);
+        }
+    }
+    s.reactor.handle_events(launch);
+    s.reactor.handle_event(Event::StartupComplete);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    assert_eq!(vec![(wid(2), screen())], s.tiles());
+    let c = s.create("C", &[wid(2)]);
+    s.create("D", &[wid(1)]);
+
+    s.switch(c);
+
+    assert_eq!(Vec::<WindowId>::new(), s.parked());
+    assert_eq!(vec![(wid(2), screen())], s.tiles());
+    assert_eq!(screen(), s.frame(wid(2)));
+}
+
+/// R22 step 4, R29. C holds an empty record of app 2 that no title matches. App
+/// 2's window 1 was closed with ⌘W and never reported destroyed, so its app no
+/// longer lists it, and it counts as gone. A switch to C fills the record with
+/// window 2, the app's open window that is in no context, and window 2 shows.
+#[test]
+#[ignore = "bug: a switch fills an empty record at step 4 with a window closed with Cmd-W that was never reported destroyed"]
+fn r22_step_4_fills_a_record_with_an_open_window_and_not_a_closed_one() {
+    let mut s = Setup::new(1);
+    let c = s.create("C", &[wid(1)]);
+    empty_record(&mut s, c, WindowId::new(90, 1), 2, "Compose");
+    let windows = vec![titled("Draft", 21, 700.), titled("Inbox", 22, 900.)];
+    let [closed, open] = launch(&mut s, 2, test_app_info(2), windows)[..] else {
+        panic!()
+    };
+    s.apps.windows.remove(&closed);
+    s.reactor.handle_event(Event::WindowsDiscovered {
+        pid: 2,
+        new: vec![],
+        known_visible: vec![open],
+    });
+    report_visible(&mut s, &[wid(1), open]);
+
+    s.switch(c);
+
+    assert_eq!(
+        vec![
+            record("Window1", RecordLink::Live(wid(1))),
+            record("Inbox", RecordLink::Live(open)),
+        ],
+        records(&s, c)
+    );
+    assert_eq!(Vec::<WindowId>::new(), s.parked());
+    let tiles = halves(wid(1), open);
+    assert_eq!(tiles, s.tiles());
+    assert_eq!(tiles, s.frames(&[wid(1), open]));
 }
