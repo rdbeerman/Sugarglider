@@ -158,7 +158,10 @@ impl Reactor {
     }
 
     /// Describes the windows on the visible screens for `plan_switch`. A
-    /// window on no screen counts as on the first visible screen.
+    /// window on no screen counts as on the first visible screen. So does a
+    /// parked window on a screen that shows a Space Sugarglider doesn't
+    /// manage, so that the plan puts it back when it must show. The other
+    /// windows on such a screen are left out.
     fn switch_input(&self, spaces: &[ShownSpace]) -> SwitchInput {
         let mut input = SwitchInput {
             screens: spaces
@@ -184,25 +187,30 @@ impl Reactor {
             let Some(info) = self.layout_window_info(wid) else {
                 continue;
             };
+            let parked = self.parked.contains_key(&wid);
+            let mut unmanaged = false;
             let slot = match self.best_screen_idx_for_window(&info.frame) {
-                Some(screen) => {
-                    let Some(slot) = spaces.iter().position(|shown| shown.screen == screen) else {
-                        continue;
-                    };
-                    slot
-                }
+                Some(screen) => match spaces.iter().position(|shown| shown.screen == screen) {
+                    Some(slot) => slot,
+                    None if parked => {
+                        unmanaged = true;
+                        0
+                    }
+                    None => continue,
+                },
                 None => 0,
             };
-            let visible = self.windows[&wid]
-                .window_server_id
-                .is_some_and(|wsid| self.visible_windows.contains(&wsid));
+            let visible = !unmanaged
+                && self.windows[&wid]
+                    .window_server_id
+                    .is_some_and(|wsid| self.visible_windows.contains(&wsid));
             let mut window = self.contexts.switch_window(wid);
-            window.parked = self.parked.contains_key(&wid);
+            window.parked = parked;
             window.own = wid.pid == own_pid;
             window.untracked = self.layout.is_untracked(&info);
-            // Minimized windows, windows of hidden apps, and windows on
-            // Spaces nobody sees are all outside the visible windows, and the
-            // plan leaves each of them where it is.
+            // Minimized windows, windows of hidden apps, windows on Spaces
+            // nobody sees, and windows on Spaces Sugarglider doesn't manage
+            // count as unseen, and the plan never parks them.
             window.unseen_space = !visible;
             input.screens[slot].windows.push(window);
         }
@@ -4430,5 +4438,133 @@ mod tests {
         );
         assert_eq!(vec![wid(4)], reactor.parked.keys().copied().collect::<Vec<_>>());
         assert_eq!(corner(CGSize::new(300., 1000.)), apps.windows[&wid(4)].frame);
+    }
+
+    /// Two screens that show Spaces 1 and 2. App 1 has windows 1 and 2 on
+    /// the left screen and window 3 on the right one. C holds window 1, and
+    /// windows 2 and 3 are parked. The right screen then moves to a Space
+    /// that Sugarglider doesn't manage. Returns the frames the windows had
+    /// under Everything.
+    fn parked_on_a_screen_with_an_unmanaged_space() -> (Setup, Vec<(WindowId, CGRect)>) {
+        let mut s = Setup::on(
+            vec![screen(), right()],
+            vec![Some(space()), Some(SpaceId::new(2))],
+        );
+        let at = |x: f64, idx| WindowInfo {
+            frame: rect(x, 100., 50., 50.),
+            ..make_window(idx)
+        };
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![at(100., 1), at(200., 2), at(1300., 3)]));
+        s.reactor.handle_event(Event::StartupComplete);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let everything = s.frames(&[wid(1), wid(2), wid(3)]);
+        assert_eq!(right(), everything[2].1);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+
+        s.reactor.handle_event(Event::SpaceChanged(
+            vec![Some(space()), None],
+            on_screen(&s, &[wid(1), wid(2)]),
+        ));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+        assert_eq!(rect(2399., 999., 1200., 1000.), s.frame(wid(3)));
+        (s, everything)
+    }
+
+    /// R27. Showing Everything puts back a window parked on a screen that
+    /// now shows a Space Sugarglider doesn't manage.
+    #[test]
+    fn r27_everything_puts_back_a_window_parked_on_a_screen_with_an_unmanaged_space() {
+        let (mut s, everything) = parked_on_a_screen_with_an_unmanaged_space();
+
+        s.switch(ContextKey::Everything);
+
+        assert!(s.parked().is_empty());
+        assert_eq!(everything, s.frames(&[wid(1), wid(2), wid(3)]));
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    /// R33. Turning Sugarglider off puts back a window parked on a screen
+    /// that now shows a Space Sugarglider doesn't manage, as the space
+    /// manager does it: it names the managed Spaces, and then reports them
+    /// all as off.
+    #[test]
+    fn r33_turning_off_puts_back_a_window_parked_on_a_screen_with_an_unmanaged_space() {
+        let (mut s, everything) = parked_on_a_screen_with_an_unmanaged_space();
+
+        s.reactor.handle_event(Event::ShowEverythingOn(vec![space()]));
+        s.reactor
+            .handle_event(Event::SpaceChanged(vec![None, None], Default::default()));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert!(s.parked().is_empty());
+        assert_eq!(everything, s.frames(&[wid(1), wid(2), wid(3)]));
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    /// R33. Turning Sugarglider off while the user is on another Space puts
+    /// back the windows parked on the Space the user left.
+    #[test]
+    fn r33_turning_off_from_another_space_puts_back_the_windows_parked_there() {
+        let mut s = Setup::new(3);
+        let everything = s.frames(&[wid(1), wid(2), wid(3)]);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+        let space2 = SpaceId::new(2);
+        s.reactor
+            .handle_event(Event::SpaceChanged(vec![Some(space2)], Default::default()));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+
+        s.reactor.handle_event(Event::ShowEverythingOn(vec![space2]));
+        s.reactor.handle_event(Event::SpaceChanged(vec![None], Default::default()));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert!(s.parked().is_empty());
+        assert!(s.journal_on_disk().is_empty());
+        assert_eq!(everything[1..], s.frames(&[wid(2), wid(3)])[..]);
+    }
+
+    /// R28, R33. Turning contexts off puts back a window parked on a Space
+    /// nobody sees and a window parked on a screen that shows a Space
+    /// Sugarglider doesn't manage.
+    #[test]
+    fn r28_turning_contexts_off_puts_back_windows_parked_outside_the_visible_spaces() {
+        let (mut s, everything) = parked_on_a_screen_with_an_unmanaged_space();
+        // Window 2 leaves the visible Space, for example to be minimized.
+        report_visible(&mut s, &[wid(1)]);
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+
+        s.reactor.handle_event(Event::ConfigChanged(config(false)));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert!(s.parked().is_empty());
+        assert_eq!(everything[1..], s.frames(&[wid(2), wid(3)])[..]);
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    /// R28. Turning contexts off while no screen shows a Space Sugarglider
+    /// manages, as at the login window, puts back every parked window.
+    #[test]
+    fn r28_turning_contexts_off_with_no_managed_space_puts_back_every_parked_window() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let everything = s.frames(&all);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        s.reactor.handle_event(Event::SpaceChanged(vec![None], Default::default()));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+
+        s.reactor.handle_event(Event::ConfigChanged(config(false)));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert!(s.parked().is_empty());
+        assert_eq!(everything[1..], s.frames(&[wid(2), wid(3)])[..]);
+        assert!(s.journal_on_disk().is_empty());
     }
 }
