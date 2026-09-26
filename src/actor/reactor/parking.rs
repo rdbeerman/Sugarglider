@@ -7,7 +7,7 @@
 use std::io;
 
 use objc2_core_foundation::{CGRect, CGSize};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use super::animation::Animation;
 use super::{Reactor, TransactionId, fit_frame_to_screen};
@@ -16,7 +16,7 @@ use crate::actor::parked_journal::JournalEntry;
 use crate::collections::HashSet;
 use crate::model::parking_origin;
 use crate::sys::app::Process;
-use crate::sys::geometry::CGRectExt;
+use crate::sys::geometry::{CGRectExt, SameAs};
 use crate::sys::window_server::WindowServerId;
 
 /// Finds the process that has a pid now.
@@ -91,7 +91,9 @@ impl Reactor {
                 continue;
             }
             let Some(window) = self.windows.get(&wid) else { continue };
-            let Some(app) = self.apps.get(&wid.pid) else { continue };
+            if !self.apps.contains_key(&wid.pid) {
+                continue;
+            }
             let Some(wsid) = window.window_server_id else {
                 debug!(?wid, "Not parking a window without a window server id");
                 continue;
@@ -115,19 +117,78 @@ impl Reactor {
                 );
                 continue;
             };
-            entries.push(JournalEntry {
-                pid: wid.pid,
-                bundle_id: app.info.bundle_id.clone(),
-                window_server_id: wsid,
-                title: window.title.expose_secret().clone(),
-                frame: frame.into(),
-            });
+            entries.extend(self.journal_entry(wid, frame));
             parking.push(Parking { wid, frame, corner });
         }
         if !parking.is_empty() {
             self.journal.record(entries)?;
         }
         Ok(parking)
+    }
+
+    /// The journal entry that puts the window back at `frame`.
+    fn journal_entry(&self, wid: WindowId, frame: CGRect) -> Option<JournalEntry> {
+        let window = self.windows.get(&wid)?;
+        Some(JournalEntry {
+            pid: wid.pid,
+            bundle_id: self.apps.get(&wid.pid)?.info.bundle_id.clone(),
+            window_server_id: window.window_server_id?,
+            title: window.title.expose_secret().clone(),
+            frame: frame.into(),
+        })
+    }
+
+    /// Parks each parked window again when it isn't in the corner that parks
+    /// it on the displays as they are now. A frame from before parking that
+    /// is on no screen now moves onto a screen, and the window's journal
+    /// entry changes before the window moves. If that write fails, those
+    /// windows stay where they are.
+    pub(super) fn repark_moved_windows(&mut self) {
+        let mut wids: Vec<WindowId> = self.parked.keys().copied().collect();
+        wids.sort();
+        let mut entries = vec![];
+        let mut moves = vec![];
+        for wid in wids {
+            let parked = self.parked[&wid];
+            let before = self.on_a_screen(parked.before, parked.observed);
+            let Some(corner) = self.parked_frame(before) else {
+                continue;
+            };
+            if before == parked.before && corner.same_as(parked.observed) {
+                continue;
+            }
+            if before != parked.before {
+                let Some(entry) = self.journal_entry(wid, before) else {
+                    continue;
+                };
+                entries.push(entry);
+            }
+            moves.push((wid, before, corner));
+        }
+        let journaled = entries.is_empty()
+            || match self.journal.record(entries) {
+                Ok(()) => true,
+                Err(err) => {
+                    error!("Could not write the parked-window journal: {err}");
+                    false
+                }
+            };
+        let mut writes = vec![];
+        for (wid, before, corner) in moves {
+            let parked = self.parked.get_mut(&wid).expect("the window is parked");
+            if before != parked.before {
+                if !journaled {
+                    continue;
+                }
+                parked.before = before;
+            }
+            parked.observed = corner;
+            writes.push((wid, corner));
+        }
+        if !writes.is_empty() {
+            info!(count = writes.len(), "Parking windows again in valid corners");
+            self.write_frames_now(&writes);
+        }
     }
 
     /// Moves windows whose journal entries are written into their corners,
@@ -2044,20 +2105,25 @@ mod tests {
         assert_eq!(vec![(wid, screen())], s.tiles());
     }
 
-    #[test]
-    fn h3_a_floating_window_whose_display_is_gone_goes_back_onto_a_screen() {
-        let mut apps = Apps::new();
-        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
-        let main = rect(0., 0., 1000., 1000.);
-        let right = rect(1000., 0., 1000., 1000.);
-        let displays = |frames: Vec<CGRect>| Event::ScreenParametersChanged {
+    /// The displays are now at `frames`, without menu bars. Display n shows
+    /// Space n.
+    fn displays(frames: Vec<CGRect>) -> Event {
+        Event::ScreenParametersChanged {
             bounds: frames.clone(),
             spaces: (1..=frames.len() as u64).map(|id| Some(SpaceId::new(id))).collect(),
             scale_factors: vec![1.0; frames.len()],
             frames,
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn h3_a_floating_window_whose_display_is_gone_goes_back_onto_a_screen() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let main = rect(0., 0., 1000., 1000.);
+        let right = rect(1000., 0., 1000., 1000.);
         reactor.handle_event(displays(vec![main, right]));
         let floating = rect(1200., 100., 300., 300.);
         let window = WindowInfo {
@@ -2182,6 +2248,117 @@ mod tests {
             s.tiles().into_iter().map(|(wid, _)| wid).collect::<Vec<_>>()
         );
         assert_eq!(rect(999., 999., 500., 1000.), s.frame(wid(1)));
+    }
+
+    /// Two displays side by side, a journal in a temporary directory, and app
+    /// 1 with window 1 tiled on the right display and window 2 on the main
+    /// one. Window 1 is parked in the bottom right corner of the right
+    /// display.
+    fn parked_on_the_right_display() -> (Reactor, Apps, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        reactor.journal = ParkedJournal::open(dir.path().join("parked.json"), SystemTime::now());
+        let main = rect(0., 0., 1000., 1000.);
+        let right = rect(1000., 0., 1000., 1000.);
+        reactor.handle_event(displays(vec![main, right]));
+        let on_right = WindowInfo {
+            frame: rect(1200., 100., 200., 200.),
+            ..make_window(1)
+        };
+        reactor.handle_events(apps.make_app(1, vec![on_right, make_window(2)]));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!(right, apps.windows[&wid(1)].frame);
+        reactor.park_windows(&[wid(1)]).unwrap();
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!(rect(1999., 999., 1000., 1000.), apps.windows[&wid(1)].frame);
+        (reactor, apps, dir)
+    }
+
+    fn journal_in(dir: &TempDir) -> Vec<JournalEntry> {
+        ParkedJournal::open(dir.path().join("parked.json"), SystemTime::now())
+            .entries()
+            .to_vec()
+    }
+
+    #[test]
+    fn h1_a_window_parked_on_a_display_that_is_unplugged_is_parked_on_another() {
+        let (mut reactor, mut apps, dir) = parked_on_the_right_display();
+        let main = rect(0., 0., 1000., 1000.);
+        // The right display is unplugged, and macOS moves the window onto the
+        // main display.
+        let txid = reactor.windows[&wid(1)].last_sent_txid;
+        reactor.handle_event(Event::WindowFrameChanged(
+            wid(1),
+            main,
+            txid,
+            Requested(false),
+            None,
+        ));
+        apps.windows.get_mut(&wid(1)).unwrap().frame = main;
+
+        reactor.handle_event(displays(vec![main]));
+
+        let corner = rect(999., 999., 1000., 1000.);
+        let requests = apps.requests();
+        assert_eq!(vec![corner], frame_writes(&requests, wid(1)));
+        assert_eq!(vec![entry(1, 1, main)], journal_in(&dir));
+        for event in apps.simulate_events_for_requests(requests) {
+            reactor.handle_event(event);
+        }
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!(corner, apps.windows[&wid(1)].frame);
+        assert_eq!(vec![entry(1, 1, main)], journal_in(&dir));
+
+        reactor.unpark_windows(&[wid(1)]);
+        assert_eq!(vec![main], frame_writes(&apps.requests(), wid(1)));
+    }
+
+    #[test]
+    fn h1_r30_a_window_is_not_parked_again_before_its_new_journal_entry_is_written() {
+        let (mut reactor, mut apps, dir) = parked_on_the_right_display();
+        let right = rect(1000., 0., 1000., 1000.);
+        let corner = rect(1999., 999., 1000., 1000.);
+
+        let failing = FailingWrites::start(dir.path());
+        reactor.handle_event(displays(vec![rect(0., 0., 1000., 1000.)]));
+        drop(failing);
+
+        assert!(frame_writes(&apps.requests(), wid(1)).is_empty());
+        assert_eq!(
+            Some(right),
+            reactor.parked.get(&wid(1)).map(|parked| parked.before)
+        );
+        assert_eq!(corner, reactor.windows[&wid(1)].frame_monotonic);
+        assert_eq!(vec![entry(1, 1, right)], journal_in(&dir));
+    }
+
+    #[test]
+    fn h1_a_display_added_next_to_a_parked_windows_corner_moves_it_to_a_clear_one() {
+        let mut s = Setup::new(2);
+        let tile = s.frame(wid(2));
+        s.reactor.park_windows(&[wid(2)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(rect(999., 999., 500., 1000.), s.frame(wid(2)));
+
+        // The same displays again move nothing.
+        s.reactor.handle_event(displays(vec![screen()]));
+        assert!(frame_writes(&s.apps.requests(), wid(2)).is_empty());
+
+        // A display on the right would take part of the corner.
+        s.reactor.handle_event(displays(vec![screen(), rect(1000., 0., 1000., 1000.)]));
+
+        let requests = s.apps.requests();
+        assert_eq!(
+            vec![rect(-499., 999., 500., 1000.)],
+            frame_writes(&requests, wid(2))
+        );
+        assert_eq!(vec![entry(1, 2, tile)], s.journal_on_disk());
+        s.handle_requests(requests);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s.reactor.unpark_windows(&[wid(2)]);
+        assert_eq!(vec![tile], frame_writes(&s.apps.requests(), wid(2)));
     }
 
     #[test]

@@ -974,6 +974,7 @@ impl Reactor {
                         self.layout.debug_tree_desc(space, "after event", false);
                     }
                 }
+                self.repark_moved_windows();
                 self.update_active_screen();
                 // FIXME: Update visible windows if space changed.
                 // Forward the event to group_indicators. We serialize these
