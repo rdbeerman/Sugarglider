@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::model::contexts::ContextKey;
 use crate::sys::screen::{SpaceId, get_active_space_number};
 use crate::sys::timer::Timer;
-use crate::ui::status_bar::{MenuKeyEquivalent, StatusIcon};
+use crate::ui::status_bar::{ContextMenuKeys, MenuKeyEquivalent, StatusIcon};
 use crate::{actor, trace_call};
 
 /// Animation frame sequence: rest -> right -> rest -> left -> repeat
@@ -107,6 +107,9 @@ impl Status {
                     toggle_floating_kb,
                 ))
             });
+        }
+        if let Some(icon) = &mut self.icon {
+            icon.set_context_keys(ContextMenuKeys::new(&self.config.keys));
         }
         self.update_space();
     }
