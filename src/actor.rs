@@ -17,6 +17,7 @@ pub mod group_bars;
 pub mod layout;
 pub mod mouse;
 pub mod notification_center;
+pub mod parked_journal;
 pub mod raise;
 pub mod reactor;
 pub mod server;
