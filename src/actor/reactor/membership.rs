@@ -1,9 +1,9 @@
 // Copyright The Glide Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Membership: which contexts a window belongs to. The reactor decides it
-//! when it first sees a window, and keeps it current as windows change and
-//! close. The design is in `docs/specs/contexts.md`.
+//! Membership: which contexts a window belongs to. The reactor decides it when
+//! it first sees a window, and keeps it current as windows change and close.
+//! The design is in `docs/specs/contexts.md`.
 
 use redact::Secret;
 use tracing::{debug, error, info, warn};
@@ -16,18 +16,18 @@ use crate::sys::window_server::WindowServerId;
 impl Reactor {
     /// Decides the membership of windows that the reactor sees for the first
     /// time. The reactor's windows are the windows it has seen, so a window
-    /// that comes back from being minimized, from a hidden app, or from
-    /// another Space is not new.
+    /// that comes back from being minimized, from a hidden app, or from another
+    /// Space is not new.
     ///
     /// Windows found before `StartupComplete` were open before Sugarglider
     /// started. They rejoin the contexts whose records they match, or stay
-    /// unsorted. Later windows rejoin the contexts whose records they match,
-    /// or else join the context that their screen shows.
+    /// unsorted. Later windows rejoin the contexts whose records they match, or
+    /// else join the context that their screen shows.
     ///
-    /// Sugarglider's own windows, windows the layout doesn't track, and
-    /// windows of apps that haven't registered get no membership. With
-    /// contexts off nothing is decided; the windows rejoin their contexts
-    /// when contexts are turned on.
+    /// Sugarglider's own windows, windows the layout doesn't track, and windows
+    /// of apps that haven't registered get no membership. With contexts off
+    /// nothing is decided; the windows rejoin their contexts when contexts are
+    /// turned on.
     pub(super) fn windows_seen(&mut self, wids: &[WindowId]) {
         if !self.contexts_enabled() {
             return;
@@ -61,10 +61,10 @@ impl Reactor {
     }
 
     /// A new tab of a native tab group that the reactor knows joins the
-    /// contexts of the group's main tab. The other windows are matched
-    /// together against the member records, and each window that matches
-    /// nothing joins the context its screen shows. Returns whether any
-    /// window joined or rejoined a context.
+    /// contexts of the group's main tab. The other windows are matched together
+    /// against the member records, and each window that matches nothing joins
+    /// the context its screen shows. Returns whether any window joined or
+    /// rejoined a context.
     fn windows_appeared(&mut self, windows: &[WindowDesc]) -> bool {
         let new: Vec<WindowId> = windows.iter().map(|window| window.wid).collect();
         let mut changed = false;
@@ -95,9 +95,9 @@ impl Reactor {
         changed
     }
 
-    /// The windows of the app that share the window's frame, the window
-    /// first. Native tabs of one group are separate windows with one frame.
-    /// Parked windows share a corner without being tabs.
+    /// The windows of the app that share the window's frame, the window first.
+    /// Native tabs of one group are separate windows with one frame. Parked
+    /// windows share a corner without being tabs.
     pub(super) fn tabs_of(&self, wid: WindowId) -> Vec<WindowId> {
         let Some(window) = self.windows.get(&wid) else {
             return vec![];
@@ -122,14 +122,14 @@ impl Reactor {
         tabs
     }
 
-    /// The window whose membership decides the window's: the main tab
-    /// of its tab group, or the window itself.
+    /// The window whose membership decides the window's: the main tab of its
+    /// tab group, or the window itself.
     pub(super) fn membership_window(&self, wid: WindowId) -> WindowId {
         self.main_tab(wid).unwrap_or(wid)
     }
 
-    /// The main tab of the window's tab group: the app's main window when it
-    /// is one of the group's tabs other than `wid`.
+    /// The main tab of the window's tab group: the app's main window when it is
+    /// one of the group's tabs other than `wid`.
     fn main_tab(&self, wid: WindowId) -> Option<WindowId> {
         let main = self.main_window_tracker.app_main_window(wid.pid)?;
         if main == wid || self.parked.contains_key(&wid) || self.parked.contains_key(&main) {
@@ -139,8 +139,8 @@ impl Reactor {
         (key(wid)? == key(main)?).then_some(main)
     }
 
-    /// A new tab joins the contexts of its group's main tab, and is
-    /// pinned when the main tab is. Returns whether it joined anything.
+    /// A new tab joins the contexts of its group's main tab, and is pinned when
+    /// the main tab is. Returns whether it joined anything.
     fn join_tab_group(&mut self, tab: &WindowDesc, main_tab: WindowId) -> bool {
         let mut joined = false;
         for id in self.contexts.contexts_of(main_tab) {
@@ -153,9 +153,9 @@ impl Reactor {
         joined
     }
 
-    /// The context a new window joins when it matches no record: the one
-    /// the screen it appears on shows. A window on no managed screen joins
-    /// the active context.
+    /// The context a new window joins when it matches no record: the one the
+    /// screen it appears on shows. A window on no managed screen joins the
+    /// active context.
     fn arrival_context(&self, wid: WindowId) -> ContextKey {
         match self.layout_frame(wid).and_then(|frame| self.best_space_for_window(&frame)) {
             Some(space) => self.shown_context(space),
@@ -163,8 +163,8 @@ impl Reactor {
         }
     }
 
-    /// Whether a record of a window of `pid` has `link`'s kind: open, or
-    /// closed and pending.
+    /// Whether a record of a window of `pid` has `link`'s kind: open, or closed
+    /// and pending.
     fn has_records(&self, pid: pid_t, link: fn(RecordLink) -> Option<WindowId>) -> bool {
         self.contexts
             .contexts()
@@ -174,9 +174,9 @@ impl Reactor {
             .any(|record| link(record.link).is_some_and(|wid| wid.pid == pid))
     }
 
-    /// The window's title changed. Its member records take the new title,
-    /// so a window that appears with it after a relaunch can match them. A
-    /// title change alone doesn't write `contexts.json`.
+    /// The window's title changed. Its member records take the new title, so a
+    /// window that appears with it after a relaunch can match them. A title
+    /// change alone doesn't write `contexts.json`.
     pub(super) fn title_changed(&mut self, wid: WindowId, title: Secret<String>) {
         if self.contexts_enabled() && self.windows.contains_key(&wid) {
             self.contexts.title_changed(wid, title.expose_secret());
@@ -187,8 +187,8 @@ impl Reactor {
         }
     }
 
-    /// A window closed. Its records wait, pending, until its app shows
-    /// whether it quit.
+    /// A window closed. Its records wait, pending, until its app shows whether
+    /// it quit.
     pub(super) fn window_closed(&mut self, wid: WindowId) {
         if self.contexts_enabled() {
             self.contexts.window_closed(wid);
@@ -196,8 +196,8 @@ impl Reactor {
     }
 
     /// The app quit. Its records stay, and keep the windows' last titles, so
-    /// its windows can rejoin when it runs again. The contexts are
-    /// saved when the app had records.
+    /// its windows can rejoin when it runs again. The contexts are saved when
+    /// the app had records.
     pub(super) fn app_terminated(&mut self, pid: pid_t) {
         if !self.contexts_enabled() {
             return;
@@ -212,8 +212,8 @@ impl Reactor {
         }
     }
 
-    /// The app showed that it is still running, so its closed windows are
-    /// gone for good, and their pending records go.
+    /// The app showed that it is still running, so its closed windows are gone
+    /// for good, and their pending records go.
     pub(super) fn app_still_running(&mut self, pid: pid_t) {
         if !self.contexts_enabled() || !self.apps.contains_key(&pid) {
             return;
@@ -232,8 +232,8 @@ impl Reactor {
         }
     }
 
-    /// A window server list that names an open window of an app shows
-    /// that the app is still running.
+    /// A window server list that names an open window of an app shows that the
+    /// app is still running.
     pub(super) fn apps_listed(&mut self, listed: &[WindowServerId]) {
         let mut pids: Vec<pid_t> = listed
             .iter()
@@ -248,10 +248,10 @@ impl Reactor {
         }
     }
 
-    /// The windows that a membership command for `window` acts on: the
-    /// window's native tab group. None, and the command does nothing,
-    /// while contexts are off or Sugarglider quits, and when there is no
-    /// window, or it is Sugarglider's own, untracked, or parked.
+    /// The windows that a membership command for `window` acts on: the window's
+    /// native tab group. None, and the command does nothing, while contexts are
+    /// off or Sugarglider quits, and when there is no window, or it is
+    /// Sugarglider's own, untracked, or parked.
     fn command_windows(&self, window: Option<WindowId>, command: &str) -> Option<Vec<WindowId>> {
         if !self.contexts_enabled() {
             debug!(command, "Ignoring a context command while contexts are off");
@@ -275,9 +275,9 @@ impl Reactor {
         Some(self.tabs_of(wid))
     }
 
-    /// Adds the window and its tabs to the context. They take effect at
-    /// the next switch: until then the windows count as members of the
-    /// active context, so they stay where they are.
+    /// Adds the window and its tabs to the context. They take effect at the
+    /// next switch: until then the windows count as members of the active
+    /// context, so they stay where they are.
     pub(super) fn add_window_to_context(
         &mut self,
         window: Option<WindowId>,
@@ -300,8 +300,8 @@ impl Reactor {
         self.save_contexts();
     }
 
-    /// Moves the window and its tabs out of the active context and
-    /// into the named one, at once. If they no longer show, they are parked.
+    /// Moves the window and its tabs out of the active context and into the
+    /// named one, at once. If they no longer show, they are parked.
     pub(super) fn move_window_to_context(
         &mut self,
         window: Option<WindowId>,
@@ -325,8 +325,8 @@ impl Reactor {
         self.park_windows_that_left(&tabs);
     }
 
-    /// Removes the window and its tabs from the active context, at
-    /// once. If they no longer show, they are parked.
+    /// Removes the window and its tabs from the active context, at once. If
+    /// they no longer show, they are parked.
     pub(super) fn remove_window_from_context(&mut self, window: Option<WindowId>) {
         let Some(tabs) = self.command_windows(window, "remove_window_from_context") else {
             return;
@@ -344,9 +344,8 @@ impl Reactor {
         self.park_windows_that_left(&tabs);
     }
 
-    /// Pins the window and its tabs, which makes them members of every
-    /// context, or unpins them. Unpinned windows that no longer show are
-    /// parked.
+    /// Pins the window and its tabs, which makes them members of every context,
+    /// or unpins them. Unpinned windows that no longer show are parked.
     pub(super) fn toggle_window_pinned(&mut self, window: Option<WindowId>) {
         let Some(tabs) = self.command_windows(window, "toggle_window_pinned") else {
             return;
@@ -366,10 +365,9 @@ impl Reactor {
         }
     }
 
-    /// Parks the windows that left the active context and no longer show,
-    /// with their journal entries written first, takes them out of
-    /// the layout, and focuses the active context's most recently focused
-    /// member.
+    /// Parks the windows that left the active context and no longer show, with
+    /// their journal entries written first, takes them out of the layout, and
+    /// focuses the active context's most recently focused member.
     fn park_windows_that_left(&mut self, wids: &[WindowId]) {
         if !self.contexts_in_use() {
             return;
@@ -401,10 +399,10 @@ impl Reactor {
     }
 
     /// Parks the windows of `pid` that must not show, with their journal
-    /// entries written first. Sugarglider's own windows, untracked windows,
-    /// and windows outside the visible-window set are left alone, and so is
-    /// the main window, which has taken focus. Does
-    /// nothing while contexts aren't in use and while quitting.
+    /// entries written first. Sugarglider's own windows, untracked windows, and
+    /// windows outside the visible-window set are left alone, and so is the
+    /// main window, which has taken focus. Does nothing while contexts aren't
+    /// in use and while quitting.
     pub(super) fn park_what_must_not_show(&mut self, pid: pid_t) {
         if !self.contexts_in_use() || self.pending_exit.is_some() {
             return;
