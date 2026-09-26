@@ -74,7 +74,7 @@ mod tests {
     use super::super::create_context::tests::*;
     use super::super::testing::*;
     use super::super::{Command, ContextCommand, ContextRef, Event, Reactor, ReactorCommand};
-    use crate::actor::app::WindowId;
+    use crate::actor::app::{Quiet, WindowId};
     use crate::actor::contexts_snapshot::{
         CONTEXTS_OFF, CommandResult, ContextSummary, ContextsSnapshot, MAX_COMMAND_RESULTS,
         RequestId, ScreenContext,
@@ -686,6 +686,38 @@ mod tests {
         assert_eq!(MAX_COMMAND_RESULTS, results.len());
         assert_eq!(Response::Pending, result_of(&s, 8));
         assert_eq!(Response::Success, result_of(&s, 9));
+    }
+
+    /// `sugarglider context add` adds the focused window to the context
+    /// that its query names, and publishes the result: the reason when no
+    /// window has focus, when the query names no context, or when it names
+    /// Everything or Unsorted, which take no window.
+    #[test]
+    fn an_add_from_the_command_line_publishes_its_result() {
+        let mut s = Setup::new(2);
+        let work = s.reactor.contexts.create("Work").unwrap();
+        let add = |name: &str| ContextCommand::AddWindowToContext(ContextRef::Name(name.into()));
+        request(&mut s, 1, add("Work"));
+        s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        s.reactor.handle_event(Event::ApplicationActivated(1, Quiet::Yes));
+        s.reactor
+            .handle_event(Event::ApplicationMainWindowChanged(1, Some(wid(2)), Quiet::Yes));
+
+        request(&mut s, 2, add("wo"));
+        request(&mut s, 3, add("Everything"));
+        request(&mut s, 4, add("nothing"));
+
+        assert_eq!(
+            vec![
+                failed(1, "No window has focus"),
+                ran(2),
+                failed(3, "Only a named context can take a window"),
+                failed(4, "No context matches \"nothing\""),
+            ],
+            s.reactor.published_contexts.clone().unwrap().results
+        );
+        assert!(s.reactor.contexts.is_member(ContextKey::Named(work), wid(2)));
+        assert!(!s.reactor.contexts.is_member(ContextKey::Named(work), wid(1)));
     }
 
     /// A command from a key binding or the menu, which has no request id,

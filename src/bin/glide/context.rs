@@ -42,12 +42,23 @@ pub enum CmdContext {
         name: String,
     },
     /// Switch to a context.
-    Switch {
-        /// The context's number from 1 to 9, or its name or part of it.
-        query: String,
-    },
+    Switch(Query),
+    /// Add the focused window to a context. It stays where it is until the
+    /// next switch.
+    Add(Query),
     /// Show every window.
     Everything,
+}
+
+/// Names a context.
+#[derive(Args, Clone, Debug, PartialEq)]
+pub struct Query {
+    /// The context's number from 1 to 9, or its name or part of it.
+    query: String,
+    /// Take the query as a name, also when it is a number, for a context
+    /// named "2024".
+    #[arg(long)]
+    name: bool,
 }
 
 #[derive(Args, Clone, Debug, PartialEq)]
@@ -98,7 +109,8 @@ fn execute<T: Transport>(
         CmdContext::List(_) => ContextRequest::List,
         CmdContext::Current(_) => ContextRequest::Current,
         CmdContext::Create { name } => run(ContextCommand::CreateContext(name.clone())),
-        CmdContext::Switch { query } => run(ContextCommand::SwitchContext(parse_query(query)?)),
+        CmdContext::Switch(query) => run(ContextCommand::SwitchContext(parse_query(query)?)),
+        CmdContext::Add(query) => run(ContextCommand::AddWindowToContext(parse_query(query)?)),
         CmdContext::Everything => run(ContextCommand::ShowEverything),
     };
     let mut transport = connect().ok_or("Sugarglider isn't running.")?;
@@ -113,7 +125,10 @@ fn execute<T: Transport>(
         }
         (
             Response::Success,
-            CmdContext::Create { .. } | CmdContext::Switch { .. } | CmdContext::Everything,
+            CmdContext::Create { .. }
+            | CmdContext::Switch(_)
+            | CmdContext::Add(_)
+            | CmdContext::Everything,
         ) => wait_for_result(&mut transport, id).map(|()| String::new()),
         (Response::Error(reason), _) => Err(reason),
         (response, _) => Err(unexpected(&response)),
@@ -147,15 +162,20 @@ fn unexpected(response: &Response) -> String {
 }
 
 /// A whole number names a context by its number, from 1 to 9. Any other
-/// text is a name, which the server matches with the switcher's ranking.
-fn parse_query(query: &str) -> Result<ContextRef, String> {
+/// text is a name, and so is a number with `--name`. The reactor matches
+/// names with the switcher's ranking.
+fn parse_query(query: &Query) -> Result<ContextRef, String> {
+    let Query { query, name } = query;
     let trimmed = query.trim();
-    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+    if *name || trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
         return Ok(ContextRef::Name(query.to_string()));
     }
     match trimmed.parse::<u8>() {
         Ok(number @ 1..=9) => Ok(ContextRef::Number(number)),
-        _ => Err(format!("Context numbers go from 1 to 9, not {trimmed}")),
+        _ => Err(format!(
+            "Context numbers go from 1 to 9, not {trimmed}. For a context with that name, \
+             add --name."
+        )),
     }
 }
 
@@ -456,6 +476,19 @@ mod tests {
         ContextCommand::SwitchContext(reference)
     }
 
+    fn query(text: &str) -> Query {
+        Query {
+            query: text.into(),
+            name: false,
+        }
+    }
+
+    fn by_name(text: &str) -> Query {
+        Query { query: text.into(), name: true }
+    }
+
+    /// Clap's own errors, such as a missing argument, exit with status 2
+    /// before the command runs.
     #[test]
     fn subcommands_parse() {
         let output = |json| Output { json };
@@ -468,7 +501,17 @@ mod tests {
                 &["create", "Client work"],
                 CmdContext::Create { name: "Client work".into() },
             ),
-            (&["switch", "2"], CmdContext::Switch { query: "2".into() }),
+            (&["switch", "2"], CmdContext::Switch(query("2"))),
+            (
+                &["switch", "--name", "2024"],
+                CmdContext::Switch(by_name("2024")),
+            ),
+            (
+                &["switch", "2024", "--name"],
+                CmdContext::Switch(by_name("2024")),
+            ),
+            (&["add", "Comms"], CmdContext::Add(query("Comms"))),
+            (&["add", "--name", "3"], CmdContext::Add(by_name("3"))),
             (&["everything"], CmdContext::Everything),
         ] {
             assert_eq!(command, parse(args).unwrap(), "{args:?}");
@@ -477,16 +520,20 @@ mod tests {
             &["create"][..],
             &["switch"],
             &["switch", "a", "b"],
+            &["switch", "--name"],
+            &["add"],
             &["list", "--yaml"],
-            &["add", "Comms"],
         ] {
-            assert!(parse(args).is_err(), "{args:?}");
+            let err = parse(args).unwrap_err();
+            assert_eq!(2, err.exit_code(), "{args:?}");
         }
     }
 
     /// A whole number from 1 to 9 is a number, and other text is a name.
+    /// With `--name`, a number is a name too.
     #[test]
     fn a_query_is_a_number_or_a_name() {
+        let parse_query = |text: &str| parse_query(&query(text));
         assert_eq!(Ok(ContextRef::Number(2)), parse_query("2"));
         assert_eq!(Ok(ContextRef::Number(9)), parse_query(" 09 "));
         assert_eq!(Ok(ContextRef::Name("cli".into())), parse_query("cli"));
@@ -494,8 +541,17 @@ mod tests {
         assert_eq!(Ok(ContextRef::Name("-1".into())), parse_query("-1"));
         for query in ["0", "10", "300"] {
             assert_eq!(
-                Err(format!("Context numbers go from 1 to 9, not {query}")),
+                Err(format!(
+                    "Context numbers go from 1 to 9, not {query}. For a context with that \
+                     name, add --name."
+                )),
                 parse_query(query)
+            );
+        }
+        for text in ["3", "2024", " 0 "] {
+            assert_eq!(
+                Ok(ContextRef::Name(text.into())),
+                super::parse_query(&by_name(text))
             );
         }
     }
@@ -708,7 +764,11 @@ mod tests {
                 old_server,
                 "The running Sugarglider doesn't support this command. Restart it.\n",
             ),
-            (out_of_range, "Context numbers go from 1 to 9, not 12\n"),
+            (
+                out_of_range,
+                "Context numbers go from 1 to 9, not 12. For a context with that name, add \
+                 --name.\n",
+            ),
             (
                 run_with(&["list"], Response::Success),
                 "Unexpected reply from Sugarglider: Success\n",
@@ -784,7 +844,7 @@ mod tests {
     }
 
     /// Every subcommand, with each output form.
-    const EVERY_SUBCOMMAND: [&[&str]; 8] = [
+    const EVERY_SUBCOMMAND: [&[&str]; 11] = [
         &["list"],
         &["list", "--json"],
         &["current"],
@@ -792,6 +852,9 @@ mod tests {
         &["create", "Client work"],
         &["switch", "2"],
         &["switch", "cli"],
+        &["switch", "--name", "2024"],
+        &["add", "Comms"],
+        &["add", "--name", "3"],
         &["everything"],
     ];
 
@@ -1143,7 +1206,14 @@ mod tests {
         for query in ["00", "256", "99999999999"] {
             let ran = run_with(&["switch", query], Response::Success);
             assert_eq!(
-                (1, "", format!("Context numbers go from 1 to 9, not {query}\n")),
+                (
+                    1,
+                    "",
+                    format!(
+                        "Context numbers go from 1 to 9, not {query}. For a context with that \
+                         name, add --name.\n"
+                    )
+                ),
                 (ran.status, &*ran.out, ran.err)
             );
             assert!(ran.requests.is_empty());
@@ -1169,17 +1239,54 @@ mod tests {
     /// M5c. `sugarglider context add <query>` adds the focused window to a
     /// context.
     #[test]
-    #[ignore = "bug: M5c has no `sugarglider context add`; it needs M5b's add_window_to_context command"]
     fn add_sends_one_command_for_the_focused_window() {
         let parsed = parse(&["add", "Comms"]);
         assert!(parsed.is_ok(), "{parsed:?}");
         let ran = run_with(&["add", "Comms"], Response::Success);
         assert_eq!((0, "", ""), (ran.status, &*ran.out, &*ran.err));
-        assert_eq!(1, ran.requests.len());
-        assert!(
-            matches!(ran.requests[0], ContextRequest::Run(..)),
-            "{:?}",
-            ran.requests
+        assert_eq!(
+            vec![ContextCommand::AddWindowToContext(ContextRef::Name(
+                "Comms".into()
+            ))],
+            ran.commands()
         );
+        let ran = run_with(&["add", "2"], Response::Success);
+        assert_eq!(
+            vec![ContextCommand::AddWindowToContext(ContextRef::Number(2))],
+            ran.commands()
+        );
+    }
+
+    /// A context whose name is a number, such as "2024" or "3", is reached
+    /// with `--name`, which sends the text as a name. Without it, the
+    /// command says to add it.
+    #[test]
+    fn a_name_made_of_digits_is_sent_with_name() {
+        for (args, command) in [
+            (
+                &["switch", "--name", "2024"][..],
+                switch(ContextRef::Name("2024".into())),
+            ),
+            (&["switch", "--name", "3"], switch(ContextRef::Name("3".into()))),
+            (
+                &["add", "--name", "2024"],
+                ContextCommand::AddWindowToContext(ContextRef::Name("2024".into())),
+            ),
+        ] {
+            let ran = run_with(args, Response::Success);
+            assert_eq!((0, "", ""), (ran.status, &*ran.out, &*ran.err), "{args:?}");
+            assert_eq!(vec![command], ran.commands(), "{args:?}");
+        }
+
+        let ran = run_with(&["switch", "2024"], Response::Success);
+        assert_eq!(
+            (
+                1,
+                "Context numbers go from 1 to 9, not 2024. For a context with that name, add \
+                 --name.\n"
+            ),
+            (ran.status, &*ran.err)
+        );
+        assert!(ran.requests.is_empty());
     }
 }
