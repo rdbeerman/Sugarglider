@@ -101,6 +101,7 @@ pub(super) mod tests {
     use crate::actor::contexts_store::{ContextsStore, Loaded};
     use crate::actor::layout::LayoutManager;
     use crate::actor::parked_journal::ParkedJournal;
+    use crate::actor::server::{ContextRequest, Response, answer_context_request};
     use crate::config::Config;
     use crate::model::contexts::{ContextId, ContextKey, Contexts};
     use crate::sys::app::WindowInfo;
@@ -353,6 +354,35 @@ pub(super) mod tests {
 
         assert!(s.reactor.contexts.contexts().is_empty());
         assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+    }
+
+    /// M5c, I3. `sugarglider context create "Client work"` followed at once
+    /// by `sugarglider context switch "Client work"`. The server answers
+    /// both from a snapshot that doesn't have the new context yet, so it
+    /// sends the name as it is, and the reactor resolves it to the new
+    /// context.
+    #[test]
+    fn a_switch_right_after_a_create_goes_to_the_new_context() {
+        let mut s = Setup::new(2);
+        s.create("Comms");
+        s.run(ContextCommand::ShowEverything);
+        let stale = s.reactor.published_contexts.clone().unwrap();
+        let answer = |command| answer_context_request(ContextRequest::Run(command), Some(&stale));
+        let by_name = ContextCommand::SwitchContext(ContextRef::Name("Client work".into()));
+
+        let (reply, create) = answer(ContextCommand::CreateContext("Client work".into()));
+        assert_eq!(Response::Success, reply);
+        let (reply, switch) = answer(by_name.clone());
+        assert_eq!((Response::Success, Some(by_name)), (reply, switch.clone()));
+
+        s.run(create.unwrap());
+        let client = ContextKey::Named(s.id("Client work"));
+        let created = s.reactor.contexts.last_used(client);
+        s.run(switch.unwrap());
+
+        assert_eq!(client, s.reactor.contexts.active());
+        assert_eq!(created + 1, s.reactor.contexts.last_used(client));
+        assert_eq!(vec![wid(1), wid(2)], s.members("Client work"));
     }
 
     /// The command survives the RON round trip that recordings use.
