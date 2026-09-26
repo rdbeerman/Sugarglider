@@ -155,12 +155,69 @@ final class ContextSwitcherContractTests: XCTestCase {
     }
   }
 
+  /// `docs/specs/contexts-switcher-contract.md`, the doc comment on
+  /// `ContextSwitcherJSON`, and `Fixtures` hold the same examples, in the
+  /// same order.
+  func testTheContractExamplesAreTheSameInEveryCopy() throws {
+    let package = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let markdown = try String(
+      contentsOf: package.deletingLastPathComponent()
+        .appendingPathComponent("docs/specs/contexts-switcher-contract.md"),
+      encoding: .utf8
+    )
+    let source = try String(
+      contentsOf: package.appendingPathComponent(
+        "Sources/SugargliderUI/ContextSwitcherContract.swift"),
+      encoding: .utf8
+    )
+    let fixtures =
+      [Fixtures.showPayload, Fixtures.rankForCli, Fixtures.rankForEmptyQuery]
+      + Fixtures.commands.map(\.json)
+    let expected = try fixtures.map(jsonValue)
+
+    XCTAssertEqual(try jsonBlocks(in: markdown, linePrefix: "").map(jsonValue), expected)
+    XCTAssertEqual(try jsonBlocks(in: source, linePrefix: "///").map(jsonValue), expected)
+  }
+
   func testMemberWithoutWindowEncodesNull() throws {
     let member = SwitcherMember(record: 3, app: "Mail", title: "Inbox", window: nil)
     XCTAssertEqual(
       try ContextSwitcherJSON.encode(member),
       #"{"app":"Mail","record":3,"title":"Inbox","window":null}"#
     )
+  }
+
+  /// The text of each fenced `json` block, in order. `linePrefix` is
+  /// removed from each line first, such as the `///` of a doc comment.
+  private func jsonBlocks(in text: String, linePrefix: String) -> [String] {
+    var blocks: [String] = []
+    var current: [String]?
+    for line in text.components(separatedBy: "\n") {
+      let trimmed = line.trimmingCharacters(in: .whitespaces)
+      guard trimmed.hasPrefix(linePrefix) else {
+        current = nil
+        continue
+      }
+      let content = String(trimmed.dropFirst(linePrefix.count))
+      let fence = content.trimmingCharacters(in: .whitespaces)
+      if let lines = current {
+        if fence == "```" {
+          blocks.append(lines.joined(separator: "\n"))
+          current = nil
+        } else {
+          current = lines + [content]
+        }
+      } else if fence == "```json" {
+        current = []
+      }
+    }
+    return blocks
+  }
+
+  private func jsonValue(_ json: String) throws -> NSObject {
+    let value = try JSONSerialization.jsonObject(with: Data(json.utf8))
+    return try XCTUnwrap(value as? NSObject)
   }
 
   private func jsonObject(_ json: String) throws -> NSDictionary {

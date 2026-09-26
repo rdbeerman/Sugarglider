@@ -5,7 +5,11 @@ import Foundation
 
 /// The JSON contract between the context switcher panel and Rust.
 ///
-/// The design is `docs/specs/contexts.md` ("Switcher" and "Swift bridge").
+/// The full contract, including what the Rust half must do, is
+/// `docs/specs/contexts-switcher-contract.md`. This comment summarizes it,
+/// and its examples are the same as the ones there. The design is
+/// `docs/specs/contexts.md` ("Switcher" and "Swift bridge").
+///
 /// All keys are snake_case. A named context is always tagged as
 /// `{"id": N}`, never a bare number, so it can't be read as a context
 /// number. The strings `"everything"` and `"unsorted"` name the two
@@ -158,7 +162,13 @@ import Foundation
 ///
 /// ```json
 /// { "switch": { "id": 4 } }
+/// ```
+///
+/// ```json
 /// { "switch": "unsorted" }
+/// ```
+///
+/// ```json
 /// { "switch": "everything" }
 /// ```
 /// Switches to the entry (R12). `"everything"` shows Everything (R27).

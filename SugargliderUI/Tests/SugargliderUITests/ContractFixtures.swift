@@ -3,8 +3,9 @@
 
 @testable import SugargliderUI
 
-/// The examples of the switcher's JSON contract, as the doc comment on
-/// `ContextSwitcherJSON` and `switcher-json-contract.md` show them.
+/// The examples of the switcher's JSON contract, as
+/// `docs/specs/contexts-switcher-contract.md` and the doc comment on
+/// `ContextSwitcherJSON` show them.
 enum Fixtures {
   static let showPayload = """
     {
