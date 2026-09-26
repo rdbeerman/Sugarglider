@@ -103,22 +103,21 @@ impl PreferencesJson {
             hotkeys: {
                 // Build a map of command_id -> default hotkey from the default config
                 let default_config = Config::default();
-                let default_keys: std::collections::HashMap<String, String> = default_config
-                    .keys
-                    .iter()
-                    .map(|(hotkey, cmd)| {
-                        let (_, _, command_id, _) = describe_command(cmd);
-                        (command_id, format_hotkey(hotkey))
-                    })
-                    .collect();
+                let default_keys: std::collections::HashMap<String, String> =
+                    command_ids(&default_config.keys)
+                        .into_iter()
+                        .zip(&default_config.keys)
+                        .map(|((command_id, _), (hotkey, _))| {
+                            (command_id, format_hotkey(hotkey))
+                        })
+                        .collect();
 
-                let mut hotkeys: Vec<_> = config
-                    .keys
-                    .iter()
-                    .map(|(hotkey, cmd)| {
-                        let (_, _, command_id, _) = describe_command(cmd);
+                let mut hotkeys: Vec<_> = command_ids(&config.keys)
+                    .into_iter()
+                    .zip(&config.keys)
+                    .map(|((command_id, cmd), (hotkey, _))| {
                         let default_key = default_keys.get(&command_id).cloned();
-                        HotkeyBindingJson::from_binding_with_default(hotkey, cmd, default_key)
+                        HotkeyBindingJson::from_binding(hotkey, &cmd, command_id, default_key)
                     })
                     .collect();
 
@@ -170,15 +169,13 @@ impl PreferencesJson {
             std::collections::HashMap::new();
 
         // Add default commands first
-        for (_, cmd) in &Config::default().keys {
-            let (_, _, command_id, _) = describe_command(cmd);
-            command_map.insert(command_id, cmd.clone());
+        for (command_id, cmd) in command_ids(&Config::default().keys) {
+            command_map.insert(command_id, cmd);
         }
 
         // Override with current config commands (for custom exec commands, etc.)
-        for (_, cmd) in &config.keys {
-            let (_, _, command_id, _) = describe_command(cmd);
-            command_map.insert(command_id, cmd.clone());
+        for (command_id, cmd) in command_ids(&config.keys) {
+            command_map.insert(command_id, cmd);
         }
 
         self.hotkeys
@@ -319,13 +316,15 @@ impl WindowRuleJson {
 }
 
 impl HotkeyBindingJson {
-    /// Create from a hotkey binding with an optional default key.
-    pub fn from_binding_with_default(
+    /// Create from a hotkey binding, with the command id that
+    /// [`command_ids`] gives the binding and an optional default key.
+    fn from_binding(
         hotkey: &Hotkey,
         cmd: &WmCommand,
+        command_id: String,
         default_key: Option<String>,
     ) -> Self {
-        let (description, category, command_id, sort_order) = describe_command(cmd);
+        let (description, category, _, sort_order) = describe_command(cmd);
         Self {
             key: format_hotkey(hotkey),
             command_id,
@@ -335,6 +334,28 @@ impl HotkeyBindingJson {
             sort_order,
         }
     }
+}
+
+/// The command id of each binding, in the order of `keys`, each with its
+/// command. Two bindings can run the same command, and one command can name
+/// different records or numbers in each binding, so the first binding keeps
+/// the name that `describe_command` gives its command and each later one
+/// takes an occurrence number. The Preferences UI keys its rows by command
+/// id, so the ids must be unique for it to tell two bindings apart.
+fn command_ids(keys: &[(Hotkey, WmCommand)]) -> Vec<(String, WmCommand)> {
+    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    keys.iter()
+        .map(|(_, cmd)| {
+            let base = describe_command(cmd).2;
+            let count = seen.entry(base.clone()).or_insert(0);
+            *count += 1;
+            let id = match count {
+                1 => base,
+                n => format!("{base}#{n}"),
+            };
+            (id, cmd.clone())
+        })
+        .collect()
 }
 
 /// Format a hotkey using macOS-style symbols.
@@ -995,6 +1016,55 @@ mod tests {
             bindings.iter().map(|(key, cmd)| (key.to_string(), cmd.clone())).collect();
         expected.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(expected, keys);
+    }
+
+    /// The Preferences list keys its rows by command id, so two bindings of
+    /// one command must not share an id. Each keeps its own id, and both
+    /// keep their command and key through the round trip.
+    #[test]
+    fn two_bindings_of_one_command_get_distinct_command_ids() {
+        let command = WmCommand::ReactorCommand(ReactorCommand::Context(
+            ContextCommand::SwitchContext(ContextRef::Number(2)),
+        ));
+        let mut config = Config::default();
+        config.keys = [
+            ("Ctrl + Alt + Digit2", command.clone()),
+            ("Ctrl + Alt + KeyT", command.clone()),
+        ]
+        .into_iter()
+        .map(|(key, cmd)| (Hotkey::from_str(key).unwrap(), cmd))
+        .collect();
+
+        let json = serde_json::to_string(&PreferencesJson::from_config(&config)).unwrap();
+        let prefs: PreferencesJson = serde_json::from_str(&json).unwrap();
+
+        let ids: Vec<&str> = prefs.hotkeys.iter().map(|hk| hk.command_id.as_str()).collect();
+        assert_eq!(vec!["switch_context_2", "switch_context_2#2"], ids);
+
+        let applied = prefs.apply_to_config(&config);
+        let keys: Vec<(String, ContextCommand)> = applied
+            .keys
+            .iter()
+            .map(|(hotkey, cmd)| match cmd {
+                WmCommand::ReactorCommand(ReactorCommand::Context(cmd)) => {
+                    (hotkey.to_string(), cmd.clone())
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            vec![
+                (
+                    "Ctrl + Alt + Digit2".to_string(),
+                    ContextCommand::SwitchContext(ContextRef::Number(2))
+                ),
+                (
+                    "Ctrl + Alt + KeyT".to_string(),
+                    ContextCommand::SwitchContext(ContextRef::Number(2))
+                ),
+            ],
+            keys
+        );
     }
 
     /// The Preferences switch shows and sets
