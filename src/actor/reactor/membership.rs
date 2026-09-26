@@ -248,9 +248,14 @@ impl Reactor {
 
     /// The window's title changed. Its member records take the new title, so a
     /// window that appears with it after a relaunch can match them. A title
-    /// change alone doesn't write `contexts.json`.
+    /// change alone doesn't write `contexts.json`. With contexts off the title
+    /// stays as the window was created: window rules never saw a change from
+    /// a title before contexts existed, and R28 keeps it that way.
     pub(super) fn title_changed(&mut self, wid: WindowId, title: Secret<String>) {
-        if self.contexts_enabled() && self.windows.contains_key(&wid) {
+        if !self.contexts_enabled() {
+            return;
+        }
+        if self.windows.contains_key(&wid) {
             self.contexts.title_changed(wid, title.expose_secret());
         }
         match self.windows.get_mut(&wid) {
@@ -260,20 +265,16 @@ impl Reactor {
     }
 
     /// A window closed. Its records wait, pending, until its app shows whether
-    /// it quit.
+    /// it quit. This keeps records current whether or not contexts are on, so
+    /// that a record can't stay bound to a window that is gone.
     pub(super) fn window_closed(&mut self, wid: WindowId) {
-        if self.contexts_enabled() {
-            self.contexts.window_closed(wid);
-        }
+        self.contexts.window_closed(wid);
     }
 
     /// The app quit. Its records stay, and keep the windows' last titles, so
     /// its windows can rejoin when it runs again. The contexts are saved when
     /// the app had records.
     pub(super) fn app_terminated(&mut self, pid: pid_t) {
-        if !self.contexts_enabled() {
-            return;
-        }
         let had_records = self.has_records(pid, |link| match link {
             RecordLink::Live(wid) | RecordLink::Pending(wid) => Some(wid),
             RecordLink::Empty => None,
@@ -287,7 +288,7 @@ impl Reactor {
     /// The app showed that it is still running, so its closed windows are gone
     /// for good, and their pending records go.
     pub(super) fn app_still_running(&mut self, pid: pid_t) {
-        if !self.contexts_enabled() || !self.apps.contains_key(&pid) {
+        if !self.apps.contains_key(&pid) {
             return;
         }
         let pending = self.has_records(pid, |link| match link {

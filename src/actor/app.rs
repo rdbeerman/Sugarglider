@@ -168,6 +168,11 @@ pub enum Request {
     /// main window change that comes with it, are reported with the given
     /// [`Quiet`].
     Activate(Quiet),
+
+    /// Send `WindowTitleChanged` for this app's windows, or stop sending it.
+    /// The reactor turns it on while contexts are on, so that with contexts
+    /// off window rules see the same titles as before contexts existed.
+    TrackTitles(bool),
 }
 
 struct RaiseRequest(Vec<WindowId>, CancellationToken, u64, Quiet);
@@ -221,6 +226,9 @@ struct State {
     /// Latest animation frame per window, awaiting a flush. See
     /// [`Request::AnimationFrame`].
     pending_frames: HashMap<WindowId, PendingFrame>,
+    /// Whether title changes become reactor events. The reactor keeps this
+    /// off while contexts are off.
+    track_titles: bool,
 }
 
 struct WindowState {
@@ -716,6 +724,7 @@ impl State {
             &mut Request::WindowDestroyed(wid) => {
                 self.on_window_destroyed(wid);
             }
+            &mut Request::TrackTitles(enabled) => self.track_titles = enabled,
             &mut Request::Activate(quiet) => {
                 let main_window = match optional(self.app.main_window()) {
                     Ok(Some(elem)) => self.id(&elem).ok(),
@@ -812,6 +821,9 @@ impl State {
                 }
             }
             kAXTitleChangedNotification => {
+                if !self.track_titles {
+                    return;
+                }
                 let Ok(wid) = self.id(&elem) else {
                     return;
                 };
@@ -1344,6 +1356,7 @@ fn app_thread_main(
         active_window_animations: 0,
         restore_enhanced_ui_on_last_end: false,
         pending_frames: HashMap::default(),
+        track_titles: false,
     };
 
     Executor::run(state.run(

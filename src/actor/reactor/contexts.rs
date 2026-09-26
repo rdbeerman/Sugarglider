@@ -12,7 +12,7 @@ use objc2_core_foundation::CGSize;
 use tracing::{debug, error, info, warn};
 
 use super::{ContextCommand, ContextRef, Reactor};
-use crate::actor::app::{WindowId, pid_t};
+use crate::actor::app::{Request, WindowId, pid_t};
 use crate::actor::contexts_snapshot::CONTEXTS_OFF;
 use crate::actor::contexts_store::{ContextsStore, Loaded, empty_contexts_after};
 use crate::actor::layout::{ActiveContext, EventResponse, LayoutEvent};
@@ -503,6 +503,12 @@ impl Reactor {
     /// every window after they were turned off. Contexts that were never
     /// read are read first.
     pub(super) fn contexts_turned_on_or_off(&mut self) {
+        // Titles reach the window rules only while contexts are on, so that
+        // with contexts off the rules see the same titles as before contexts
+        // existed.
+        for app in self.apps.values() {
+            _ = app.handle.send(Request::TrackTitles(self.contexts_enabled()));
+        }
         if self.contexts_enabled() {
             info!("Contexts are on");
             if self.contexts_unread {
@@ -3935,14 +3941,20 @@ mod tests {
     }
 
     /// Answers the requests until the apps are quiet, and adds each request
-    /// to `trace`.
+    /// to `trace`. Title tracking is left out: it is not a layout request,
+    /// and only the run with contexts on has it.
     fn settle(reactor: &mut Reactor, apps: &mut Apps, trace: &mut Vec<String>) {
         loop {
             let requests = apps.requests();
             if requests.is_empty() {
                 return;
             }
-            trace.extend(requests.iter().map(|request| format!("{request:?}")));
+            trace.extend(
+                requests
+                    .iter()
+                    .filter(|request| !matches!(request, Request::TrackTitles(_)))
+                    .map(|request| format!("{request:?}")),
+            );
             for event in apps.simulate_events_for_requests(requests) {
                 reactor.handle_event(event);
             }

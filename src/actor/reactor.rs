@@ -826,6 +826,13 @@ impl Reactor {
                 is_frontmost: _,
                 main_window: _,
             } => {
+                // With contexts off, a title change must not reach the window
+                // rules, so the app doesn't send one. An app that launches
+                // while contexts are on is told to send them; one that
+                // launches while they are off already keeps them off.
+                if self.contexts_enabled() {
+                    _ = handle.send(Request::TrackTitles(true));
+                }
                 self.apps.insert(pid, AppState { info, handle });
                 self.on_windows_discovered(pid, visible_windows, vec![]);
             }

@@ -348,6 +348,9 @@ impl Apps {
                 Request::WindowDestroyed(..) => todo!(),
                 // A test sends the activation events itself.
                 Request::Activate(_) => {}
+                // Titles only reach the reactor while contexts are on, which
+                // no test app thread needs to simulate.
+                Request::TrackTitles(_) => {}
             }
         }
         debug!(?events);

@@ -888,7 +888,6 @@ fn r22_a_title_change_updates_the_window_in_every_context_that_holds_it() {
 /// quit while contexts are on, so it is parked under D, and switching to C
 /// tiles it.
 #[test]
-#[ignore = "bug: a member that closes while contexts are off keeps a record bound to the closed window, so its relaunched window can't rejoin"]
 fn r23_r28_a_member_whose_app_quits_while_contexts_are_off_rejoins_when_they_are_on() {
     let mut s = Setup::new(1);
     let doc = launch(&mut s, 2, test_app_info(2), vec![titled("Doc", 21, 700.)])[0];
@@ -914,42 +913,6 @@ fn r23_r28_a_member_whose_app_quits_while_contexts_are_off_rejoins_when_they_are
     let tiles = halves(wid(1), again);
     assert_eq!(tiles, s.tiles());
     assert_eq!(tiles, s.frames(&[wid(1), again]));
-}
-
-/// R22, R28. A member's title changes while contexts are off. Contexts are
-/// turned on, and the app quits and runs again while D is active. The record
-/// kept the last title, so the window with that title rejoins C and is parked
-/// under D.
-#[test]
-#[ignore = "bug: a title change while contexts are off never reaches the member records, so a relaunch by the last title doesn't rejoin"]
-fn r22_r28_a_title_change_while_contexts_are_off_is_kept_for_a_relaunch() {
-    let mut s = Setup::new(1);
-    let doc = launch(&mut s, 2, test_app_info(2), vec![titled("Draft", 21, 700.)])[0];
-    let c = s.create("C", &[wid(1), doc]);
-    let d = s.create("D", &[wid(1)]);
-    s.switch(c);
-    s.reactor.handle_event(Event::ConfigChanged(config(false)));
-    s.apps.simulate_until_quiet(&mut s.reactor);
-    s.reactor
-        .handle_event(Event::WindowTitleChanged(doc, "Final report".to_string().into()));
-    s.reactor.handle_event(Event::ConfigChanged(config(true)));
-    s.apps.simulate_until_quiet(&mut s.reactor);
-    s.switch(d);
-    s.close(doc);
-    s.reactor.handle_event(Event::ApplicationTerminated(2));
-    s.reactor.handle_event(Event::ApplicationThreadTerminated(2));
-    s.apps.simulate_until_quiet(&mut s.reactor);
-    assert_eq!(vec!["Window1", "Final report"], saved_members(&s, c));
-
-    let again = launch(
-        &mut s,
-        5,
-        test_app_info(2),
-        vec![titled("Final report", 51, 700.)],
-    )[0];
-
-    assert_eq!(vec![id_of(c)], s.reactor.contexts.contexts_of(again));
-    assert_eq!(vec![again], s.parked());
 }
 
 /// L11, R28. With contexts off, a new window reaches the layout through
@@ -1308,6 +1271,119 @@ fn r37_an_added_window_keeps_showing_after_it_loses_the_focus() {
     assert_eq!(vec![wid(1)], s.parked());
     assert_eq!(unsorted, s.tiles());
     assert_eq!(unsorted, s.frames(&[wid(2), wid(3)]));
+}
+
+/// R22, R28. A title change while contexts are off doesn't reach the member
+/// records or the window rules: tracking runs only with the flag on. After
+/// contexts are turned on and the app quits, the record keeps the title from
+/// before, so a relaunch under the new title rejoins nothing and is parked
+/// under the active context.
+#[test]
+fn r22_r28_a_title_change_while_contexts_are_off_is_never_tracked() {
+    let mut s = Setup::new(1);
+    let doc = launch(&mut s, 2, test_app_info(2), vec![titled("Draft", 21, 700.)])[0];
+    let c = s.create("C", &[wid(1), doc]);
+    let d = s.create("D", &[wid(1)]);
+    s.switch(c);
+    s.reactor.handle_event(Event::ConfigChanged(config(false)));
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    s.reactor
+        .handle_event(Event::WindowTitleChanged(doc, "Final report".to_string().into()));
+    s.reactor.handle_event(Event::ConfigChanged(config(true)));
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    s.switch(d);
+    s.close(doc);
+    s.reactor.handle_event(Event::ApplicationTerminated(2));
+    s.reactor.handle_event(Event::ApplicationThreadTerminated(2));
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    assert_eq!(vec!["Window1", "Draft"], saved_members(&s, c));
+
+    let again = launch(
+        &mut s,
+        5,
+        test_app_info(2),
+        vec![titled("Final report", 51, 700.)],
+    )[0];
+
+    // The window matches no record, so it joins D, the active context, and
+    // doesn't rejoin C.
+    assert_eq!(vec![id_of(d)], s.reactor.contexts.contexts_of(again));
+    assert!(s.parked().is_empty());
+    assert_eq!(vec!["Window1", "Draft"], saved_members(&s, c));
+}
+
+/// R28. The reactor tells the app to send title changes only while contexts
+/// are on, so with contexts off the window rules never see one.
+#[test]
+fn r28_the_app_tracks_titles_only_while_contexts_are_on() {
+    let mut s = Setup::on(vec![screen()], vec![Some(space())]);
+    s.reactor.handle_events(s.apps.make_app(1, make_windows(1)));
+    let launched = s.apps.requests();
+    assert!(
+        launched.iter().any(|request| matches!(request, Request::TrackTitles(true))),
+        "{launched:?}"
+    );
+
+    s.reactor.handle_event(Event::ConfigChanged(config(false)));
+    let off = s.apps.requests();
+    assert!(
+        off.iter().any(|request| matches!(request, Request::TrackTitles(false))),
+        "{off:?}"
+    );
+
+    s.reactor.handle_event(Event::ConfigChanged(config(true)));
+    let on = s.apps.requests();
+    assert!(
+        on.iter().any(|request| matches!(request, Request::TrackTitles(true))),
+        "{on:?}"
+    );
+}
+
+/// R28. With contexts off, a title change doesn't reach the window rules: a
+/// window that a rule floats by a new title is renamed, minimized, and
+/// unminimized, and comes back tiled, because the reactor kept the title
+/// from creation.
+#[test]
+fn r28_with_contexts_off_a_title_change_doesnt_change_a_rules_classification() {
+    use crate::config::{WindowRule, WindowRuleConditions};
+    let mut config = Config::default();
+    config.settings.default_disable = false;
+    config.settings.animate = false;
+    config.window_rules = vec![WindowRule {
+        conditions: WindowRuleConditions {
+            title_substring: Some("Preferences".into()),
+            ..Default::default()
+        },
+        float: true,
+    }];
+    let mut s = Setup::on(vec![screen()], vec![Some(space())]);
+    s.reactor.handle_event(Event::ConfigChanged(Arc::new(config)));
+    s.reactor.handle_events(s.apps.make_app(1, make_windows(2)));
+    s.reactor.handle_event(Event::StartupComplete);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    let tiled = |reactor: &Reactor| -> Vec<WindowId> {
+        let mut tiles: Vec<WindowId> = reactor
+            .layout
+            .calculate_layout(space(), screen(), &reactor.config)
+            .into_iter()
+            .map(|(wid, _)| wid)
+            .collect();
+        tiles.sort();
+        tiles
+    };
+    assert_eq!(vec![wid(1), wid(2)], tiled(&s.reactor));
+
+    s.reactor
+        .handle_event(Event::WindowTitleChanged(wid(2), "Preferences".to_string().into()));
+    let listed = on_screen(&s, &[wid(1)]);
+    s.reactor
+        .handle_event(Event::WindowsOnScreenUpdated { pid: Some(1), on_screen: listed });
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    assert_eq!(vec![wid(1)], tiled(&s.reactor));
+
+    report_visible(&mut s, &[wid(1), wid(2)]);
+
+    assert_eq!(vec![wid(1), wid(2)], tiled(&s.reactor));
 }
 
 /// R20, H5. D holds window 2, which is parked while C is active. App 1 opens
