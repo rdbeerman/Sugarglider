@@ -202,6 +202,17 @@ pub struct Experimental {
     pub status_icon: StatusIconExperimental,
     #[derive_args(ScrollConfigPartial)]
     pub scroll: ScrollConfig,
+    #[derive_args(ContextsConfigPartial)]
+    pub contexts: ContextsConfig,
+}
+
+#[derive(PartialConfig!)]
+#[derive_args(ContextsConfigPartial)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ContextsConfig {
+    /// Named window sets that the user switches between.
+    pub enable: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
@@ -878,6 +889,15 @@ mod tests {
     #[test]
     fn scroll_gate_is_disabled_by_default() {
         assert!(!Config::default().settings.experimental.scroll.enable);
+    }
+
+    /// R28.
+    #[test]
+    fn contexts_are_off_by_default_and_turn_on_with_their_flag() {
+        assert!(!Config::default().settings.experimental.contexts.enable);
+        let config = Config::parse("settings.experimental.contexts.enable = true").unwrap();
+        assert!(config.settings.experimental.contexts.enable);
+        assert!(Config::parse("settings.experimental.contexts.scope = \"global\"").is_err());
     }
 
     #[test]
