@@ -48,7 +48,7 @@ impl Reactor {
 
     /// Whether applying contexts can change anything. Without contexts and
     /// parked windows, Spaces are shown exactly as without the feature.
-    fn contexts_in_use(&self) -> bool {
+    pub(super) fn contexts_in_use(&self) -> bool {
         self.contexts_enabled()
             && (!self.contexts.contexts().is_empty()
                 || self.contexts.active() != ContextKey::Everything
@@ -1631,6 +1631,122 @@ mod tests {
         assert_eq!(vec![0], *exits.lock().unwrap());
         assert!(s.apps.requests().is_empty());
         assert_eq!(ContextKey::Everything, s.saved_active());
+    }
+
+    /// R32, R27. A quit that waits for windows a switch put back, with no
+    /// window parked, shows Everything on the Space while it waits. A window
+    /// that becomes visible meanwhile is tiled there, and the context keeps
+    /// its arrangement.
+    #[test]
+    fn r32_a_quit_that_waits_with_nothing_parked_shows_everything() {
+        let mut s = Setup::new(4);
+        // Window 4 is minimized.
+        let snapshot = on_screen(&s, &[wid(1), wid(2), wid(3)]);
+        s.reactor
+            .handle_event(Event::WindowsOnScreenUpdated { pid: None, on_screen: snapshot });
+        s.reactor.update_visible_windows();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let c = s.create("C", &[wid(1)]);
+        let d = s.create("D", &[wid(1), wid(2), wid(3)]);
+        s.switch(d);
+        s.move_window(wid(1), Direction::Right);
+        let in_d = vec![
+            (wid(1), rect(400., 0., 400., 1000.)),
+            (wid(2), rect(0., 0., 400., 1000.)),
+            (wid(3), rect(800., 0., 400., 1000.)),
+        ];
+        assert_eq!(in_d, s.tiles());
+        s.command(c);
+        s.command(d);
+        let exits = catch_exits(&mut s);
+
+        save_and_exit(&mut s);
+        assert!(s.parked().is_empty());
+        assert!(exits.lock().unwrap().is_empty());
+        let mut requests = s.apps.requests();
+        // Window 4 is unminimized, and the refresh reports it.
+        let snapshot = on_screen(&s, &[wid(1), wid(2), wid(3), wid(4)]);
+        s.reactor
+            .handle_event(Event::WindowsOnScreenUpdated { pid: None, on_screen: snapshot });
+        s.reactor.handle_event(Event::WindowsDiscovered {
+            pid: 1,
+            new: vec![],
+            known_visible: vec![wid(1), wid(2), wid(3), wid(4)],
+        });
+
+        let everything = vec![
+            (wid(1), rect(0., 0., 300., 1000.)),
+            (wid(2), rect(300., 0., 300., 1000.)),
+            (wid(3), rect(600., 0., 300., 1000.)),
+            (wid(4), rect(900., 0., 300., 1000.)),
+        ];
+        assert_eq!(everything, s.tiles());
+        requests.extend(s.apps.requests());
+        answer(&mut s, requests);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert_eq!(everything, s.frames(&[wid(1), wid(2), wid(3), wid(4)]));
+        assert!(s.journal_on_disk().is_empty());
+
+        // The test reactor keeps running after the quit.
+        s.switch(d);
+        assert_eq!(in_d, s.tiles());
+        assert_eq!(vec![wid(4)], s.parked());
+    }
+
+    /// R32, R34. With contexts off, a quit waits for a window that the
+    /// journal put back at launch, until its app reports it back. If the
+    /// deadline passes first, the journal keeps the window's entry.
+    #[test]
+    fn r32_with_contexts_off_a_quit_waits_for_a_window_the_journal_put_back() {
+        let parked_at = corner(CGSize::new(600., 1000.));
+        let before = rect(600., 0., 600., 1000.);
+        for confirmed in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("parked.json");
+            let mut journal = ParkedJournal::open(path.clone(), SystemTime::now());
+            journal.record(vec![entry(2, before)]).unwrap();
+            let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+            reactor.journal = ParkedJournal::open(path.clone(), SystemTime::now());
+            reactor.handle_event(screens(vec![screen()], vec![Some(space())]));
+            let mut apps = Apps::new();
+            let windows = vec![
+                make_window(1),
+                WindowInfo {
+                    frame: parked_at,
+                    ..make_window(2)
+                },
+            ];
+            reactor.handle_events(apps.make_app(1, windows));
+            reactor.handle_event(Event::StartupComplete);
+            let requests = apps.requests();
+            assert_eq!(vec![before], frame_writes(&requests, wid(2)));
+            let exits = Arc::new(Mutex::new(vec![]));
+            let caught = exits.clone();
+            reactor.exit = Box::new(move |code| caught.lock().unwrap().push(code));
+            let start = Instant::now();
+
+            reactor.handle_event(Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)));
+            assert!(exits.lock().unwrap().is_empty());
+            assert!(apps.requests().is_empty());
+
+            if confirmed {
+                for event in apps.simulate_events_for_requests(requests) {
+                    reactor.handle_event(event);
+                }
+                assert_eq!(vec![0], *exits.lock().unwrap());
+                assert!(ParkedJournal::open(path, SystemTime::now()).entries().is_empty());
+            } else {
+                reactor.exit_deadline_tick(start + Duration::from_millis(1900));
+                assert!(exits.lock().unwrap().is_empty());
+                reactor.exit_deadline_tick(Instant::now() + Duration::from_secs(2));
+                assert_eq!(vec![0], *exits.lock().unwrap());
+                assert_eq!(
+                    vec![entry(2, before)],
+                    ParkedJournal::open(path, SystemTime::now()).entries()
+                );
+            }
+        }
     }
 
     /// R33.
@@ -3961,5 +4077,86 @@ mod tests {
         assert_eq!(right(), s.frame(wid(2)));
         assert_eq!(vec![wid(3)], s.parked());
         assert_eq!(vec![entry(3, rect(1400., 100., 50., 50.))], s.journal_on_disk());
+    }
+
+    /// R32, R31. Showing Everything puts the windows back, and a quit comes
+    /// before the app has moved them. The quit waits for them although no
+    /// window is parked any more.
+    #[test]
+    fn r32_a_quit_right_after_showing_everything_waits_for_the_windows_it_put_back() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let everything = s.frames(&all);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+        let exits = catch_exits(&mut s);
+
+        s.command(ContextKey::Everything);
+        assert!(s.parked().is_empty());
+        save_and_exit(&mut s);
+
+        assert!(exits.lock().unwrap().is_empty());
+        assert_eq!(2, s.journal_on_disk().len());
+        let requests = s.apps.requests();
+        assert_eq!(vec![everything[1].1], frame_writes(&requests, wid(2)));
+        assert_eq!(vec![everything[2].1], frame_writes(&requests, wid(3)));
+        answer(&mut s, requests);
+
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert_eq!(everything, s.frames(&all));
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    /// R32, R31. A switch puts back a window of app 2, and a quit comes
+    /// before app 2 has moved it. The quit waits for app 2 as well as for the
+    /// window it puts back itself.
+    #[test]
+    fn r32_a_quit_waits_for_a_window_that_a_switch_just_put_back() {
+        let mut s = Setup::on(vec![screen()], vec![Some(space())]);
+        let other = WindowId::new(2, 1);
+        let window = WindowInfo {
+            sys_id: Some(WindowServerId::new(30)),
+            frame: rect(700., 100., 50., 50.),
+            ..make_window(1)
+        };
+        s.reactor.handle_events(s.apps.make_app(1, make_windows(2)));
+        s.reactor.handle_events(s.apps.make_app(2, vec![window]));
+        s.reactor.handle_event(Event::WindowsOnScreenUpdated {
+            pid: None,
+            on_screen: on_screen(&s, &[wid(1), wid(2), other]),
+        });
+        s.reactor.handle_event(Event::StartupComplete);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let c = s.create("C", &[wid(1)]);
+        let d = s.create("D", &[wid(1), other]);
+        s.switch(c);
+        assert_eq!(vec![wid(2), other], s.parked());
+        let exits = catch_exits(&mut s);
+
+        s.command(d);
+        assert_eq!(vec![wid(2)], s.parked());
+        save_and_exit(&mut s);
+        assert!(exits.lock().unwrap().is_empty());
+        let (app1, app2): (Vec<Request>, Vec<Request>) =
+            s.apps.requests().into_iter().partition(|request| match request {
+                Request::SetWindowFrame(wid, ..) => wid.pid == 1,
+                _ => true,
+            });
+        assert!(!frame_writes(&app2, other).is_empty());
+        answer(&mut s, app1);
+
+        assert!(exits.lock().unwrap().is_empty());
+        assert_eq!(
+            vec![WindowServerId::new(30)],
+            s.journal_on_disk()
+                .iter()
+                .map(|entry| entry.window_server_id)
+                .collect::<Vec<_>>()
+        );
+        answer(&mut s, app2);
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert!(s.journal_on_disk().is_empty());
+        assert!(s.parked().is_empty());
     }
 }

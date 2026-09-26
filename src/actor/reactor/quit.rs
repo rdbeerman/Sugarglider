@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Quitting. Before Sugarglider quits, it puts every parked window back and
-//! waits for the windows to report their frames, for at most 2 seconds.
+//! waits until every window in the journal has reported its frame, for at
+//! most 2 seconds.
 
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use super::Reactor;
 use crate::actor::app::{WindowId, pid_t};
 use crate::sys::window_server::WindowServerId;
 
-/// How long a quit waits for parked windows to come back.
+/// How long a quit waits for windows to come back from parking.
 const EXIT_DEADLINE: Duration = Duration::from_secs(2);
 
 /// A quit that waits for windows to come back from parking.
@@ -24,29 +25,31 @@ pub(super) struct PendingExit {
 }
 
 impl Reactor {
-    /// Saves the state and quits. If windows are parked, they are put back
-    /// first, and the quit waits until each has reported its frame, or until
-    /// the first visibility refresh 2 seconds after `now`. The saved active
-    /// context doesn't change.
+    /// Saves the state and quits. While contexts are in use, every visible
+    /// Space shows Everything first, which puts the parked windows back. The
+    /// quit waits until every window that the journal lists, and that the
+    /// reactor knows, has reported its frame, or until the first visibility
+    /// refresh 2 seconds after `now`. The saved active context doesn't
+    /// change.
     pub(super) fn save_and_exit(&mut self, now: Instant) {
         if self.pending_exit.is_some() {
             debug!("Already waiting to quit");
             return;
         }
-        if self.parked.is_empty() {
+        let waiting = self.journaled_known_windows();
+        if waiting.is_empty() {
             self.exit_now();
             return;
         }
-        let waiting = self
-            .parked
-            .keys()
-            .filter_map(|wid| Some((wid.pid, self.windows.get(wid)?.window_server_id?)))
-            .collect();
-        self.pending_exit = Some(PendingExit { since: now, waiting });
         info!(
-            count = self.parked.len(),
-            "Putting parked windows back before quitting"
+            count = waiting.len(),
+            parked = self.parked.len(),
+            "Waiting for windows to come back from parking before quitting"
         );
+        self.pending_exit = Some(PendingExit { since: now, waiting });
+        if self.parked.is_empty() && !self.contexts_in_use() {
+            return;
+        }
         self.layout.cancel_interactive_state();
         self.in_drag = false;
         self.resizing_window = None;
@@ -58,6 +61,21 @@ impl Reactor {
         }
     }
 
+    /// The journal entries of windows the reactor knows. The entries of apps
+    /// that haven't registered can only be put back at the next launch.
+    fn journaled_known_windows(&self) -> Vec<(pid_t, WindowServerId)> {
+        self.journal
+            .entries()
+            .iter()
+            .filter(|entry| {
+                self.windows.iter().any(|(wid, window)| {
+                    wid.pid == entry.pid && window.window_server_id == Some(entry.window_server_id)
+                })
+            })
+            .map(|entry| (entry.pid, entry.window_server_id))
+            .collect()
+    }
+
     /// Quits if a quit is waiting and every window it waits for is back or
     /// gone.
     pub(super) fn exit_if_windows_are_back(&mut self) {
@@ -65,7 +83,7 @@ impl Reactor {
         if pending.waiting.iter().any(|&(pid, wsid)| self.journal.get(pid, wsid).is_some()) {
             return;
         }
-        info!("Every parked window is back; quitting");
+        info!("Every window is back from parking; quitting");
         self.exit_now();
     }
 
