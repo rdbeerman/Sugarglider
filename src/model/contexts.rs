@@ -126,10 +126,17 @@ pub enum ContextError {
     NumberOutOfRange(u8),
     #[error("No such context")]
     NoSuchContext,
+    #[error("No such member record")]
+    NoSuchRecord,
 }
 
 pub const EVERYTHING_NAME: &str = "Everything";
 pub const UNSORTED_NAME: &str = "Unsorted";
+
+/// The most empty member records that a context, or the pinned list, keeps.
+/// An empty record's window is gone, and the record waits for a window to
+/// match it.
+pub const MAX_EMPTY_RECORDS: usize = 50;
 
 /// The user's contexts, their members, and the active context.
 ///
@@ -385,6 +392,25 @@ impl Contexts {
         let len = context.members.len();
         context.members.retain(|m| m.window() != Some(wid));
         Ok(context.members.len() != len)
+    }
+
+    /// Removes a member record from a context or from the pinned list,
+    /// whether or not it has a live window. `index` points into the slot's
+    /// records. This is how the user removes the record of a window that is
+    /// gone.
+    pub fn remove_record(
+        &mut self,
+        slot: Slot,
+        index: usize,
+    ) -> Result<MemberRecord, ContextError> {
+        let records = match slot {
+            Slot::Pinned => &mut self.pinned,
+            Slot::Context(id) => &mut self.get_mut(id)?.members,
+        };
+        if index >= records.len() {
+            return Err(ContextError::NoSuchRecord);
+        }
+        Ok(records.remove(index))
     }
 
     /// Moves a window out of the active context and into `target`.
@@ -1040,14 +1066,34 @@ impl Contexts {
 
     /// The app quit. All of its records stay, open or pending, and wait for
     /// its windows to appear again.
+    ///
+    /// A context, and the pinned list, keeps at most [`MAX_EMPTY_RECORDS`]
+    /// empty records. When the app's records take it over that, the oldest
+    /// empty records go: first the ones that were empty already, then the
+    /// app's own, each in list order, which is the order the records were
+    /// added. Loading `contexts.json` applies no limit, because every record
+    /// is empty after a restart.
     pub fn app_terminated(&mut self, pid: pid_t) {
         self.last_focus.retain(|wid, _| wid.pid != pid);
-        for record in self.records_mut() {
-            if let RecordLink::Live(wid) | RecordLink::Pending(wid) = record.link
-                && wid.pid == pid
-            {
-                record.link = RecordLink::Empty;
+        let lists = self
+            .contexts
+            .iter_mut()
+            .map(|c| &mut c.members)
+            .chain(std::iter::once(&mut self.pinned));
+        for records in lists {
+            let emptied: Vec<bool> = records
+                .iter()
+                .map(|m| match m.link {
+                    RecordLink::Live(wid) | RecordLink::Pending(wid) => wid.pid == pid,
+                    RecordLink::Empty => false,
+                })
+                .collect();
+            for (record, emptied) in records.iter_mut().zip(&emptied) {
+                if *emptied {
+                    record.link = RecordLink::Empty;
+                }
             }
+            drop_oldest_empty_records(records, &emptied);
         }
     }
 
@@ -1061,6 +1107,30 @@ impl Contexts {
         }
         self.pinned.retain(still_running);
     }
+}
+
+/// Drops empty records until at most [`MAX_EMPTY_RECORDS`] are left, first
+/// the ones not marked in `newest`, then the marked ones, each from the
+/// front of the list.
+fn drop_oldest_empty_records(records: &mut Vec<MemberRecord>, newest: &[bool]) {
+    let empty = records.iter().filter(|m| m.link == RecordLink::Empty).count();
+    let excess = empty.saturating_sub(MAX_EMPTY_RECORDS);
+    if excess == 0 {
+        return;
+    }
+    let mut dropped: Vec<usize> = (0..records.len())
+        .filter(|&i| !newest[i])
+        .chain((0..records.len()).filter(|&i| newest[i]))
+        .filter(|&i| records[i].link == RecordLink::Empty)
+        .take(excess)
+        .collect();
+    dropped.sort_unstable();
+    let mut index = 0;
+    records.retain(|_| {
+        let keep = dropped.binary_search(&index).is_err();
+        index += 1;
+        keep
+    });
 }
 
 /// The windows of a visible screen, for planning a switch.
@@ -3769,6 +3839,86 @@ mod tests {
         assert_eq!(records(&cx, a), vec![("Mail", RecordLink::Live(mail.wid))]);
         assert_eq!(records(&cx, b), vec![]);
         assert_eq!(cx.pinned(), &[]);
+    }
+
+    /// `remove_record` removes a record from a context or the pinned list,
+    /// whether or not its window is open.
+    #[test]
+    fn remove_record_removes_records_with_or_without_a_window() {
+        let (mut cx, ids) = with_records(&[("A", vec![empty_record("App", "Gone", None)])]);
+        let open = window(1, 1, "App", "Open");
+        cx.add_window(ids[0], &open).unwrap();
+        cx.pinned.push(empty_record("Music", "Music", None));
+        let removed = cx.remove_record(Slot::Context(ids[0]), 0).unwrap();
+        assert_eq!(removed, empty_record("App", "Gone", None));
+        assert_eq!(records(&cx, ids[0]), vec![("Open", RecordLink::Live(open.wid))]);
+        assert_eq!(
+            cx.remove_record(Slot::Context(ids[0]), 1),
+            Err(ContextError::NoSuchRecord)
+        );
+        assert_eq!(
+            cx.remove_record(Slot::Context(ContextId(99)), 0),
+            Err(ContextError::NoSuchContext)
+        );
+        assert!(cx.remove_record(Slot::Context(ids[0]), 0).is_ok());
+        assert!(cx.is_unsorted(open.wid));
+        assert!(cx.remove_record(Slot::Pinned, 0).is_ok());
+        assert_eq!(cx.pinned(), &[]);
+    }
+
+    fn titled(prefix: &str, count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("{prefix} {i}")).collect()
+    }
+
+    /// When an app quits, a context keeps at most 50 empty records. The
+    /// ones that were empty already go first, oldest first, then the app's
+    /// own. Live records don't count.
+    #[test]
+    fn app_terminated_keeps_50_empty_records_dropping_the_oldest() {
+        let old = titled("Old", 50);
+        let (mut cx, ids) = with_records(&[(
+            "A",
+            old.iter().map(|title| empty_record("Gone", title, None)).collect(),
+        )]);
+        let docs = window(1, 1, "Chrome", "Docs");
+        let mail = window(1, 2, "Chrome", "Mail");
+        let notes = window(2, 1, "Notes", "Notes");
+        for w in [&docs, &mail, &notes] {
+            cx.add_window(ids[0], w).unwrap();
+        }
+        cx.window_closed(mail.wid);
+        cx.app_terminated(1);
+        let titles: Vec<&str> = records(&cx, ids[0]).into_iter().map(|(t, _)| t).collect();
+        let mut expected: Vec<&str> = old[2..].iter().map(String::as_str).collect();
+        expected.extend(["Docs", "Mail", "Notes"]);
+        assert_eq!(titles, expected);
+
+        // The app's own records go when they alone are over the limit.
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let own = titled("Own", 52);
+        for (idx, title) in own.iter().enumerate() {
+            let w = window(3, idx as u32, "App", title);
+            cx.add_window(a, &w).unwrap();
+            cx.pin(&w);
+        }
+        cx.app_terminated(3);
+        let titles: Vec<&str> = records(&cx, a).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(titles, own[2..].iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(cx.pinned().len(), MAX_EMPTY_RECORDS);
+        assert_eq!(cx.pinned()[0].title, "Own 2");
+    }
+
+    /// `contexts.json` keeps every record, because every record is empty
+    /// after a restart, even in a context with more than 50 members.
+    #[test]
+    fn contexts_json_keeps_every_record() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        for idx in 0..60 {
+            cx.add_window(a, &window(1, idx, "App", &format!("W {idx}"))).unwrap();
+        }
+        assert_eq!(round_trip(&cx).get(a).unwrap().members.len(), 60);
     }
 
     /// R24: focus on a member of the active context, pinned or not, never
