@@ -1386,6 +1386,35 @@ fn r28_with_contexts_off_a_title_change_doesnt_change_a_rules_classification() {
     assert_eq!(vec![wid(1), wid(2)], tiled(&s.reactor));
 }
 
+/// R36, H5. A window of the app shows where the app's parked window sits,
+/// which a tiling layout can produce. Parked windows share a corner without
+/// being tabs, so the showing window takes no membership from the parked
+/// one, and a membership command on it leaves the parked window alone.
+#[test]
+fn r36_parked_windows_that_share_a_corner_are_no_tabs() {
+    let mut s = Setup::new(3);
+    let c = s.create("C", &[wid(1), wid(2)]);
+    let d = s.create("D", &[wid(3)]);
+    s.switch(c);
+    assert_eq!(vec![wid(3)], s.parked());
+    let corner = s.frame(wid(3));
+    s.reactor.windows.get_mut(&wid(2)).unwrap().frame_monotonic = corner;
+    s.apps.windows.get_mut(&wid(2)).unwrap().frame = corner;
+
+    assert_eq!(vec![wid(2)], s.reactor.tabs_of(wid(2)));
+    assert_eq!(wid(2), s.reactor.membership_window(wid(2)));
+    let e = s.create("E", &[]);
+    focus_quietly(&mut s, wid(2));
+    run(
+        &mut s,
+        ContextCommand::AddWindowToContext(ContextRef::Id(id_of(e))),
+    );
+
+    assert_eq!(vec![id_of(c), id_of(e)], s.reactor.contexts.contexts_of(wid(2)));
+    assert_eq!(vec![id_of(d)], s.reactor.contexts.contexts_of(wid(3)));
+    assert_eq!(vec![wid(3)], s.reactor.tabs_of(wid(3)));
+}
+
 /// R20, H5. D holds window 2, which is parked while C is active. App 1 opens
 /// window 3 at window 2's corner, as an app that restores the frame its last
 /// window had can do. Parked windows share a corner without being tabs, so
