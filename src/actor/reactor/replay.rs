@@ -78,7 +78,11 @@ impl Record {
 
     #[cfg(test)]
     pub fn new_for_test(temp: NamedTempFile) -> Self {
-        Self { file: None, temp: Some(temp), layout_line: None }
+        Self {
+            file: None,
+            temp: Some(temp),
+            layout_line: None,
+        }
     }
 
     #[cfg(test)]
