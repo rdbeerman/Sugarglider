@@ -541,12 +541,21 @@ impl From<ValidationError> for SpannedError {
 pub fn write_preferences_to_file(
     prefs: &crate::ui::preferences_json::PreferencesJson,
 ) -> anyhow::Result<PathBuf> {
+    let path = config_path();
+    write_preferences_to_path(prefs, &path)?;
+    Ok(path)
+}
+
+/// Write preferences to the config file at `path`, as
+/// [`write_preferences_to_file`] does.
+fn write_preferences_to_path(
+    prefs: &crate::ui::preferences_json::PreferencesJson,
+    path: &Path,
+) -> anyhow::Result<()> {
     use std::fs;
     use std::io::Write;
 
     use toml_edit::{DocumentMut, value};
-
-    let path = config_path();
 
     // Load existing config or create empty document
     let existing = if path.exists() {
@@ -617,7 +626,7 @@ pub fn write_preferences_to_file(
         // This ensures we have serializations for all standard commands (from defaults)
         // plus any custom commands like `exec` (from the loaded config).
         let default_config = Config::default();
-        let current_config = Config::load(None).unwrap_or_else(|_| Config::default());
+        let current_config = Config::load(Some(path)).unwrap_or_else(|_| Config::default());
 
         let mut command_serializations: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
@@ -683,9 +692,9 @@ pub fn write_preferences_to_file(
     // Write atomically using a temp file
     let tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
     write!(tmp.as_file(), "{}", doc)?;
-    tmp.persist(&path)?;
+    tmp.persist(path)?;
 
-    Ok(path)
+    Ok(())
 }
 
 /// Convert macOS symbol hotkey format (⌥⇧H) to TOML key format (Alt + Shift + KeyH).
