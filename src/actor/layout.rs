@@ -6586,6 +6586,76 @@ mod tests {
         );
     }
 
+    /// Whether some layout holds two nodes for one window.
+    fn has_duplicate_nodes(mgr: &LayoutManager) -> bool {
+        mgr.tree.layouts().any(|layout| {
+            let windows: Vec<WindowId> = mgr
+                .tree
+                .root(layout)
+                .traverse_postorder(mgr.tree.map())
+                .filter_map(|node| mgr.tree.window_at(node))
+                .collect();
+            windows.len() != windows.iter().collect::<HashSet<_>>().len()
+        })
+    }
+
+    /// L9. Floating a window and changing the layout kind under Everything
+    /// leave the window's nodes in C's and D's layouts, before the windows
+    /// are sent again. No layout gets two nodes for one window.
+    #[test]
+    fn floating_and_changing_the_layout_kind_under_everything_keep_context_nodes() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        mgr.set_config(&config_with_scroll(true, LayoutKind::Tree));
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c, d] = named_contexts(["C", "D"]);
+        let everything = ContextKey::Everything;
+        let c_frames = vec![
+            (w(1), rect(0, 0, 120, 60)),
+            (w(2), rect(0, 60, 60, 60)),
+            (w(3), rect(60, 60, 60, 60)),
+        ];
+        let d_frames = vec![
+            (w(1), rect(0, 60, 60, 60)),
+            (w(2), rect(0, 0, 120, 60)),
+            (w(3), rect(60, 60, 60, 60)),
+        ];
+
+        switch(&mut mgr, space, screen.size, everything, &all);
+        switch(&mut mgr, space, screen.size, d, &all);
+        move_window(&mut mgr, space, w(2), Direction::Up);
+        switch(&mut mgr, space, screen.size, everything, &all);
+        switch(&mut mgr, space, screen.size, c, &all);
+        move_window(&mut mgr, space, w(1), Direction::Up);
+        switch(&mut mgr, space, screen.size, everything, &all);
+
+        _ = mgr.handle_event(WindowFocused(vec![space], w(2)));
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        assert_eq!(
+            vec![(w(1), rect(0, 0, 60, 120)), (w(3), rect(60, 0, 60, 120))],
+            mgr.layout_sorted(space, screen),
+        );
+        assert_eq!(c_frames, shown_frames(&mut mgr, space, screen, c));
+        assert_eq!(d_frames, shown_frames(&mut mgr, space, screen, d));
+
+        show(&mut mgr, space, screen.size, everything);
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        _ = mgr.handle_command(Some(space), &[space], ChangeLayoutKind);
+        assert_eq!(LayoutKind::Scroll, mgr.active_layout_kind(space));
+        let everything_layout = mgr.layout_mapping[&space].active_layout();
+        for wid in all {
+            assert!(mgr.tree.window_node(everything_layout, wid).is_some());
+        }
+        assert!(!has_duplicate_nodes(&mgr));
+        assert_eq!(c_frames, shown_frames(&mut mgr, space, screen, c));
+        assert_eq!(d_frames, shown_frames(&mut mgr, space, screen, d));
+        assert!(!has_duplicate_nodes(&mgr));
+    }
+
     /// L3. A context whose first layout is made with no members starts
     /// empty.
     #[test]
