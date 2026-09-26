@@ -317,7 +317,6 @@ impl Reactor {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Instant, SystemTime};
 
@@ -330,7 +329,7 @@ mod tests {
     use super::super::{Command, Event, FrameAttempt, MAX_FRAME_ATTEMPTS, Reactor, Requested};
     use crate::actor::app::{Quiet, Request, WindowId, pid_t};
     use crate::actor::layout::{LayoutCommand, LayoutEvent, LayoutManager};
-    use crate::actor::parked_journal::{JournalEntry, ParkedJournal};
+    use crate::actor::parked_journal::{FailingWrites, JournalEntry, ParkedJournal};
     use crate::sys::app::{Process, WindowInfo};
     use crate::sys::event::MouseState;
     use crate::sys::geometry::CGRectExt;
@@ -566,9 +565,9 @@ mod tests {
         let txid = s.reactor.windows[&wid(1)].last_sent_txid;
         let frame = s.reactor.windows[&wid(1)].frame_monotonic;
 
-        fs::set_permissions(s.dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let failing = FailingWrites::start(s.dir.path());
         let result = s.reactor.park_windows(&[wid(1), wid(2)]);
-        fs::set_permissions(s.dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        drop(failing);
 
         assert!(result.is_err());
         assert!(s.apps.requests().is_empty());

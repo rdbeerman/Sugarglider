@@ -236,10 +236,35 @@ fn unreadable_path(path: &Path, now: SystemTime) -> PathBuf {
     path.with_file_name(format!("{stem}.unreadable-{secs}.json"))
 }
 
+/// Makes every write into a directory fail until it is dropped, even for
+/// root. It moves the directory aside and puts a file in its place.
+#[cfg(test)]
+pub(crate) struct FailingWrites {
+    dir: PathBuf,
+    aside: PathBuf,
+}
+
+#[cfg(test)]
+impl FailingWrites {
+    pub(crate) fn start(dir: &Path) -> FailingWrites {
+        let aside = dir.with_extension("aside");
+        fs::rename(dir, &aside).unwrap();
+        fs::write(dir, "").unwrap();
+        FailingWrites { dir: dir.to_owned(), aside }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailingWrites {
+    fn drop(&mut self) {
+        _ = fs::remove_file(&self.dir);
+        _ = fs::rename(&self.aside, &self.dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -247,7 +272,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
-    use super::{JournalEntry, ParkedJournal};
+    use super::{FailingWrites, JournalEntry, ParkedJournal};
     use crate::sys::window_server::WindowServerId;
 
     fn entry(pid: i32, wsid: u32) -> JournalEntry {
@@ -343,9 +368,9 @@ mod tests {
         journal.record(vec![entry(1, 10)]).unwrap();
         let on_disk = fs::read(journal_path(&dir)).unwrap();
 
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let failing = FailingWrites::start(dir.path());
         let result = journal.record(vec![entry(1, 11)]);
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        drop(failing);
 
         assert!(result.is_err());
         assert_eq!(&[entry(1, 10)], journal.entries());
@@ -533,9 +558,9 @@ mod tests {
         let mut journal = ParkedJournal::open(journal_path(&dir), now());
         journal.record(vec![entry(1, 10), entry(2, 20)]).unwrap();
 
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let failing = FailingWrites::start(dir.path());
         let removed = journal.remove_window(1, WindowServerId::new(10));
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        drop(failing);
 
         assert!(removed);
         assert_eq!(&[entry(2, 20)], journal.entries());
