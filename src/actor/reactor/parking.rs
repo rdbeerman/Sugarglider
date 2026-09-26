@@ -2046,6 +2046,26 @@ mod tests {
     }
 
     #[test]
+    fn h2_a_parked_window_reaches_the_layout_with_its_frame_from_before_parking() {
+        let mut s = Setup::new(2);
+        let tile = s.frame(wid(1));
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        // The layout loses the window and everything it knew about it.
+        s.reactor.send_layout_event(LayoutEvent::WindowRemoved(wid(1)));
+        assert_eq!(None, s.reactor.layout.floating_restore_frame(wid(1)));
+
+        s.refresh_visible_windows();
+
+        assert_eq!(Some(tile), s.reactor.layout.floating_restore_frame(wid(1)));
+        assert_eq!(
+            vec![wid(1), wid(2)],
+            s.tiles().into_iter().map(|(wid, _)| wid).collect::<Vec<_>>()
+        );
+        assert_eq!(rect(999., 999., 500., 1000.), s.frame(wid(1)));
+    }
+
+    #[test]
     fn r31_the_next_event_writes_a_removal_that_could_not_be_written() {
         let mut s = Setup::new(2);
         let tiles = [wid(1), wid(2)].map(|wid| s.frame(wid));
