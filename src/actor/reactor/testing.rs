@@ -252,7 +252,9 @@ impl Apps {
         for request in requests {
             debug!(?request);
             match request {
-                Request::Terminate => break,
+                // Every app shares this channel, so the requests that follow
+                // can be for other apps.
+                Request::Terminate => continue,
                 Request::GetVisibleWindows => {
                     // Only do this once per cycle, since we simulate responding
                     // from all apps.
