@@ -867,4 +867,93 @@ mod tests {
             .collect();
         assert_eq!(vec![(frames, bounds)], sent);
     }
+
+    /// R33. Turning off the focused Space shows Everything only on it, and
+    /// before the Space change that turns it off.
+    #[test]
+    fn r33_turning_off_the_focused_space_shows_everything_on_it_first() {
+        let mut h = TestHarness::new();
+        two_screens(&mut h);
+        h.on_event(Event::FocusedScreenChanged(screen(2)));
+        h.drain_all();
+
+        h.on_event(Event::ToggleFocusedSpace);
+        assert_eq!(
+            vec![vec![space(20)]],
+            shown_everything(&drain(&mut h.reactor_rx))
+        );
+        h.send_space_changed(vec![Some(space(10)), Some(space(20))]);
+        let events = drain(&mut h.reactor_rx);
+        assert_eq!(
+            vec![Some(space(10)), None],
+            *space_changed_spaces(&events).unwrap()
+        );
+        assert!(shown_everything(&events).is_empty());
+    }
+
+    /// R33. With `default_disable`, turning Sugarglider off shows Everything
+    /// on the Spaces the user turned on, and on no other.
+    #[test]
+    fn r33_turning_sugarglider_off_shows_everything_only_on_managed_spaces() {
+        let mut config = Config::default();
+        config.settings.default_disable = true;
+        let mut h = TestHarness::new_with(false, config);
+        two_screens(&mut h);
+        h.on_event(Event::ToggleSpace(screen(2)));
+        h.drain_all();
+
+        h.on_event(Event::ToggleGlobalEnabled);
+
+        assert_eq!(
+            vec![vec![space(20)]],
+            shown_everything(&drain(&mut h.reactor_rx))
+        );
+    }
+
+    /// R33. In `one_space` mode, leaving the managed Space, Mission Control,
+    /// and a config reload that turns contexts on or off keep their paths
+    /// and don't show Everything. Turning Sugarglider off shows Everything
+    /// only while the managed Space is visible.
+    #[test]
+    fn r33_one_space_mission_control_and_config_reloads_do_not_show_everything() {
+        let mut h = TestHarness::new_with(true, Config::default());
+        h.setup_space(screen(1), space(10));
+
+        h.send_space_changed(vec![Some(space(20))]);
+        let events = drain(&mut h.reactor_rx);
+        assert_eq!(vec![None], *space_changed_spaces(&events).unwrap());
+        assert!(shown_everything(&events).is_empty());
+        h.on_event(Event::ToggleFocusedSpace);
+        assert!(shown_everything(&drain(&mut h.reactor_rx)).is_empty());
+        h.on_event(Event::ToggleFocusedSpace);
+        h.send_space_changed(vec![Some(space(10))]);
+        drain(&mut h.reactor_rx);
+
+        h.on_event(Event::ExposeActive(true));
+        h.send_space_changed(vec![Some(space(10))]);
+        h.on_event(Event::ExposeActive(false));
+        assert!(shown_everything(&drain(&mut h.reactor_rx)).is_empty());
+
+        for enable in [true, false] {
+            let mut config = Config::default();
+            config.settings.experimental.contexts.enable = enable;
+            h.on_event(Event::ConfigUpdated(Arc::new(config)));
+            let events = drain(&mut h.reactor_rx);
+            assert!(shown_everything(&events).is_empty());
+            assert!(events.iter().any(|event| matches!(event, reactor::Event::ConfigChanged(_))));
+        }
+
+        h.send_space_changed(vec![Some(space(20))]);
+        drain(&mut h.reactor_rx);
+        h.on_event(Event::SetGlobalEnabled(false));
+        assert!(shown_everything(&drain(&mut h.reactor_rx)).is_empty());
+        h.on_event(Event::SetGlobalEnabled(true));
+        h.send_space_changed(vec![Some(space(10))]);
+        drain(&mut h.reactor_rx);
+        h.on_event(Event::SetGlobalEnabled(false));
+        assert_eq!(
+            vec![vec![space(10)]],
+            shown_everything(&drain(&mut h.reactor_rx))
+        );
+    }
 }
