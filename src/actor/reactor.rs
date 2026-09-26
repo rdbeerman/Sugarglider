@@ -762,10 +762,12 @@ impl Reactor {
                 // Don't force layout on startup - windows may already be in
                 // correct positions from a previous run. Layout will be
                 // enforced when something actually changes.
-                if self.contexts_in_use() {
+                if self.contexts_in_use()
+                    && let Some(response) = self.show_visible_spaces()
+                {
                     // The windows open at launch have rejoined their contexts,
                     // and the ones that must not show are parked.
-                    self.apply_again();
+                    self.handle_layout_response(response);
                 }
             }
             Event::ApplicationTerminated(pid) => {

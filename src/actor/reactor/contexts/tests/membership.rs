@@ -894,3 +894,46 @@ fn r36_a_group_shows_and_hides_with_its_main_tab() {
     s.switch(e);
     assert_eq!(vec![wid(2), wid(3)], s.parked());
 }
+
+/// R38, R10. When startup completes while the window server's list names
+/// no window the reactor knows, as right after the login window, the
+/// active context only shows, and nothing is parked until a full list
+/// arrives.
+#[test]
+fn r38_startup_with_a_window_list_that_names_no_known_window_parks_nothing() {
+    let mut s = Setup::on(vec![screen()], vec![Some(space())]);
+    let old = WindowId::new(9, 1);
+    let desc = WindowDesc {
+        wid: old,
+        bundle_id: Some("com.testapp1".into()),
+        app_name: Some("TestApp1".into()),
+        title: "Window1".into(),
+        window_server_id: None,
+    };
+    let c = ContextKey::Named(s.reactor.contexts.create("C").unwrap());
+    s.reactor.contexts.add_window(id_of(c), &desc).unwrap();
+    s.reactor.contexts.window_closed(old);
+    s.reactor.contexts.app_terminated(9);
+    s.reactor.contexts.switch_to(c).unwrap();
+    let mut events = s.apps.make_app(1, make_windows(2));
+    for event in &mut events {
+        if let Event::WindowsOnScreenUpdated { on_screen, .. } = event {
+            *on_screen = WindowsOnScreen::new(vec![WindowServerInfo {
+                id: WindowServerId::new(999),
+                pid: 5,
+                layer: 0,
+                frame: rect(0., 0., 100., 100.),
+            }]);
+        }
+    }
+    s.reactor.handle_events(events);
+    s.reactor.handle_event(Event::StartupComplete);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    assert!(s.reactor.contexts.is_member(c, wid(1)));
+    assert!(s.parked().is_empty());
+
+    report_visible(&mut s, &[wid(1), wid(2)]);
+    assert_eq!(vec![wid(2)], s.parked());
+    assert_eq!(vec![(wid(1), screen())], s.tiles());
+}
