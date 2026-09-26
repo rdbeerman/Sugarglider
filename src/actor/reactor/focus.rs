@@ -107,7 +107,7 @@ impl Reactor {
             Some(space) => self.shown_context(space),
             None => self.contexts.active(),
         };
-        if shown == ContextKey::Everything || self.contexts.is_member(shown, wid) {
+        if self.shows_under(shown, wid) {
             return FocusOutcome::Stays;
         }
         if self.parked.contains_key(&wid) {
@@ -122,7 +122,7 @@ impl Reactor {
             let has_member = self
                 .windows
                 .keys()
-                .any(|&other| other.pid == wid.pid && self.contexts.is_member(shown, other));
+                .any(|&other| other.pid == wid.pid && self.shows_under(shown, other));
             if has_member {
                 debug!(?wid, "The app has a member of the active context; not switching");
                 return FocusOutcome::Ignored;
@@ -142,7 +142,7 @@ impl Reactor {
             .filter(|&(&wid, window)| {
                 wid.pid == pid
                     && !self.parked.contains_key(&wid)
-                    && self.contexts.is_member(key, wid)
+                    && self.shows_under(key, wid)
                     && window
                         .window_server_id
                         .is_some_and(|wsid| self.visible_windows.contains(&wsid))
@@ -151,11 +151,37 @@ impl Reactor {
             .max_by_key(|&wid| (self.contexts.last_focus(wid), wid))
     }
 
+    /// R12 steps 5 and 6, R25. After windows were parked, handles the
+    /// layout's `response` and raises `focus`, unless it is the main window
+    /// already and `always` is false. When there is no window to focus,
+    /// activates Finder instead. Focus from outside counts again when that
+    /// ends.
+    pub(super) fn focus_after_parking(
+        &mut self,
+        mut response: EventResponse,
+        focus: Option<WindowId>,
+        always: bool,
+        parked: &[WindowId],
+    ) {
+        if let Some(focus) = focus
+            && (always || self.main_window() != Some(focus))
+        {
+            response.focus_window = Some(focus);
+        }
+        let raised = response.focus_window;
+        let sequence = self.handle_layout_response(response);
+        let finder = match focus {
+            Some(_) => None,
+            None => self.activate_finder(),
+        };
+        self.guard_switch(sequence.zip(raised), parked, finder);
+    }
+
     /// R25. Starts waiting for the end of a switch: its raise sequence, which
     /// focuses `raise`'s window, or, when it raised nothing, the echo of
     /// every window it parked. With `finder`, the wait also lasts until
     /// Finder's activation arrives.
-    pub(super) fn guard_switch(
+    fn guard_switch(
         &mut self,
         raise: Option<(u64, WindowId)>,
         parked: &[WindowId],

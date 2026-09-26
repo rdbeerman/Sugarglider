@@ -485,6 +485,54 @@ fn describe_context_command(cmd: &ContextCommand) -> (String, String, String, u3
             format!("switch_context_id_{}", id.get()),
             30,
         ),
+        ContextCommand::AddWindowToContext(reference) => {
+            let (name, id, order) = describe_context_ref(reference);
+            (
+                format!("Add the window to {name}"),
+                category,
+                format!("add_window_to_context_{id}"),
+                40 + order,
+            )
+        }
+        ContextCommand::MoveWindowToContext(reference) => {
+            let (name, id, order) = describe_context_ref(reference);
+            (
+                format!("Move the window to {name}"),
+                category,
+                format!("move_window_to_context_{id}"),
+                60 + order,
+            )
+        }
+        ContextCommand::RemoveWindowFromContext => (
+            "Remove the window from the active context".to_string(),
+            category,
+            "remove_window_from_context".to_string(),
+            80,
+        ),
+        ContextCommand::ToggleWindowPinned => (
+            "Pin or unpin the window".to_string(),
+            category,
+            "toggle_window_pinned".to_string(),
+            81,
+        ),
+    }
+}
+
+/// The description, the part of a command id, and the offset in the sort
+/// order of a context that a command names.
+fn describe_context_ref(reference: &ContextRef) -> (String, String, u32) {
+    match reference {
+        ContextRef::Number(number) => (
+            format!("context {number}"),
+            number.to_string(),
+            u32::from(*number),
+        ),
+        ContextRef::Name(name) => (format!("context \"{name}\""), format!("name_{name}"), 10),
+        ContextRef::Id(id) => (
+            format!("context with id {}", id.get()),
+            format!("id_{}", id.get()),
+            11,
+        ),
     }
 }
 
@@ -806,6 +854,16 @@ mod tests {
                 ContextCommand::SwitchContext(ContextRef::Id(id)),
             ),
             ("Ctrl + Alt + Tab", ContextCommand::PreviousContext),
+            (
+                "Ctrl + Alt + KeyA",
+                ContextCommand::AddWindowToContext(ContextRef::Number(2)),
+            ),
+            (
+                "Ctrl + Alt + KeyM",
+                ContextCommand::MoveWindowToContext(ContextRef::Name("Comms".into())),
+            ),
+            ("Ctrl + Alt + KeyR", ContextCommand::RemoveWindowFromContext),
+            ("Ctrl + Alt + KeyP", ContextCommand::ToggleWindowPinned),
         ];
         let mut config = Config::default();
         config.keys = bindings
@@ -824,12 +882,16 @@ mod tests {
         ids.sort();
         assert_eq!(
             vec![
+                "add_window_to_context_2",
+                "move_window_to_context_name_Comms",
                 "previous_context",
+                "remove_window_from_context",
                 "show_everything",
                 "switch_context_1",
                 "switch_context_2",
                 "switch_context_id_7",
                 "switch_context_name_Comms",
+                "toggle_window_pinned",
             ],
             ids
         );
@@ -844,8 +906,9 @@ mod tests {
             })
             .collect();
         keys.sort_by(|a, b| a.0.cmp(&b.0));
-        let expected: Vec<(String, ContextCommand)> =
+        let mut expected: Vec<(String, ContextCommand)> =
             bindings.iter().map(|(key, cmd)| (key.to_string(), cmd.clone())).collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(expected, keys);
     }
 

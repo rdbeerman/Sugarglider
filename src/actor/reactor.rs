@@ -265,6 +265,15 @@ pub enum ContextCommand {
     ShowEverything,
     /// Switches back to the context used before the current one.
     PreviousContext,
+    /// Adds the focused window to the context. It shows where it is until
+    /// the next switch.
+    AddWindowToContext(ContextRef),
+    /// Moves the focused window out of the active context and into this one.
+    MoveWindowToContext(ContextRef),
+    /// Removes the focused window from the active context.
+    RemoveWindowFromContext,
+    /// Makes the focused window a member of every context, or stops that.
+    ToggleWindowPinned,
 }
 
 /// Names a context in a command.
@@ -401,6 +410,9 @@ pub struct Reactor {
     switch_guard: focus::SwitchGuard,
     /// A window that took focus before the reactor saw it.
     focus_waiting: Option<WindowId>,
+    /// Windows added to a context since the last switch. They count as
+    /// members of the active context until the next switch.
+    added_since_switch: HashSet<WindowId>,
     /// Where the layout is saved when Sugarglider quits. `None` saves nothing.
     layout_file: Option<PathBuf>,
     /// Ends the process with an exit code.
@@ -632,6 +644,7 @@ impl Reactor {
             showing_everything: HashSet::default(),
             switch_guard: Default::default(),
             focus_waiting: None,
+            added_since_switch: HashSet::default(),
             layout_file: None,
             exit: Box::new(|code| info!(code, "Not quitting a reactor that has no exit")),
         }

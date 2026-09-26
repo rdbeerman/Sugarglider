@@ -85,9 +85,19 @@ impl Reactor {
     /// Whether the window is one the Space shows (R13). Under Everything
     /// every window is; under a context only its members are.
     pub(super) fn shows_on(&self, space: SpaceId, wid: WindowId) -> bool {
-        match self.shown_context(space) {
+        self.shows_under(self.shown_context(space), wid)
+    }
+
+    /// Whether the window shows when `key` is shown. A window added to a
+    /// context since the last switch counts as a member of the active
+    /// context until the next switch (R37).
+    pub(super) fn shows_under(&self, key: ContextKey, wid: WindowId) -> bool {
+        match key {
             ContextKey::Everything => true,
-            key => self.contexts.is_member(key, wid),
+            key => {
+                self.contexts.is_member(key, wid)
+                    || key == self.contexts.active() && self.added_since_switch.contains(&wid)
+            }
         }
     }
 
@@ -212,6 +222,16 @@ impl Reactor {
                     .window_server_id
                     .is_some_and(|wsid| self.visible_windows.contains(&wsid));
             let mut window = self.contexts.switch_window(wid);
+            if self.added_since_switch.contains(&wid) {
+                // It counts as a member of the active context (R37).
+                match self.contexts.active() {
+                    ContextKey::Named(id) if !window.contexts.contains(&id) => {
+                        window.contexts.push(id)
+                    }
+                    ContextKey::Unsorted => window.contexts.clear(),
+                    _ => {}
+                }
+            }
             window.parked = parked;
             window.own = wid.pid == own_pid;
             window.untracked = self.layout.is_untracked(&info);
@@ -305,29 +325,21 @@ impl Reactor {
         self.in_drag = false;
         self.resizing_window = None;
         self.title_bar_drag = None;
+        let added = std::mem::take(&mut self.added_since_switch);
         match self.apply(Apply::Switch(target)) {
             Ok((plan, response)) => {
                 self.save_contexts();
-                let mut response = response.unwrap_or_default();
-                let focus = focused.or(plan.focus);
-                if let Some(focus) = focus
-                    && (focused.is_some() || self.main_window() != Some(focus))
-                {
-                    response.focus_window = Some(focus);
-                }
-                let raised = response.focus_window;
-                let sequence = self.handle_layout_response(response);
-                if let Some(focused) = focused {
-                    self.select_in_layout(focused);
-                    self.contexts.window_focused(focused);
-                }
                 let parked: Vec<WindowId> =
                     plan.park.iter().copied().filter(|wid| self.parked.contains_key(wid)).collect();
-                let finder = match focus {
-                    Some(_) => None,
-                    None => self.activate_finder(),
-                };
-                self.guard_switch(sequence.zip(raised), &parked, finder);
+                let response = response.unwrap_or_default();
+                match focused {
+                    Some(focused) => {
+                        self.focus_after_parking(response, Some(focused), true, &parked);
+                        self.select_in_layout(focused);
+                        self.contexts.window_focused(focused);
+                    }
+                    None => self.focus_after_parking(response, plan.focus, false, &parked),
+                }
                 info!(
                     ?target,
                     parked = plan.park.len(),
@@ -337,6 +349,7 @@ impl Reactor {
                 );
             }
             Err(err) => {
+                self.added_since_switch = added;
                 error!(
                     ?target,
                     "Could not write the parked-window journal, so the context stays: {err}"
@@ -385,6 +398,24 @@ impl Reactor {
                 Some(key) => self.switch_context(key),
                 None => debug!("There is no previous context"),
             },
+            ContextCommand::AddWindowToContext(reference) => {
+                self.add_window_to_context(self.main_window(), &reference)
+            }
+            ContextCommand::MoveWindowToContext(reference) => {
+                self.move_window_to_context(self.main_window(), &reference)
+            }
+            ContextCommand::RemoveWindowFromContext => {
+                self.remove_window_from_context(self.main_window())
+            }
+            ContextCommand::ToggleWindowPinned => self.toggle_window_pinned(self.main_window()),
+        }
+    }
+
+    /// The named context that a command names.
+    pub(super) fn resolve_named(&self, reference: &ContextRef) -> Option<ContextId> {
+        match self.resolve(reference) {
+            Some(ContextKey::Named(id)) => Some(id),
+            _ => None,
         }
     }
 

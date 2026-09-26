@@ -635,3 +635,232 @@ fn r36_a_new_tab_joins_the_contexts_of_its_groups_main_tab() {
         assert_eq!(vec![wid(2)], s.parked());
     }
 }
+
+/// Gives the window the focus, as the switch's own raise does, so that
+/// the reactor's main window is the window and no focus from outside
+/// counts.
+fn focus_quietly(s: &mut Setup, wid: WindowId) {
+    s.reactor.handle_event(Event::ApplicationGloballyActivated(wid.pid));
+    s.reactor.handle_event(Event::ApplicationActivated(wid.pid, Quiet::Yes));
+    s.reactor.handle_event(Event::ApplicationMainWindowChanged(
+        wid.pid,
+        Some(wid),
+        Quiet::Yes,
+    ));
+    assert_eq!(Some(wid), s.reactor.main_window());
+}
+
+fn run(s: &mut Setup, command: ContextCommand) {
+    s.reactor.handle_event(Event::Command(Command::Context(command)));
+}
+
+/// R37. Under Unsorted, adding the focused window to C takes it out of
+/// Unsorted, but it keeps showing, with its tile, until the next switch,
+/// including a switch to Unsorted again.
+#[test]
+fn r37_an_added_window_keeps_showing_until_the_next_switch() {
+    let mut s = Setup::new(3);
+    let c = s.create("C", &[wid(1)]);
+    s.switch(ContextKey::Unsorted);
+    assert_eq!(vec![wid(1)], s.parked());
+    let unsorted = s.tiles();
+    focus_quietly(&mut s, wid(2));
+
+    run(
+        &mut s,
+        ContextCommand::AddWindowToContext(ContextRef::Id(id_of(c))),
+    );
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    report_visible(&mut s, &[wid(1), wid(2), wid(3)]);
+
+    assert!(s.reactor.contexts.is_member(c, wid(2)));
+    assert!(!s.reactor.contexts.is_unsorted(wid(2)));
+    assert_eq!(vec!["Window1", "Window2"], saved_members(&s, c));
+    assert_eq!(unsorted, s.tiles());
+    assert_eq!(unsorted, s.frames(&[wid(2), wid(3)]));
+    assert_eq!(vec![wid(1)], s.parked());
+
+    s.switch(ContextKey::Unsorted);
+    assert_eq!(vec![wid(1), wid(2)], s.parked());
+    assert_eq!(vec![(wid(3), screen())], s.tiles());
+    s.switch(c);
+    assert_eq!(
+        vec![wid(1), wid(2)],
+        s.tiles().into_iter().map(|(wid, _)| wid).collect::<Vec<_>>()
+    );
+    assert_eq!(vec![wid(3)], s.parked());
+}
+
+/// R37, R30, R25. Moving the focused window to D takes it out of C at once.
+/// It is parked, with its journal entry written first, and the most
+/// recently focused member of C gets the focus. An activation before that
+/// raise ends doesn't switch to D.
+#[test]
+fn r37_a_moved_window_is_parked_and_the_last_focused_member_is_focused() {
+    let mut s = Setup::new(3);
+    let c = s.create("C", &[wid(1), wid(2), wid(3)]);
+    let d = s.create("D", &[]);
+    s.switch(c);
+    let tile = s.frame(wid(2));
+    s.reactor.contexts.window_focused(wid(3));
+    s.reactor.contexts.window_focused(wid(1));
+    focus_quietly(&mut s, wid(2));
+    let (raise_manager_tx, mut raises) = mpsc::unbounded_channel();
+    s.reactor.raise_manager_tx = raise_manager_tx;
+
+    run(
+        &mut s,
+        ContextCommand::MoveWindowToContext(ContextRef::Name("D".into())),
+    );
+
+    assert_eq!(vec![id_of(d)], s.reactor.contexts.contexts_of(wid(2)));
+    assert_eq!(vec![wid(2)], s.parked());
+    assert_eq!(vec![entry(2, tile)], s.journal_on_disk());
+    let mut focused = vec![];
+    while let Ok((_, event)) = raises.try_recv() {
+        if let raise::Event::RaiseRequest(request) = event {
+            focused.push(request.focus_window.map(|(wid, _)| wid));
+        }
+    }
+    assert_eq!(vec![Some(wid(1))], focused);
+    s.reactor
+        .handle_event(Event::ApplicationMainWindowChanged(1, Some(wid(2)), Quiet::No));
+    assert_eq!(c, s.reactor.contexts.active());
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    let tiles = vec![
+        (wid(1), rect(0., 0., 600., 1000.)),
+        (wid(3), rect(600., 0., 600., 1000.)),
+    ];
+    assert_eq!(tiles, s.tiles());
+    assert_eq!(tiles, s.frames(&[wid(1), wid(3)]));
+    assert_eq!(corner(tile.size), s.frame(wid(2)));
+}
+
+/// R37. Removing the focused window from the active context parks it at
+/// once. Under Unsorted there is no context to remove it from.
+#[test]
+fn r37_a_removed_window_is_parked() {
+    let mut s = Setup::new(2);
+    let c = s.create("C", &[wid(1), wid(2)]);
+    s.switch(c);
+    focus_quietly(&mut s, wid(2));
+
+    run(&mut s, ContextCommand::RemoveWindowFromContext);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    assert!(s.reactor.contexts.is_unsorted(wid(2)));
+    assert_eq!(vec![wid(2)], s.parked());
+    assert_eq!(vec![(wid(1), screen())], s.tiles());
+    assert_eq!(vec!["Window1"], saved_members(&s, c));
+
+    s.switch(ContextKey::Unsorted);
+    focus_quietly(&mut s, wid(2));
+    run(&mut s, ContextCommand::RemoveWindowFromContext);
+    assert!(all_frame_writes(s.apps.requests()).is_empty());
+    assert_eq!(vec![wid(1)], s.parked());
+}
+
+/// R3. A pinned window shows under every context and under Unsorted, and
+/// doesn't count as unsorted. Unpinning it under a context that doesn't
+/// hold it parks it.
+#[test]
+fn r3_a_pinned_window_shows_everywhere_until_it_is_unpinned() {
+    let mut s = Setup::new(3);
+    let c = s.create("C", &[wid(1), wid(2)]);
+    let d = s.create("D", &[wid(3)]);
+    s.switch(c);
+    focus_quietly(&mut s, wid(1));
+
+    run(&mut s, ContextCommand::ToggleWindowPinned);
+
+    assert!(s.reactor.contexts.is_pinned(wid(1)));
+    assert!(!s.reactor.contexts.is_unsorted(wid(1)));
+    for key in [d, ContextKey::Unsorted, c] {
+        s.switch(key);
+        assert!(!s.parked().contains(&wid(1)), "{key:?}");
+    }
+    s.switch(d);
+    assert_eq!(vec![wid(2)], s.parked());
+    focus_quietly(&mut s, wid(1));
+
+    run(&mut s, ContextCommand::ToggleWindowPinned);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    assert!(!s.reactor.contexts.is_pinned(wid(1)));
+    assert_eq!(vec![wid(1), wid(2)], s.parked());
+    assert_eq!(vec![(wid(3), screen())], s.tiles());
+}
+
+/// R36. A membership command acts on the focused window's whole tab group.
+#[test]
+fn r36_a_command_acts_on_every_tab_of_the_group() {
+    let mut s = Setup::new(2);
+    let c = s.create("C", &[wid(1), wid(2)]);
+    let d = s.create("D", &[wid(1)]);
+    s.switch(c);
+    focus_quietly(&mut s, wid(2));
+    let tab = WindowInfo {
+        frame: s.frame(wid(2)),
+        ..make_window(3)
+    };
+    open_window(&mut s, wid(3), tab, &[wid(1), wid(2)]);
+    assert!(s.reactor.contexts.is_member(c, wid(3)));
+
+    run(
+        &mut s,
+        ContextCommand::MoveWindowToContext(ContextRef::Id(id_of(d))),
+    );
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    for tab in [wid(2), wid(3)] {
+        assert_eq!(vec![id_of(d)], s.reactor.contexts.contexts_of(tab), "{tab:?}");
+    }
+    assert_eq!(vec![wid(2), wid(3)], s.parked());
+    assert_eq!(vec![(wid(1), screen())], s.tiles());
+}
+
+/// R37, R3. Membership commands do nothing without a focused window, for
+/// a parked window, for Everything or Unsorted as the target, and while
+/// contexts are off.
+#[test]
+fn r37_membership_commands_that_cant_apply_change_nothing() {
+    let mut s = Setup::new(2);
+    let c = s.create("C", &[wid(1)]);
+    s.switch(c);
+    let before = records(&s, c);
+    let commands = || {
+        [
+            ContextCommand::AddWindowToContext(ContextRef::Id(id_of(c))),
+            ContextCommand::MoveWindowToContext(ContextRef::Id(id_of(c))),
+            ContextCommand::RemoveWindowFromContext,
+            ContextCommand::ToggleWindowPinned,
+        ]
+    };
+    for command in commands() {
+        run(&mut s, command);
+    }
+    focus_quietly(&mut s, wid(2));
+    for command in commands() {
+        run(&mut s, command);
+    }
+    focus_quietly(&mut s, wid(1));
+    for name in ["Everything", "Unsorted"] {
+        run(
+            &mut s,
+            ContextCommand::AddWindowToContext(ContextRef::Name(name.into())),
+        );
+        run(
+            &mut s,
+            ContextCommand::MoveWindowToContext(ContextRef::Name(name.into())),
+        );
+    }
+    s.reactor.handle_event(Event::ConfigChanged(config(false)));
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    for command in commands() {
+        run(&mut s, command);
+    }
+
+    assert_eq!(before, records(&s, c));
+    assert!(s.reactor.contexts.pinned().is_empty());
+    assert!(s.parked().is_empty());
+}

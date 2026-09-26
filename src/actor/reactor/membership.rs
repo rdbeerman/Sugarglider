@@ -6,9 +6,9 @@
 //! close. The design is in `docs/specs/contexts.md`.
 
 use redact::Secret;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-use super::Reactor;
+use super::{ContextRef, Reactor};
 use crate::actor::app::{WindowId, pid_t};
 use crate::model::contexts::{Arrival, ContextKey, MatchPass, RecordLink, WindowDesc, plan_switch};
 use crate::sys::window_server::WindowServerId;
@@ -236,6 +236,158 @@ impl Reactor {
         for pid in pids {
             self.app_still_running(pid);
         }
+    }
+
+    /// The windows that a membership command for `window` acts on: the
+    /// window's native tab group (R36). None, and the command does nothing,
+    /// while contexts are off or Sugarglider quits, and when there is no
+    /// window, or it is Sugarglider's own, untracked, or parked.
+    fn command_windows(&self, window: Option<WindowId>, command: &str) -> Option<Vec<WindowId>> {
+        if !self.contexts_enabled() {
+            debug!(command, "Ignoring a context command while contexts are off");
+            return None;
+        }
+        if self.pending_exit.is_some() {
+            info!(command, "Ignoring a context command while quitting");
+            return None;
+        }
+        let Some(wid) = window else {
+            info!(command, "No window has focus");
+            return None;
+        };
+        let own_pid = std::process::id() as pid_t;
+        let untracked =
+            self.layout_window_info(wid).is_none_or(|info| self.layout.is_untracked(&info));
+        if wid.pid == own_pid || untracked || self.parked.contains_key(&wid) {
+            info!(command, ?wid, "The window can't be in a context");
+            return None;
+        }
+        Some(self.tabs_of(wid))
+    }
+
+    /// R37. Adds the window and its tabs to the context. They take effect at
+    /// the next switch: until then the windows count as members of the
+    /// active context, so they stay where they are.
+    pub(super) fn add_window_to_context(
+        &mut self,
+        window: Option<WindowId>,
+        reference: &ContextRef,
+    ) {
+        let Some(tabs) = self.command_windows(window, "add_window_to_context") else {
+            return;
+        };
+        let Some(id) = self.resolve_named(reference) else {
+            warn!(?reference, "No context to add the window to");
+            return;
+        };
+        for &tab in &tabs {
+            if let Some(desc) = self.window_desc(tab) {
+                _ = self.contexts.add_window(id, &desc);
+                self.added_since_switch.insert(tab);
+            }
+        }
+        info!(?tabs, ?id, "Added the window to a context");
+        self.save_contexts();
+    }
+
+    /// R37. Moves the window and its tabs out of the active context and
+    /// into the named one, at once. If they no longer show, they are parked.
+    pub(super) fn move_window_to_context(
+        &mut self,
+        window: Option<WindowId>,
+        reference: &ContextRef,
+    ) {
+        let Some(tabs) = self.command_windows(window, "move_window_to_context") else {
+            return;
+        };
+        let Some(id) = self.resolve_named(reference) else {
+            warn!(?reference, "No context to move the window to");
+            return;
+        };
+        for &tab in &tabs {
+            if let Some(desc) = self.window_desc(tab) {
+                _ = self.contexts.move_window(id, &desc);
+                self.added_since_switch.remove(&tab);
+            }
+        }
+        info!(?tabs, ?id, "Moved the window to a context");
+        self.save_contexts();
+        self.park_windows_that_left(&tabs);
+    }
+
+    /// R37. Removes the window and its tabs from the active context, at
+    /// once. If they no longer show, they are parked.
+    pub(super) fn remove_window_from_context(&mut self, window: Option<WindowId>) {
+        let Some(tabs) = self.command_windows(window, "remove_window_from_context") else {
+            return;
+        };
+        let ContextKey::Named(id) = self.contexts.active() else {
+            info!("No named context is active to remove the window from");
+            return;
+        };
+        for &tab in &tabs {
+            _ = self.contexts.remove_window(id, tab);
+            self.added_since_switch.remove(&tab);
+        }
+        info!(?tabs, ?id, "Removed the window from the active context");
+        self.save_contexts();
+        self.park_windows_that_left(&tabs);
+    }
+
+    /// R3. Pins the window and its tabs, which makes them members of every
+    /// context, or unpins them. Unpinned windows that no longer show are
+    /// parked.
+    pub(super) fn toggle_window_pinned(&mut self, window: Option<WindowId>) {
+        let Some(tabs) = self.command_windows(window, "toggle_window_pinned") else {
+            return;
+        };
+        let unpin = self.contexts.is_pinned(tabs[0]);
+        for &tab in &tabs {
+            if unpin {
+                self.contexts.unpin(tab);
+            } else if let Some(desc) = self.window_desc(tab) {
+                self.contexts.pin(&desc);
+            }
+        }
+        info!(?tabs, pinned = !unpin, "Toggled pinning the window");
+        self.save_contexts();
+        if unpin {
+            self.park_windows_that_left(&tabs);
+        }
+    }
+
+    /// Parks the windows that left the active context and no longer show,
+    /// with their journal entries written first (R30), takes them out of
+    /// the layout, and focuses the active context's most recently focused
+    /// member (R37).
+    fn park_windows_that_left(&mut self, wids: &[WindowId]) {
+        if !self.contexts_in_use() {
+            return;
+        }
+        let spaces = self.shown_spaces(self.contexts.active());
+        let park: Vec<WindowId> = plan_switch(&self.switch_input(&spaces))
+            .park
+            .into_iter()
+            .filter(|wid| wids.contains(wid))
+            .collect();
+        if park.is_empty() {
+            return;
+        }
+        let parked = match self.journal_parking(&park) {
+            Ok(parking) => self.move_to_corners(parking),
+            Err(err) => {
+                error!("Could not write the parked-window journal, so nothing is parked: {err}");
+                return;
+            }
+        };
+        let mut pids: Vec<pid_t> = parked.iter().map(|wid| wid.pid).collect();
+        pids.sort();
+        pids.dedup();
+        for pid in pids {
+            self.send_visible_windows_to_layout(pid);
+        }
+        let focus = plan_switch(&self.switch_input(&spaces)).focus;
+        self.focus_after_parking(Default::default(), focus, false, &parked);
     }
 
     /// Parks the windows of `pid` that must not show (R13), with their

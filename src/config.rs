@@ -914,6 +914,11 @@ mod tests {
             "Ctrl + Alt + KeyI" = { switch_context = { id = 7 } }
             "Ctrl + Alt + Digit0" = "show_everything"
             "Ctrl + Alt + Tab" = "previous_context"
+            "Ctrl + Alt + KeyA" = { add_window_to_context = 2 }
+            "Ctrl + Alt + KeyM" = { move_window_to_context = { id = 7 } }
+            "Ctrl + Alt + KeyN" = { move_window_to_context = "Comms" }
+            "Ctrl + Alt + KeyR" = "remove_window_from_context"
+            "Ctrl + Alt + KeyP" = "toggle_window_pinned"
             "#,
         )
         .unwrap();
@@ -943,6 +948,23 @@ mod tests {
         );
         assert_eq!(ContextCommand::ShowEverything, command("Ctrl + Alt + Digit0"));
         assert_eq!(ContextCommand::PreviousContext, command("Ctrl + Alt + Tab"));
+        assert_eq!(
+            ContextCommand::AddWindowToContext(ContextRef::Number(2)),
+            command("Ctrl + Alt + KeyA")
+        );
+        assert_eq!(
+            ContextCommand::MoveWindowToContext(ContextRef::Id(id)),
+            command("Ctrl + Alt + KeyM")
+        );
+        assert_eq!(
+            ContextCommand::MoveWindowToContext(ContextRef::Name("Comms".into())),
+            command("Ctrl + Alt + KeyN")
+        );
+        assert_eq!(
+            ContextCommand::RemoveWindowFromContext,
+            command("Ctrl + Alt + KeyR")
+        );
+        assert_eq!(ContextCommand::ToggleWindowPinned, command("Ctrl + Alt + KeyP"));
     }
 
     /// Key bindings. The default config ships the context bindings of the
