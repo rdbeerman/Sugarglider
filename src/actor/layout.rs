@@ -5579,6 +5579,80 @@ mod tests {
         }
     }
 
+    /// R2, L1. A context keeps a layout per Space, so a command under C on
+    /// one Space leaves C's layout on the other Space alone.
+    #[test]
+    fn a_command_under_a_context_changes_its_layout_only_on_that_space() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let on1 = [w(1), w(2), w(3)];
+        let on2 = [w(4), w(5), w(6)];
+        let [c] = named_contexts(["C"]);
+        let everything = ContextKey::Everything;
+        let everything1 = vec![
+            (w(1), rect(0, 0, 40, 120)),
+            (w(2), rect(40, 0, 40, 120)),
+            (w(3), rect(80, 0, 40, 120)),
+        ];
+        let everything2 = vec![
+            (w(4), rect(0, 0, 40, 120)),
+            (w(5), rect(40, 0, 40, 120)),
+            (w(6), rect(80, 0, 40, 120)),
+        ];
+
+        switch(&mut mgr, space1, screen.size, everything, &on1);
+        switch(&mut mgr, space2, screen.size, everything, &on2);
+        switch(&mut mgr, space1, screen.size, c, &on1);
+        switch(&mut mgr, space2, screen.size, c, &on2);
+        assert_eq!(everything1, mgr.layout_sorted(space1, screen));
+        assert_eq!(everything2, mgr.layout_sorted(space2, screen));
+
+        _ = mgr.handle_event(WindowFocused(vec![space1], w(3)));
+        _ = mgr.handle_command(Some(space1), &[space1], Split(Orientation::Vertical));
+        _ = mgr.handle_command(
+            Some(space1),
+            &[space1],
+            Resize {
+                direction: Direction::Down,
+                percent: 25.0,
+            },
+        );
+        let c1_frames = vec![
+            (w(1), rect(0, 0, 60, 120)),
+            (w(2), rect(60, 90, 60, 30)),
+            (w(3), rect(60, 0, 60, 90)),
+        ];
+        assert_eq!(c1_frames, mgr.layout_sorted(space1, screen));
+        assert_eq!(everything2, mgr.layout_sorted(space2, screen));
+
+        move_window(&mut mgr, space2, w(4), Direction::Up);
+        let c2_frames = vec![
+            (w(4), rect(0, 0, 120, 60)),
+            (w(5), rect(0, 60, 60, 60)),
+            (w(6), rect(60, 60, 60, 60)),
+        ];
+        assert_eq!(c2_frames, mgr.layout_sorted(space2, screen));
+        assert_eq!(c1_frames, mgr.layout_sorted(space1, screen));
+
+        for _ in 0..2 {
+            assert_eq!(c2_frames, switched_frames(&mut mgr, space2, screen, c, &on2));
+            assert_eq!(c1_frames, switched_frames(&mut mgr, space1, screen, c, &on1));
+            assert_eq!(
+                everything1,
+                switched_frames(&mut mgr, space1, screen, everything, &on1)
+            );
+            assert_eq!(
+                everything2,
+                switched_frames(&mut mgr, space2, screen, everything, &on2)
+            );
+        }
+    }
+
     /// L7, L9. Floating a window that is in C and D takes it out of C's
     /// layouts at every size. D keeps its place, and unfloating the window in
     /// C doesn't move it in D.
