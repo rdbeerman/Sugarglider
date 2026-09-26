@@ -194,10 +194,10 @@ impl Contexts {
         self.contexts.iter().find(|c| c.number == Some(number))
     }
 
-    /// Finds a context by name, ignoring case.
+    /// Finds a context by name, ignoring case and accents.
     pub fn by_name(&self, name: &str) -> Option<&Context> {
-        let name = name.trim().to_lowercase();
-        self.contexts.iter().find(|c| c.name.to_lowercase() == name)
+        let name = fold(name.trim());
+        self.contexts.iter().find(|c| fold(&c.name) == name)
     }
 
     pub fn active(&self) -> ContextKey {
@@ -217,6 +217,9 @@ impl Contexts {
         }
     }
 
+    /// Trims a name and checks that it isn't empty, reserved, or another
+    /// context's name. Names are compared ignoring case and accents, as the
+    /// switcher compares them.
     fn checked_name(
         &self,
         name: &str,
@@ -226,8 +229,8 @@ impl Contexts {
         if name.is_empty() {
             return Err(ContextError::EmptyName);
         }
-        let lower = name.to_lowercase();
-        if lower == EVERYTHING_NAME.to_lowercase() || lower == UNSORTED_NAME.to_lowercase() {
+        let folded = fold(name);
+        if folded == fold(EVERYTHING_NAME) || folded == fold(UNSORTED_NAME) {
             return Err(ContextError::ReservedName(name.to_string()));
         }
         if let Some(other) = self.by_name(name)
@@ -425,8 +428,9 @@ impl Contexts {
 
 /// Lowercases text and removes accents, for comparing names and titles.
 ///
-/// Folds the Latin-1 Supplement and Latin Extended-A blocks to ASCII and
-/// drops combining diacritical marks.
+/// Folds the letters with marks, and the ligatures, of the Latin-1
+/// Supplement, Latin Extended-A, Latin Extended-B, and Latin Extended
+/// Additional blocks to ASCII, and drops combining diacritical marks.
 pub fn fold(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -467,6 +471,87 @@ fn fold_char(c: char) -> Option<&'static str> {
         '\u{0174}' | '\u{0175}' => "w",
         'Ý' | 'ý' | 'ÿ' | '\u{0176}'..='\u{0178}' => "y",
         '\u{0179}'..='\u{017E}' => "z",
+        '\u{0180}'..='\u{024F}' => return fold_latin_extended_b(c),
+        '\u{1E00}'..='\u{1EFF}' => return fold_latin_extended_additional(c),
+        _ => return None,
+    })
+}
+
+/// Folds a letter of the Latin Extended-B block. Letters that aren't a
+/// Latin letter with a mark or a digraph, such as schwa, ezh, and wynn,
+/// are not folded.
+fn fold_latin_extended_b(c: char) -> Option<&'static str> {
+    Some(match c {
+        '\u{01CD}' | '\u{01CE}' | '\u{01DE}'..='\u{01E1}' | '\u{01FA}' | '\u{01FB}' => "a",
+        '\u{0200}'..='\u{0203}' | '\u{0226}' | '\u{0227}' | '\u{023A}' => "a",
+        '\u{01E2}' | '\u{01E3}' | '\u{01FC}' | '\u{01FD}' => "ae",
+        '\u{0180}'..='\u{0183}' | '\u{0243}' => "b",
+        '\u{0187}' | '\u{0188}' | '\u{023B}' | '\u{023C}' => "c",
+        '\u{0189}'..='\u{018C}' | '\u{0221}' => "d",
+        '\u{0238}' => "db",
+        '\u{01C4}'..='\u{01C6}' | '\u{01F1}'..='\u{01F3}' => "dz",
+        '\u{0204}'..='\u{0207}' | '\u{0228}' | '\u{0229}' | '\u{0246}' | '\u{0247}' => "e",
+        '\u{0191}' | '\u{0192}' => "f",
+        '\u{0193}' | '\u{01E4}'..='\u{01E7}' | '\u{01F4}' | '\u{01F5}' => "g",
+        '\u{021E}' | '\u{021F}' => "h",
+        '\u{0195}' | '\u{01F6}' => "hv",
+        '\u{0197}' | '\u{01CF}' | '\u{01D0}' | '\u{0208}'..='\u{020B}' => "i",
+        '\u{01F0}' | '\u{0237}' | '\u{0248}' | '\u{0249}' => "j",
+        '\u{0198}' | '\u{0199}' | '\u{01E8}' | '\u{01E9}' => "k",
+        '\u{019A}' | '\u{0234}' | '\u{023D}' => "l",
+        '\u{01C7}'..='\u{01C9}' => "lj",
+        '\u{019D}' | '\u{019E}' | '\u{01F8}' | '\u{01F9}' | '\u{0220}' | '\u{0235}' => "n",
+        '\u{01CA}'..='\u{01CC}' => "nj",
+        '\u{019F}'..='\u{01A1}' | '\u{01D1}' | '\u{01D2}' | '\u{01EA}'..='\u{01ED}' => "o",
+        '\u{01FE}' | '\u{01FF}' | '\u{020C}'..='\u{020F}' | '\u{022A}'..='\u{0231}' => "o",
+        '\u{01A2}' | '\u{01A3}' => "oi",
+        '\u{0222}' | '\u{0223}' => "ou",
+        '\u{01A4}' | '\u{01A5}' => "p",
+        '\u{024A}' | '\u{024B}' => "q",
+        '\u{0239}' => "qp",
+        '\u{0210}'..='\u{0213}' | '\u{024C}' | '\u{024D}' => "r",
+        '\u{0218}' | '\u{0219}' | '\u{023F}' => "s",
+        '\u{01AB}'..='\u{01AE}' | '\u{021A}' | '\u{021B}' | '\u{0236}' | '\u{023E}' => "t",
+        '\u{01AF}' | '\u{01B0}' | '\u{01D3}'..='\u{01DC}' | '\u{0214}'..='\u{0217}' => "u",
+        '\u{0244}' => "u",
+        '\u{01B2}' => "v",
+        '\u{01B3}' | '\u{01B4}' | '\u{0232}' | '\u{0233}' | '\u{024E}' | '\u{024F}' => "y",
+        '\u{01B5}' | '\u{01B6}' | '\u{0224}' | '\u{0225}' | '\u{0240}' => "z",
+        _ => return None,
+    })
+}
+
+/// Folds a letter of the Latin Extended Additional block, which holds most
+/// Vietnamese letters. The letter delta is not folded.
+fn fold_latin_extended_additional(c: char) -> Option<&'static str> {
+    Some(match c {
+        '\u{1E00}' | '\u{1E01}' | '\u{1E9A}' | '\u{1EA0}'..='\u{1EB7}' => "a",
+        '\u{1E02}'..='\u{1E07}' => "b",
+        '\u{1E08}' | '\u{1E09}' => "c",
+        '\u{1E0A}'..='\u{1E13}' => "d",
+        '\u{1E14}'..='\u{1E1D}' | '\u{1EB8}'..='\u{1EC7}' => "e",
+        '\u{1E1E}' | '\u{1E1F}' => "f",
+        '\u{1E20}' | '\u{1E21}' => "g",
+        '\u{1E22}'..='\u{1E2B}' | '\u{1E96}' => "h",
+        '\u{1E2C}'..='\u{1E2F}' | '\u{1EC8}'..='\u{1ECB}' => "i",
+        '\u{1E30}'..='\u{1E35}' => "k",
+        '\u{1E36}'..='\u{1E3D}' => "l",
+        '\u{1EFA}' | '\u{1EFB}' => "ll",
+        '\u{1E3E}'..='\u{1E43}' => "m",
+        '\u{1E44}'..='\u{1E4B}' => "n",
+        '\u{1E4C}'..='\u{1E53}' | '\u{1ECC}'..='\u{1EE3}' => "o",
+        '\u{1E54}'..='\u{1E57}' => "p",
+        '\u{1E58}'..='\u{1E5F}' => "r",
+        '\u{1E60}'..='\u{1E69}' | '\u{1E9B}'..='\u{1E9D}' => "s",
+        '\u{1E9E}' => "ss",
+        '\u{1E6A}'..='\u{1E71}' | '\u{1E97}' => "t",
+        '\u{1E72}'..='\u{1E7B}' | '\u{1EE4}'..='\u{1EF1}' => "u",
+        '\u{1E7C}'..='\u{1E7F}' | '\u{1EFC}' | '\u{1EFD}' => "v",
+        '\u{1E80}'..='\u{1E89}' | '\u{1E98}' => "w",
+        '\u{1E8A}'..='\u{1E8D}' => "x",
+        '\u{1E8E}' | '\u{1E8F}' | '\u{1E99}' | '\u{1EF2}'..='\u{1EF9}' => "y",
+        '\u{1EFE}' | '\u{1EFF}' => "y",
+        '\u{1E90}'..='\u{1E95}' => "z",
         _ => return None,
     })
 }
@@ -476,11 +561,12 @@ fn fold_char(c: char) -> Option<&'static str> {
 pub enum NameMatch {
     /// The query is empty, so every entry is listed.
     EmptyQuery,
-    /// The query's letters appear in the name in order.
+    /// The query's letters, at least 2 of them, appear in the name in order.
     LettersInOrder,
-    /// Each word of the query starts a word of the name, in order.
+    /// Each word of a query of two or more words starts a word of the name,
+    /// in any order.
     AllWordPrefixes,
-    /// The query starts the name's initials.
+    /// The query, at least 2 characters long, starts the name's initials.
     Initials,
     /// The query starts a word of the name.
     WordPrefix,
@@ -492,8 +578,8 @@ pub enum NameMatch {
 /// Ranks the switcher's entries for a query, best first.
 ///
 /// The entries are the named contexts, Unsorted when it has windows, and
-/// Everything. Entries that don't match are left out. Ties go to the most
-/// recently used entry.
+/// Everything. Entries that don't match are left out, and a query without
+/// letters or digits matches none. Ties go to the most recently used entry.
 pub fn rank(
     query: &str,
     contexts: &Contexts,
@@ -525,6 +611,9 @@ fn match_name(query: &str, name: &str) -> Option<NameMatch> {
     if query.is_empty() {
         return Some(NameMatch::EmptyQuery);
     }
+    if !query.chars().any(char::is_alphanumeric) {
+        return None;
+    }
     if name == query {
         return Some(NameMatch::Exact);
     }
@@ -536,15 +625,18 @@ fn match_name(query: &str, name: &str) -> Option<NameMatch> {
     }
     let name_words: Vec<&str> = words(name).collect();
     let initials: String = name_words.iter().filter_map(|w| w.chars().next()).collect();
-    if !query.contains(char::is_whitespace) && initials.starts_with(query) {
+    let letters: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
+    if letters.len() >= 2 && !query.contains(char::is_whitespace) && initials.starts_with(query) {
         return Some(NameMatch::Initials);
     }
-    let mut remaining = name_words.iter();
-    if words(query).all(|q| remaining.any(|w| w.starts_with(q))) {
+    let query_words: Vec<&str> = words(query).collect();
+    if query_words.len() >= 2
+        && query_words.iter().all(|q| name_words.iter().any(|w| w.starts_with(q)))
+    {
         return Some(NameMatch::AllWordPrefixes);
     }
     let mut name_chars = name.chars();
-    if query.chars().filter(|c| !c.is_whitespace()).all(|q| name_chars.any(|c| c == q)) {
+    if letters.len() >= 2 && letters.iter().all(|q| name_chars.any(|c| c == *q)) {
         return Some(NameMatch::LettersInOrder);
     }
     None
@@ -1519,7 +1611,10 @@ mod tests {
         );
         assert_eq!(match_of("clwk", "Client work"), Some(NameMatch::LettersInOrder));
         assert_eq!(match_of("wc", "Client work"), None);
-        assert_eq!(match_of("wo cl", "Client work"), None);
+        assert_eq!(
+            match_of("wo cl", "Client work"),
+            Some(NameMatch::AllWordPrefixes)
+        );
         let mut kinds = vec![
             NameMatch::LettersInOrder,
             NameMatch::Exact,
@@ -3768,7 +3863,6 @@ mod tests {
     /// Switcher ranking: the words of a query match as prefixes in any
     /// order, as in Rooms' `Matcher.rank`.
     #[test]
-    #[ignore = "bug: multi-word queries must match the name's words in order; Rooms' Matcher.rank takes any order"]
     fn rank_all_words_match_as_prefixes_in_any_order() {
         assert_eq!(
             match_of("wo cl", "Client work"),
@@ -3778,7 +3872,6 @@ mod tests {
 
     /// Switcher ranking: a query without letters or digits matches nothing.
     #[test]
-    #[ignore = "bug: a query with no letters or digits matches every entry as AllWordPrefixes"]
     fn rank_a_query_without_letters_or_digits_matches_nothing() {
         let mut cx = Contexts::new();
         cx.create("Comms").unwrap();
@@ -3792,7 +3885,6 @@ mod tests {
     /// a query of at least 2 characters, so one character matches only the
     /// start of a word.
     #[test]
-    #[ignore = "bug: a one-character query matches letters inside words; Rooms needs 2 characters"]
     fn rank_one_character_matches_only_word_starts() {
         let mut cx = Contexts::new();
         cx.create("Comms").unwrap();
@@ -3804,7 +3896,6 @@ mod tests {
     /// Switcher ranking compares names without accents, including accents
     /// outside Latin-1 and Latin Extended-A.
     #[test]
-    #[ignore = "bug: fold keeps precomposed accents outside Latin-1 and Latin Extended-A"]
     fn rank_ignores_accents_outside_latin_1_and_extended_a() {
         let mut cx = Contexts::new();
         let hanoi = cx.create("Hà Nội").unwrap();
@@ -3871,6 +3962,53 @@ mod tests {
         for mark in '\u{300}'..='\u{36F}' {
             assert_eq!(fold(&format!("A{mark}b")), "ab", "U+{:04X}", mark as u32);
         }
+    }
+
+    /// `fold` folds every letter with a mark, and every digraph, of Latin
+    /// Extended-B and Latin Extended Additional to lowercase ASCII. The
+    /// other letters of those blocks are only lowercased.
+    #[test]
+    fn fold_folds_latin_extended_b_and_extended_additional() {
+        let kept = "ƄƅƆƍƎƏƐƔƖƛƜƦƧƨƩƪƱƷƸƹƺƻƼƽƾƿǀǁǂǃǝǮǯǷȜȝɁɂɅẟ";
+        for c in ('\u{0180}'..='\u{024F}').chain('\u{1E00}'..='\u{1EFF}') {
+            let folded = fold(&c.to_string());
+            if kept.contains(c) {
+                assert_eq!(folded, c.to_lowercase().to_string(), "U+{:04X}", c as u32);
+            } else {
+                assert!(
+                    !folded.is_empty() && folded.chars().all(|f| f.is_ascii_lowercase()),
+                    "U+{:04X} {c} folds to {folded:?}",
+                    c as u32
+                );
+            }
+        }
+        assert_eq!(fold("Hà Nội, Phở Đường"), "ha noi, pho duong");
+        assert_eq!(fold("Lǚ Xíng Nǚ"), "lu xing nu");
+        assert_eq!(fold("Ștefan Țară"), "stefan tara");
+        assert_eq!(fold("Ǆ ǅ ǆ Ǉ ǌ ẞ Ỻ ƕ"), "dz dz dz lj nj ss ll hv");
+    }
+
+    /// R4: names are unique ignoring accents as well as case, as the
+    /// switcher compares them. The reserved names are too.
+    #[test]
+    fn r4_names_are_unique_ignoring_accents() {
+        let mut cx = Contexts::new();
+        let cafe = cx.create("Café").unwrap();
+        for variant in ["Cafe", "CAFE", "cafe\u{301}"] {
+            assert_eq!(cx.create(variant), Err(ContextError::NameTaken("Café".into())));
+        }
+        let other = cx.create("Other").unwrap();
+        assert_eq!(
+            cx.rename(other, "cafe"),
+            Err(ContextError::NameTaken("Café".into()))
+        );
+        assert_eq!(cx.by_name("CAFE").map(|c| c.id), Some(cafe));
+        assert_eq!(
+            cx.create("Évérything"),
+            Err(ContextError::ReservedName("Évérything".into()))
+        );
+        cx.rename(cafe, "Cafe").unwrap();
+        assert_eq!(context_names(&cx), vec!["Cafe", "Other"]);
     }
 
     /// `contexts.json` with fields this version doesn't know loads, and a
