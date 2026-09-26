@@ -22,19 +22,15 @@ use crate::sys::window_server::WindowServerId;
 /// Finds the process that has a pid now.
 pub(super) type ProcessLookup = Box<dyn Fn(pid_t) -> Process + Send>;
 
-/// How far, in points, the frame a window reports may be from the frame
+/// How far, in points, the position a window reports may be from the position
 /// written to put it back, for the window to count as back.
 const BACK_TOLERANCE: f64 = 16.0;
 
+/// Whether a window that reports `reported` is back at `target`. Only the
+/// position counts, because some apps keep a size of their own.
 fn is_back(reported: CGRect, target: CGRect) -> bool {
-    [
-        reported.origin.x - target.origin.x,
-        reported.origin.y - target.origin.y,
-        reported.size.width - target.size.width,
-        reported.size.height - target.size.height,
-    ]
-    .iter()
-    .all(|difference| difference.abs() <= BACK_TOLERANCE)
+    (reported.origin.x - target.origin.x).abs() <= BACK_TOLERANCE
+        && (reported.origin.y - target.origin.y).abs() <= BACK_TOLERANCE
 }
 
 /// Whether the bundle id in a journal entry and the bundle id of the app that
@@ -195,8 +191,8 @@ impl Reactor {
     }
 
     /// Handles the echo of a frame write. If the window is back from parking
-    /// and the echo is within 16 points of the frame written, the window's
-    /// journal entry goes.
+    /// and the position in the echo is within 16 points of the position
+    /// written, the window's journal entry goes.
     ///
     /// The caller has checked that the echo belongs to the last write, whose
     /// target is the window's `frame_monotonic`.
@@ -1126,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn r31_the_tolerance_is_16_points_for_each_edge_and_size() {
+    fn r31_the_tolerance_is_16_points_on_each_axis_and_the_size_does_not_count() {
         let mut s = Setup::new(2);
         s.reactor.park_windows(&[wid(1)]).unwrap();
         s.apps.simulate_until_quiet(&mut s.reactor);
@@ -1160,13 +1156,13 @@ mod tests {
         for off in [
             echo(0., 17., 0., 0.),
             echo(-17., 0., 0., 0.),
-            echo(0., 0., -17., 0.),
-            echo(0., 0., 0., -17.),
+            echo(17., -17., 0., 0.),
         ] {
             s.reactor.handle_event(off);
             assert_eq!(1, s.journal_on_disk().len());
         }
-        s.reactor.handle_event(echo(-16., 16., -16., -16.));
+        // The app keeps a size of its own.
+        s.reactor.handle_event(echo(-16., 16., -200., 300.));
         assert!(s.journal_on_disk().is_empty());
     }
 
