@@ -597,6 +597,7 @@ impl Reactor {
                     self.apps.keys().copied().collect(),
                 ));
                 self.startup_complete = true;
+                self.drop_journal_entries_of_absent_apps();
                 // Don't force layout on startup - windows may already be in
                 // correct positions from a previous run. Layout will be
                 // enforced when something actually changes.
@@ -1444,6 +1445,9 @@ impl Reactor {
             self.visible_windows.retain(|wsid| !self.hidden_windows.contains(wsid));
         }
 
+        // Windows parked before a restart go back first, so the layout sees
+        // them at their frames from before parking.
+        self.restore_from_journal(pid);
         self.send_visible_windows_to_layout(pid);
     }
 

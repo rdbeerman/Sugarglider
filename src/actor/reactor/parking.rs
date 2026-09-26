@@ -7,7 +7,7 @@
 use std::io;
 
 use objc2_core_foundation::CGRect;
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::Reactor;
 use super::animation::Animation;
@@ -170,6 +170,53 @@ impl Reactor {
         self.parked.retain(|wid, _| wid.pid != pid);
         self.journal.remove_app(pid);
     }
+
+    /// Puts the app's windows that the journal listed at startup back at their
+    /// frames from before parking. Each entry is put back once, and it stays
+    /// in the journal until the window reports the frame.
+    pub(super) fn restore_from_journal(&mut self, pid: pid_t) {
+        let entries = self.journal.unrestored(pid);
+        if entries.is_empty() {
+            return;
+        }
+        let Some(app) = self.apps.get(&pid) else { return };
+        let bundle_id = app.info.bundle_id.clone();
+        let mut writes = vec![];
+        for entry in entries {
+            if entry.bundle_id.is_some() && bundle_id.is_some() && entry.bundle_id != bundle_id {
+                info!(
+                    pid,
+                    journal = ?entry.bundle_id,
+                    running = ?bundle_id,
+                    "Dropping a journal entry whose pid belongs to another app now"
+                );
+                self.journal.remove_window(pid, entry.window_server_id);
+                continue;
+            }
+            let Some(&wid) = self.windows.iter().find_map(|(wid, window)| {
+                (wid.pid == pid && window.window_server_id == Some(entry.window_server_id))
+                    .then_some(wid)
+            }) else {
+                continue;
+            };
+            self.journal.mark_restored(pid, entry.window_server_id);
+            writes.push((wid, entry.frame.into()));
+        }
+        if !writes.is_empty() {
+            info!(
+                pid,
+                count = writes.len(),
+                "Putting back windows parked before a restart"
+            );
+            self.write_frames_now(&writes);
+        }
+    }
+
+    /// Drops the journal entries of apps that are not running.
+    pub(super) fn drop_journal_entries_of_absent_apps(&mut self) {
+        let apps = &self.apps;
+        self.journal.retain_apps(|pid| apps.contains_key(&pid));
+    }
 }
 
 #[cfg(test)]
@@ -218,11 +265,23 @@ mod tests {
 
     impl Setup {
         fn new(windows: usize) -> Setup {
+            let mut s = Setup::launching(vec![]);
+            s.reactor.handle_events(s.apps.make_app(1, make_windows(windows)));
+            s.reactor.handle_event(Event::StartupComplete);
+            s.apps.simulate_until_quiet(&mut s.reactor);
+            s
+        }
+
+        /// A reactor on one screen that no app has reached yet, starting with
+        /// the journal that an earlier run left with `entries`.
+        fn launching(entries: Vec<JournalEntry>) -> Setup {
             let dir = TempDir::new().unwrap();
-            let mut apps = Apps::new();
+            let path = dir.path().join("parked.json");
+            if !entries.is_empty() {
+                ParkedJournal::open(path.clone(), SystemTime::now()).record(entries).unwrap();
+            }
             let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
-            reactor.journal =
-                ParkedJournal::open(dir.path().join("parked.json"), SystemTime::now());
+            reactor.journal = ParkedJournal::open(path, SystemTime::now());
             reactor.handle_event(Event::ScreenParametersChanged {
                 frames: vec![screen()],
                 bounds: vec![screen()],
@@ -231,10 +290,11 @@ mod tests {
                 converter: CoordinateConverter::default(),
                 on_screen: Default::default(),
             });
-            reactor.handle_events(apps.make_app(1, make_windows(windows)));
-            reactor.handle_event(Event::StartupComplete);
-            apps.simulate_until_quiet(&mut reactor);
-            Setup { reactor, apps, dir }
+            Setup {
+                reactor,
+                apps: Apps::new(),
+                dir,
+            }
         }
 
         fn journal_path(&self) -> PathBuf {
@@ -536,5 +596,123 @@ mod tests {
         assert_eq!(tiles, [wid(1), wid(2)].map(|wid| s.frame(wid)));
         assert!(s.journal_on_disk().is_empty());
         assert!(s.reactor.parked.is_empty());
+    }
+
+    fn entry(pid: i32, wsid: u32, frame: CGRect) -> JournalEntry {
+        JournalEntry {
+            pid,
+            bundle_id: Some(format!("com.testapp{pid}")),
+            window_server_id: WindowServerId::new(wsid),
+            title: format!("Window{wsid}"),
+            frame: frame.into(),
+        }
+    }
+
+    fn window_at(sys_id: u32, frame: CGRect) -> WindowInfo {
+        WindowInfo {
+            frame,
+            sys_id: Some(WindowServerId::new(sys_id)),
+            ..make_window(1)
+        }
+    }
+
+    fn journal_wsids(entries: Vec<JournalEntry>) -> Vec<u32> {
+        entries.iter().map(|entry| entry.window_server_id.as_u32()).collect()
+    }
+
+    #[test]
+    fn a_launch_without_a_journal_writes_none() {
+        let s = Setup::new(2);
+        assert!(!s.journal_path().exists());
+    }
+
+    #[test]
+    fn r34_launch_puts_back_each_apps_windows_when_the_app_arrives() {
+        let left = rect(0., 0., 500., 1000.);
+        let right = rect(500., 0., 500., 1000.);
+        let elsewhere = rect(100., 100., 300., 300.);
+        let parked = rect(999., 999., 500., 1000.);
+        let mut s = Setup::launching(vec![
+            entry(1, 11, right),
+            entry(1, 12, left),
+            entry(2, 21, elsewhere),
+            entry(3, 31, left),
+        ]);
+
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![window_at(11, parked), window_at(12, parked)]));
+        // The windows go back before the layout sees them, so their tiles keep
+        // the order they had before parking and need no second write.
+        let requests = s.apps.requests();
+        assert_eq!(vec![right], frame_writes(&requests, WindowId::new(1, 1)));
+        assert_eq!(vec![left], frame_writes(&requests, WindowId::new(1, 2)));
+        for event in s.apps.simulate_events_for_requests(requests) {
+            s.reactor.handle_event(event);
+        }
+        assert_eq!(vec![21, 31], journal_wsids(s.journal_on_disk()));
+
+        s.reactor.handle_events(s.apps.make_app(2, vec![window_at(21, parked)]));
+        let requests = s.apps.requests();
+        assert_eq!(
+            Some(&elsewhere),
+            frame_writes(&requests, WindowId::new(2, 1)).first()
+        );
+        for event in s.apps.simulate_events_for_requests(requests) {
+            s.reactor.handle_event(event);
+        }
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![31], journal_wsids(s.journal_on_disk()));
+
+        s.reactor.handle_event(Event::StartupComplete);
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    #[test]
+    fn r34_a_window_the_app_reports_later_goes_back_then() {
+        let mut s = Setup::launching(vec![entry(1, 11, screen())]);
+        s.reactor.handle_events(s.apps.make_app(1, vec![]));
+        s.reactor.handle_event(Event::StartupComplete);
+        assert!(s.apps.requests().is_empty());
+
+        let wid = WindowId::new(1, 1);
+        s.reactor.handle_event(Event::WindowsDiscovered {
+            pid: 1,
+            new: vec![(wid, window_at(11, rect(999., 999., 1000., 1000.)))],
+            known_visible: vec![wid],
+        });
+        assert_eq!(vec![screen()], frame_writes(&s.apps.requests(), wid));
+    }
+
+    #[test]
+    fn r34_each_entry_is_put_back_once() {
+        let mut s = Setup::launching(vec![entry(1, 11, screen())]);
+        let wid = WindowId::new(1, 1);
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![window_at(11, rect(999., 999., 1000., 1000.))]));
+        assert_eq!(vec![screen()], frame_writes(&s.apps.requests(), wid));
+
+        // The window hasn't reported the frame, so its entry is still there.
+        s.reactor.handle_event(Event::WindowsDiscovered {
+            pid: 1,
+            new: vec![],
+            known_visible: vec![wid],
+        });
+        assert!(frame_writes(&s.apps.requests(), wid).is_empty());
+        assert_eq!(vec![11], journal_wsids(s.journal_on_disk()));
+    }
+
+    #[test]
+    fn r34_an_entry_whose_pid_another_app_has_now_is_dropped() {
+        let elsewhere = rect(100., 100., 300., 300.);
+        let mut other_app = entry(1, 11, elsewhere);
+        other_app.bundle_id = Some("com.example.other".into());
+        let mut s = Setup::launching(vec![other_app]);
+
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![window_at(11, rect(999., 999., 1000., 1000.))]));
+
+        let writes = frame_writes(&s.apps.requests(), WindowId::new(1, 1));
+        assert!(!writes.contains(&elsewhere), "{writes:?}");
+        assert!(s.journal_on_disk().is_empty());
     }
 }
