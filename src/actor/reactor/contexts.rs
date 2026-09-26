@@ -708,6 +708,7 @@ mod tests {
     mod focus_rules;
     mod membership;
     mod membership_rules;
+    mod replay_rules;
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
