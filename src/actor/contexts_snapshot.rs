@@ -7,8 +7,12 @@
 //! [`ContextsSnapshot`] here, and the message server answers the command line
 //! from the snapshot without waiting for the reactor. The design is in
 //! `docs/specs/contexts.md`, section "IPC".
+//!
+//! The command line and the server can be different versions, so every field
+//! but an id has a default: a reader fills in the fields that a writer of
+//! another version left out, and skips the fields it doesn't know.
 
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +42,7 @@ pub struct RequestId(pub u64);
 pub struct CommandResult {
     pub request: RequestId,
     /// Why the command did nothing, or `None` when it ran.
+    #[serde(default)]
     pub error: Option<String>,
 }
 
@@ -60,6 +65,7 @@ enum ContextKeyDef {
 
 /// The contexts, as the reactor last published them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ContextsSnapshot {
     /// Whether contexts are on. When they are off, nothing else is filled in.
     pub enabled: bool,
@@ -80,9 +86,12 @@ pub struct ContextsSnapshot {
 
 /// The context a visible screen shows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ScreenContext {
     /// The screen's position in the reactor's list of screens, from 1 for the
-    /// main screen.
+    /// main screen. It changes when displays are added, removed, or
+    /// rearranged. Per-screen scope (M9) may name screens by display id
+    /// instead.
     pub id: u32,
     /// The active context, or Everything while the screen's Space shows every
     /// window, for example during a quit.
@@ -93,20 +102,26 @@ pub struct ScreenContext {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextSummary {
     pub id: ContextId,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub number: Option<u8>,
     /// The use number of the last switch to the context. Larger is later.
+    #[serde(default)]
     pub last_used: u64,
     /// The app names of the open member windows, each once, in member order,
     /// then those of the open pinned windows.
+    #[serde(default)]
     pub apps: Vec<String>,
     /// How many member windows are open, wherever they are: on another
     /// Space, minimized, or parked. Pinned windows are members of every
     /// context and count too.
+    #[serde(default)]
     pub windows: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UnsortedSummary {
     /// Whether Unsorted is listed among the contexts to switch to: while it
     /// has windows. The menu, the command line, and the switcher list it
@@ -122,9 +137,25 @@ pub struct UnsortedSummary {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EverythingSummary {
     /// The use number of the last switch to Everything.
     pub last_used: u64,
+}
+
+impl Default for ContextsSnapshot {
+    fn default() -> Self {
+        Self::off()
+    }
+}
+
+impl Default for ScreenContext {
+    fn default() -> Self {
+        ScreenContext {
+            id: 0,
+            shows: ContextKey::Everything,
+        }
+    }
 }
 
 impl ContextsSnapshot {
@@ -246,13 +277,16 @@ pub fn publish(snapshot: Arc<ContextsSnapshot>) {
     let mut snapshot = Some(snapshot);
     let lock = PUBLISHED.get_or_init(|| RwLock::new(snapshot.take().expect("not taken yet")));
     if let Some(snapshot) = snapshot {
-        *lock.write().unwrap() = snapshot;
+        *lock.write().unwrap_or_else(PoisonError::into_inner) = snapshot;
     }
 }
 
 /// The snapshot the reactor published last, or `None` before the first.
+/// The message server calls this on the main thread, so it never panics.
 pub fn published() -> Option<Arc<ContextsSnapshot>> {
-    PUBLISHED.get().map(|lock| lock.read().unwrap().clone())
+    PUBLISHED
+        .get()
+        .map(|lock| lock.read().unwrap_or_else(PoisonError::into_inner).clone())
 }
 
 #[cfg(test)]
@@ -366,10 +400,7 @@ mod tests {
             .map(|c| (c.id, c.apps.iter().map(String::as_str).collect(), c.windows))
             .collect();
         assert_eq!(
-            vec![
-                (comms, vec!["Mail", "Music"], 2),
-                (empty, vec!["Music"], 1)
-            ],
+            vec![(comms, vec!["Mail", "Music"], 2), (empty, vec!["Music"], 1)],
             counts
         );
         assert!(!snapshot.unsorted.listed);
@@ -452,6 +483,65 @@ mod tests {
             let ron = ron::ser::to_string(&snapshot).unwrap();
             assert_eq!(snapshot, ron::de::from_str::<ContextsSnapshot>(&ron).unwrap());
         }
+    }
+
+    /// A snapshot as a server of M5c writes it, before command results and
+    /// Unsorted's listing, reads with those fields at their defaults.
+    #[test]
+    fn a_snapshot_from_an_older_server_reads_with_defaults() {
+        let older = r#"(
+            enabled: true,
+            scope: global,
+            active: Named(2),
+            screens: [(id: 1, shows: Named(2))],
+            contexts: [(id: 2, name: "Comms", number: Some(1), last_used: 3, apps: ["Mail"], windows: 1)],
+            unsorted: (windows: 2, last_used: 1),
+            everything: (last_used: 0),
+        )"#;
+
+        let snapshot: ContextsSnapshot = ron::de::from_str(older).unwrap();
+
+        assert_eq!(1, snapshot.contexts.len());
+        assert_eq!("Comms", snapshot.contexts[0].name);
+        assert_eq!(2, snapshot.unsorted.windows);
+        assert!(!snapshot.unsorted.listed);
+        assert!(snapshot.results.is_empty());
+        let empty: ContextsSnapshot = ron::de::from_str("()").unwrap();
+        assert_eq!(ContextsSnapshot::off(), empty);
+    }
+
+    /// A snapshot from a newer server, with fields this version doesn't
+    /// know, reads without them.
+    #[test]
+    fn a_snapshot_from_a_newer_server_reads_without_its_new_fields() {
+        let newer = r#"(
+            enabled: true,
+            scope: global,
+            active: Unsorted,
+            screens: [(id: 1, shows: Unsorted, display_id: 42)],
+            contexts: [(id: 2, name: "Comms", members: [(title: "Inbox")])],
+            unsorted: (listed: true, windows: 1, last_used: 4, titles: ["Notes"]),
+            everything: (last_used: 0),
+            results: [(request: 9, error: None, finished_at: 12)],
+            focused_screen: 1,
+        )"#;
+
+        let snapshot: ContextsSnapshot = ron::de::from_str(newer).unwrap();
+
+        assert_eq!(ContextKey::Unsorted, snapshot.active);
+        assert_eq!(ContextKey::Unsorted, snapshot.screens[0].shows);
+        assert_eq!(
+            ("Comms", 0),
+            (&*snapshot.contexts[0].name, snapshot.contexts[0].windows)
+        );
+        assert!(snapshot.unsorted.listed);
+        assert_eq!(
+            Some(&CommandResult {
+                request: RequestId(9),
+                error: None
+            }),
+            snapshot.result(RequestId(9))
+        );
     }
 
     /// I1. The only test that touches the process-wide snapshot.

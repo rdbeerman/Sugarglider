@@ -16,8 +16,9 @@ use sugarglider::model::contexts::ContextKey;
 use sugarglider::sys::message_port::SendError;
 
 /// What the command says when the server replies with nothing, which is how
-/// a server that doesn't know contexts answers (I4).
-const OLD_SERVER: &str = "The running Sugarglider doesn't support contexts. Restart it.";
+/// a server answers a request it can't read, such as a server from before
+/// contexts or from before this request (I4).
+const OLD_SERVER: &str = "The running Sugarglider doesn't support this command. Restart it.";
 
 /// What a command says when Sugarglider took it but published no result in
 /// time.
@@ -167,8 +168,12 @@ fn send(transport: &mut impl Transport, request: ContextRequest) -> Result<Respo
     if reply.is_empty() {
         return Err(OLD_SERVER.to_string());
     }
-    ron::de::from_bytes(&reply)
-        .map_err(|err| format!("Could not read the reply from Sugarglider: {err}"))
+    ron::de::from_bytes(&reply).map_err(|err| {
+        format!(
+            "Could not read the reply from Sugarglider, which may be another version. \
+             Restart it. ({err})"
+        )
+    })
 }
 
 fn name(snapshot: &ContextsSnapshot, key: ContextKey) -> &str {
@@ -701,7 +706,7 @@ mod tests {
             (not_running, "Sugarglider isn't running.\n"),
             (
                 old_server,
-                "The running Sugarglider doesn't support contexts. Restart it.\n",
+                "The running Sugarglider doesn't support this command. Restart it.\n",
             ),
             (out_of_range, "Context numbers go from 1 to 9, not 12\n"),
             (
@@ -711,8 +716,18 @@ mod tests {
         ] {
             assert_eq!((1, "", reason), (ran.status, &*ran.out, &*ran.err));
         }
-        assert_eq!(1, garbage.status);
-        assert!(garbage.err.starts_with("Could not read the reply from Sugarglider"));
+        let newer = run_raw(&["everything"], Some(b"Queued(3)".to_vec()));
+        for ran in [garbage, newer] {
+            assert_eq!((1, ""), (ran.status, &*ran.out));
+            assert!(
+                ran.err.starts_with(
+                    "Could not read the reply from Sugarglider, which may be another version. \
+                     Restart it. ("
+                ),
+                "{}",
+                ran.err
+            );
+        }
     }
 
     /// A number out of range fails before anything is sent.
@@ -802,7 +817,7 @@ mod tests {
             assert_eq!(1, server.messages, "{args:?}");
         }
         assert_eq!(
-            "The running Sugarglider doesn't support contexts. Restart it.",
+            "The running Sugarglider doesn't support this command. Restart it.",
             OLD_SERVER
         );
     }
