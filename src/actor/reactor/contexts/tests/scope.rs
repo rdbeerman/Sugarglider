@@ -170,7 +170,7 @@ fn r11_changing_scope_spreads_and_keeps_the_shown_contexts() {
 /// next switch is written, or a second launch loses that switch.
 #[test]
 fn a_cold_change_to_global_uses_the_focused_screen_and_persists_switches() {
-    for (focused, expected) in [(0, "A"), (1, "B")] {
+    for (focused, expected, stale_focus) in [(0, "A", false), (1, "B", false), (1, "A", true)] {
         let mut s = per_screen_setup();
         let a = s.create("A", &[wid(1)]);
         let b = s.create("B", &[WindowId::new(2, 2)]);
@@ -226,7 +226,44 @@ fn a_cold_change_to_global_uses_the_focused_screen_and_persists_switches() {
             Quiet::Yes,
         ));
         assert_eq!(Some(focused_window), restarted.reactor.main_window());
-        if focused == 1 {
+        if stale_focus {
+            restarted.reactor.update_active_screen();
+            assert_eq!(Some(1), restarted.reactor.active_screen_idx);
+            restarted.reactor.handle_event(Event::ApplicationMainWindowChanged(
+                pid,
+                None,
+                Quiet::Yes,
+            ));
+            assert_eq!(None, restarted.reactor.main_window());
+            let error = restarted
+                .reactor
+                .run_context_command(ContextCommand::ToggleWindowPinned)
+                .unwrap_err();
+            assert_eq!("Contexts are waiting for the focused screen at startup", error);
+            assert!(restarted.reactor.contexts.has_screen_actives());
+        }
+        if focused == 0 {
+            restarted.reactor.update_active_screen();
+            assert_eq!(Some(0), restarted.reactor.active_screen_idx);
+            restarted.reactor.handle_event(Event::ApplicationMainWindowChanged(
+                pid,
+                None,
+                Quiet::Yes,
+            ));
+            assert_eq!(None, restarted.reactor.main_window());
+            let error = restarted
+                .reactor
+                .run_context_command(ContextCommand::ToggleWindowPinned)
+                .unwrap_err();
+            assert_eq!("Contexts are waiting for the focused screen at startup", error);
+            assert!(restarted.reactor.contexts.has_screen_actives());
+            restarted.reactor.handle_event(Event::ApplicationMainWindowChanged(
+                pid,
+                Some(focused_window),
+                Quiet::Yes,
+            ));
+        }
+        if focused == 1 && !stale_focus {
             restarted.reactor.handle_event(Event::Command(Command::Context(
                 ContextCommand::RenameContext {
                     context: ContextRef::Id(id_of(a)),

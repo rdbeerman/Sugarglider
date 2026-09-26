@@ -610,10 +610,10 @@ impl Reactor {
             && self.scope() == Scope::Global
             && self.contexts.has_screen_actives()
         {
-            self.update_active_screen();
-            if self.active_screen_idx.is_none() {
+            if self.current_main_screen_index().is_none() {
                 return Err("Contexts are waiting for the focused screen at startup".to_string());
             }
+            self.update_active_screen();
         }
         self.reconcile_cold_scope();
         let result = match command {
@@ -1098,7 +1098,7 @@ impl Reactor {
         {
             return false;
         }
-        let screen = self.screens[self.focused_screen_index()].id;
+        let screen = self.screens[self.current_main_screen_index().unwrap_or(0)].id;
         let key = self.contexts.active_on(screen);
         info!(?screen, ?key, "Restoring the focused screen's context as global");
         self.contexts.forget_screen_actives();

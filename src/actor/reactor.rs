@@ -2047,8 +2047,7 @@ impl Reactor {
 
     fn update_active_screen(&mut self) {
         let changed = (|| {
-            let frame = self.layout_frame(self.main_window()?)?;
-            let screen = self.best_screen_idx_for_window(&frame)?;
+            let screen = self.current_main_screen_index()?;
             Some(self.active_screen_idx.replace(screen as u16) != Some(screen as u16))
         })();
         if changed.unwrap_or(false)
@@ -2056,6 +2055,11 @@ impl Reactor {
         {
             status_tx.send(status::Event::FocusedScreenChanged);
         }
+    }
+
+    fn current_main_screen_index(&self) -> Option<usize> {
+        let frame = self.layout_frame(self.main_window()?)?;
+        self.best_screen_idx_for_window(&frame)
     }
 
     fn active_screen(&self) -> Option<&Screen> {
