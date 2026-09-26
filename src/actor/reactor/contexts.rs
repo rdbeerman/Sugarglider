@@ -3342,7 +3342,8 @@ mod tests {
     }
 
     /// R10, R16. A Space change applies the active context again, which
-    /// parks again a parked window that its app moved back on screen.
+    /// parks again a parked window that its app moved back on screen. Only
+    /// the window server's list says so; no frame change was reported.
     #[test]
     fn r10_r16_a_space_change_parks_again_a_window_its_app_moved_back() {
         let mut s = Setup::new(2);
@@ -3351,15 +3352,7 @@ mod tests {
         let parked_at = corner(CGSize::new(600., 1000.));
         assert_eq!(parked_at, s.frame(wid(2)));
         let moved = rect(300., 200., 600., 700.);
-        let txid = s.reactor.windows[&wid(2)].last_sent_txid;
         s.apps.windows.get_mut(&wid(2)).unwrap().frame = moved;
-        s.reactor.handle_event(Event::WindowFrameChanged(
-            wid(2),
-            moved,
-            txid,
-            Requested(false),
-            None,
-        ));
 
         let snapshot = on_screen(&s, &[wid(1), wid(2)]);
         s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], snapshot));

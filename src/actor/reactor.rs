@@ -794,6 +794,9 @@ impl Reactor {
                     // restart restored before they can rejoin their contexts.
                     if self.apps.contains_key(&pid) || !self.contexts_in_use() {
                         self.send_visible_windows_to_layout(pid);
+                        if self.startup_complete {
+                            self.park_what_must_not_show(pid);
+                        }
                     }
                 }
                 None => self.update_complete_window_server_info(on_screen),
@@ -883,6 +886,10 @@ impl Reactor {
                         "Keeping a parked window's frame change out of the layout"
                     );
                     self.observe_parked(wid, new_frame, last_seen);
+                    if self.contexts_enabled() && self.pending_exit.is_none() {
+                        // The app may have moved the window out of its corner.
+                        self.repark_moved_windows();
+                    }
                     return;
                 }
                 let window = self.windows.get_mut(&wid).unwrap();

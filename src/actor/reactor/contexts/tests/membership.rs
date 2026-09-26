@@ -487,3 +487,112 @@ fn r22_a_title_change_updates_the_member_records_and_a_relaunch_matches_it() {
     assert!(s.reactor.contexts.is_member(c, relaunched));
     assert_eq!(vec![relaunched], s.parked());
 }
+
+/// C holds windows 1 and 2, window 3 is minimized, and C is active.
+fn c_with_window_3_minimized() -> (Setup, ContextKey) {
+    let mut s = Setup::new(3);
+    report_visible(&mut s, &[wid(1), wid(2)]);
+    let c = s.create("C", &[wid(1), wid(2)]);
+    s.switch(c);
+    assert!(s.parked().is_empty());
+    (s, c)
+}
+
+fn in_c() -> Vec<(WindowId, CGRect)> {
+    vec![
+        (wid(1), rect(0., 0., 600., 1000.)),
+        (wid(2), rect(600., 0., 600., 1000.)),
+    ]
+}
+
+/// R39, R30. A known window that isn't a member becomes visible without
+/// taking focus: its app reports it unminimized, or a Space change finds it
+/// moved in from another Space. It is parked at once, with its journal
+/// entry written first, and the members keep their tiles.
+#[test]
+fn r39_a_known_non_member_that_becomes_visible_is_parked() {
+    for how in ["unminimized", "moved in from another Space"] {
+        let (mut s, _) = c_with_window_3_minimized();
+        let frame = s.frame(wid(3));
+        let listed = on_screen(&s, &[wid(1), wid(2), wid(3)]);
+        match how {
+            "unminimized" => s.reactor.handle_event(Event::WindowsOnScreenUpdated {
+                pid: Some(1),
+                on_screen: listed,
+            }),
+            _ => s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], listed)),
+        }
+        let requests = s.apps.requests();
+        assert_eq!(
+            vec![corner(frame.size)],
+            frame_writes(&requests, wid(3)),
+            "{how}"
+        );
+        assert_eq!(vec![entry(3, frame)], s.journal_on_disk(), "{how}");
+        answer(&mut s, requests);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(vec![wid(3)], s.parked(), "{how}");
+        assert_eq!(corner(frame.size), s.frame(wid(3)));
+        assert_eq!(in_c(), s.tiles(), "{how}");
+        assert_eq!(in_c(), s.frames(&[wid(1), wid(2)]), "{how}");
+    }
+}
+
+/// R39, R24. A window that becomes visible as the main window has taken
+/// focus, so R39 doesn't park it.
+#[test]
+fn r39_a_window_that_becomes_visible_as_the_main_window_is_not_parked() {
+    let (mut s, _) = c_with_window_3_minimized();
+    let frame = s.frame(wid(3));
+    s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
+    s.reactor.handle_event(Event::ApplicationActivated(1, Quiet::Yes));
+    s.reactor
+        .handle_event(Event::ApplicationMainWindowChanged(1, Some(wid(3)), Quiet::Yes));
+    assert_eq!(Some(wid(3)), s.reactor.main_window());
+
+    let listed = on_screen(&s, &[wid(1), wid(2), wid(3)]);
+    s.reactor.handle_event(Event::WindowsOnScreenUpdated {
+        pid: Some(1),
+        on_screen: listed,
+    });
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    assert!(s.parked().is_empty());
+    assert_eq!(frame, s.frame(wid(3)));
+    assert_eq!(in_c(), s.tiles());
+}
+
+/// R39, R31. A parked window that its app moves out of its corner is parked
+/// again at once. Its journal entry keeps the frame from before it was
+/// first parked.
+#[test]
+fn r39_a_parked_window_that_its_app_moves_back_is_parked_again_at_once() {
+    let mut s = Setup::new(2);
+    let c = s.create("C", &[wid(1)]);
+    s.switch(c);
+    let parked_at = corner(CGSize::new(600., 1000.));
+    assert_eq!(parked_at, s.frame(wid(2)));
+    let journal = s.journal_on_disk();
+    assert_eq!(vec![entry(2, rect(600., 0., 600., 1000.))], journal);
+
+    let moved = rect(300., 200., 600., 700.);
+    let txid = s.reactor.windows[&wid(2)].last_sent_txid;
+    s.apps.windows.get_mut(&wid(2)).unwrap().frame = moved;
+    s.reactor.handle_event(Event::WindowFrameChanged(
+        wid(2),
+        moved,
+        txid,
+        Requested(false),
+        None,
+    ));
+
+    let requests = s.apps.requests();
+    assert_eq!(vec![parked_at], frame_writes(&requests, wid(2)));
+    answer(&mut s, requests);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    assert_eq!(parked_at, s.frame(wid(2)));
+    assert_eq!(vec![wid(2)], s.parked());
+    assert_eq!(journal, s.journal_on_disk());
+    assert_eq!(vec![(wid(1), screen())], s.tiles());
+}
