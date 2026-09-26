@@ -7,10 +7,10 @@
 use std::io;
 
 use objc2_core_foundation::{CGRect, CGSize};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::animation::Animation;
-use super::{Reactor, TransactionId, fit_frame_to_screen};
+use super::{MAX_REPARKS, Reactor, TransactionId, fit_frame_to_screen};
 use crate::actor::app::{WindowId, pid_t};
 use crate::actor::parked_journal::JournalEntry;
 use crate::collections::HashSet;
@@ -179,6 +179,19 @@ impl Reactor {
             };
         let mut writes = vec![];
         for (wid, before, corner) in moves {
+            let reparks = self.repark_counts.entry(wid).or_default();
+            if *reparks >= MAX_REPARKS {
+                if *reparks == MAX_REPARKS {
+                    warn!(
+                        ?wid,
+                        "An app keeps moving its parked window back; leaving it there \
+                         until the next switch or space change"
+                    );
+                    *reparks += 1;
+                }
+                continue;
+            }
+            *reparks += 1;
             let parked = self.parked.get_mut(&wid).expect("the window is parked");
             if before != parked.before {
                 if !journaled {

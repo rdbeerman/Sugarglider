@@ -404,6 +404,9 @@ pub struct Reactor {
     hidden_windows: HashSet<WindowServerId>,
     /// Windows parked in a screen corner.
     parked: HashMap<WindowId, Parked>,
+    /// How many times each parked window was parked again since the last
+    /// switch or Space change, to stop fighting an app that moves it back.
+    repark_counts: HashMap<WindowId, u32>,
     /// Windows the reactor saw for the first time before the window server
     /// listed them, whose membership waits for the layer the list reports.
     pending_first_seen: HashSet<WindowId>,
@@ -454,6 +457,12 @@ pub struct Reactor {
 /// up, and how long a pause resets the count.
 const MAX_FRAME_ATTEMPTS: u32 = 5;
 const FRAME_ATTEMPT_RESET: Duration = Duration::from_secs(2);
+
+/// How many times a window is parked again since the last switch or Space
+/// change before Sugarglider leaves it where its app put it. An app that
+/// moves its parked window back every time would otherwise make Sugarglider
+/// write the corner in a loop.
+const MAX_REPARKS: u32 = 5;
 
 /// The smallest size difference that counts as an app refusing to shrink a
 /// window. Anything smaller is pixel rounding.
@@ -671,6 +680,7 @@ impl Reactor {
             startup_complete: false,
             hidden_windows: HashSet::default(),
             parked: HashMap::default(),
+            repark_counts: HashMap::default(),
             pending_first_seen: HashSet::default(),
             journal,
             process_lookup: Box::new(Process::with_pid),
@@ -1236,6 +1246,9 @@ impl Reactor {
                 self.resizing_window = None;
                 info!("space changed");
                 self.showing_everything.clear();
+                // A Space change is a fresh start for the limit on parking
+                // windows again.
+                self.repark_counts.clear();
                 for (space, screen) in spaces.iter().zip(&mut self.screens) {
                     screen.space = *space;
                 }

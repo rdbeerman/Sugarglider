@@ -597,6 +597,55 @@ fn r39_a_parked_window_that_its_app_moves_back_is_parked_again_at_once() {
     assert_eq!(vec![(wid(1), screen())], s.tiles());
 }
 
+/// R39, Q1. An app that moves its parked window back after every write is
+/// parked again at most five times since the last switch, so Sugarglider
+/// doesn't loop with the app. The next switch lets it park the window again.
+#[test]
+fn r39_an_app_that_keeps_moving_its_parked_window_back_is_parked_five_times() {
+    let mut s = Setup::new(2);
+    let c = s.create("C", &[wid(1)]);
+    s.switch(c);
+    let parked_at = corner(CGSize::new(600., 1000.));
+    assert_eq!(parked_at, s.frame(wid(2)));
+    let moved = rect(300., 200., 600., 700.);
+    let mut writes = 0;
+    for _ in 0..10 {
+        let txid = s.reactor.windows[&wid(2)].last_sent_txid;
+        s.apps.windows.get_mut(&wid(2)).unwrap().frame = moved;
+        s.reactor.handle_event(Event::WindowFrameChanged(
+            wid(2),
+            moved,
+            txid,
+            Requested(false),
+            None,
+        ));
+        let requests = s.apps.requests();
+        writes += frame_writes(&requests, wid(2)).iter().filter(|&&f| f == parked_at).count();
+        answer(&mut s, requests);
+    }
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    assert_eq!(5, writes);
+    assert_eq!(moved, s.frame(wid(2)));
+    assert_eq!(vec![wid(2)], s.parked());
+
+    s.switch(ContextKey::Everything);
+    s.switch(c);
+    assert_eq!(parked_at, s.frame(wid(2)));
+    let txid = s.reactor.windows[&wid(2)].last_sent_txid;
+    s.apps.windows.get_mut(&wid(2)).unwrap().frame = moved;
+    s.reactor.handle_event(Event::WindowFrameChanged(
+        wid(2),
+        moved,
+        txid,
+        Requested(false),
+        None,
+    ));
+    let requests = s.apps.requests();
+    assert_eq!(vec![parked_at], frame_writes(&requests, wid(2)));
+    answer(&mut s, requests);
+}
+
 /// R36. A new native tab shares the frame of its group. It joins the
 /// contexts of the group's main tab, here C and D, and not only the active
 /// context, and it is pinned when the main tab is. It takes no tile of its

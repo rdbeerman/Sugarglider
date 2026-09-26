@@ -341,6 +341,8 @@ impl Reactor {
         self.in_drag = false;
         self.resizing_window = None;
         self.title_bar_drag = None;
+        // A switch is a fresh start for the limit on parking windows again.
+        self.repark_counts.clear();
         let added = std::mem::take(&mut self.added_since_switch);
         let contexts = self.contexts.clone();
         self.rejoin_for_switch(target);
