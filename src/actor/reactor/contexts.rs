@@ -16,8 +16,8 @@ use crate::actor::app::{WindowId, pid_t};
 use crate::actor::contexts_store::{ContextsStore, Loaded, empty_contexts_after};
 use crate::actor::layout::{ActiveContext, EventResponse, LayoutEvent};
 use crate::model::contexts::{
-    ContextError, ContextId, ContextKey, Contexts, RecordLink, SwitchInput, SwitchPlan,
-    SwitchScreen, plan_switch, rank,
+    ContextError, ContextId, ContextKey, Contexts, MatchPass, RecordLink, SwitchInput, SwitchPlan,
+    SwitchScreen, WindowDesc, plan_switch, rank,
 };
 use crate::sys::screen::SpaceId;
 
@@ -402,6 +402,39 @@ impl Reactor {
         if let Err(err) = self.contexts_store.save(&self.contexts, self.boot_id.as_deref()) {
             error!("Could not write the contexts: {err}");
         }
+    }
+
+    /// The window as member records describe it.
+    fn window_desc(&self, wid: WindowId) -> Option<WindowDesc> {
+        let window = self.windows.get(&wid)?;
+        let app = self.apps.get(&wid.pid);
+        Some(WindowDesc {
+            wid,
+            bundle_id: app.and_then(|app| app.info.bundle_id.clone()),
+            app_name: app.and_then(|app| app.info.localized_name.clone()),
+            title: window.title.expose_secret().clone(),
+            window_server_id: window.window_server_id,
+        })
+    }
+
+    /// Binds windows that the reactor finds to the empty member records they
+    /// match, so they rejoin the contexts that hold those records. Returns
+    /// whether any window rejoined.
+    pub(super) fn rejoin_windows(&mut self, wids: &[WindowId]) -> bool {
+        if !self.contexts_enabled() {
+            return false;
+        }
+        let windows: Vec<WindowDesc> =
+            wids.iter().filter_map(|&wid| self.window_desc(wid)).collect();
+        if windows.is_empty() {
+            return false;
+        }
+        let matches = self.contexts.rejoin_all(&windows, MatchPass::Arrival);
+        let rejoined = matches.iter().filter(|found| !found.is_empty()).count();
+        if rejoined > 0 {
+            info!(rejoined, "Windows rejoined their contexts");
+        }
+        rejoined > 0
     }
 
     /// Saves the contexts when an app that has member records quits, so the
@@ -4158,5 +4191,102 @@ mod tests {
         assert_eq!(vec![0], *exits.lock().unwrap());
         assert!(s.journal_on_disk().is_empty());
         assert!(s.parked().is_empty());
+    }
+
+    /// Starts a reactor as `--restore` does, with the layout, the journal,
+    /// and the contexts that `s` saved, and with contexts turned on as
+    /// `contexts` says. No app has registered yet.
+    fn restore(s: &Setup, contexts: bool) -> Reactor {
+        let layout =
+            LayoutManager::load(s.dir.path().join("layout.ron"), config(contexts)).unwrap();
+        let mut reactor = Reactor::new_for_test(layout);
+        reactor.journal = ParkedJournal::open(s.dir.path().join("parked.json"), SystemTime::now());
+        reactor.open_contexts(
+            ContextsStore::new(s.dir.path().join("contexts.json")),
+            Some("boot".into()),
+            SystemTime::now(),
+        );
+        reactor.handle_event(Event::ConfigChanged(config(contexts)));
+        reactor.handle_event(screens(vec![screen()], vec![Some(space())]));
+        reactor
+    }
+
+    /// App 1 registers with the reactor, with its windows at `frames`, and
+    /// startup completes.
+    fn register_app_1(reactor: &mut Reactor, frames: &[(WindowId, CGRect)]) -> Apps {
+        let mut apps = Apps::new();
+        let windows = frames
+            .iter()
+            .enumerate()
+            .map(|(idx, &(_, frame))| WindowInfo { frame, ..make_window(idx + 1) })
+            .collect();
+        reactor.handle_events(apps.make_app(1, windows));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(reactor);
+        apps
+    }
+
+    /// R32, R21, journal and state files. C is active, and its arrangement
+    /// differs from the order of the windows under Everything. After a quit
+    /// and `--restore`, the app's windows rejoin C when the app registers.
+    /// C keeps its arrangement, and the window that isn't in C is parked at
+    /// once. A Space change then changes nothing.
+    #[test]
+    fn r32_after_save_and_exit_and_restore_the_active_context_keeps_its_arrangement() {
+        let mut s = Setup::new(4);
+        let all = [wid(1), wid(2), wid(3), wid(4)];
+        let c = s.create("C", &[wid(1), wid(2), wid(3)]);
+        s.switch(c);
+        s.move_window(wid(1), Direction::Right);
+        let arranged = vec![
+            (wid(1), rect(400., 0., 400., 1000.)),
+            (wid(2), rect(0., 0., 400., 1000.)),
+            (wid(3), rect(800., 0., 400., 1000.)),
+        ];
+        assert_eq!(arranged, s.tiles());
+        let exits = catch_exits(&mut s);
+        save_and_exit(&mut s);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        let everything = s.frames(&all);
+        assert_eq!(rect(0., 0., 300., 1000.), everything[0].1);
+
+        let mut reactor = restore(&s, true);
+        assert_eq!(c, reactor.contexts.active());
+        let tiles = |reactor: &Reactor| {
+            let mut tiles = reactor.layout.calculate_layout(space(), screen(), &reactor.config);
+            tiles.sort_by_key(|(wid, _)| *wid);
+            tiles
+        };
+        assert_eq!(arranged, tiles(&reactor), "before any app registers");
+
+        let mut apps = register_app_1(&mut reactor, &everything);
+
+        let frames = |apps: &Apps, wids: &[WindowId]| {
+            wids.iter().map(|&wid| (wid, apps.windows[&wid].frame)).collect::<Vec<_>>()
+        };
+        assert_eq!(arranged, tiles(&reactor));
+        assert_eq!(arranged, frames(&apps, &all[..3]));
+        assert_eq!(vec![wid(4)], reactor.parked.keys().copied().collect::<Vec<_>>());
+        assert_eq!(corner(CGSize::new(300., 1000.)), apps.windows[&wid(4)].frame);
+        assert_eq!(
+            vec![entry(4, everything[3].1)],
+            ParkedJournal::open(s.dir.path().join("parked.json"), SystemTime::now()).entries()
+        );
+
+        let snapshot = WindowsOnScreen::new(
+            all.iter()
+                .map(|&wid| WindowServerInfo {
+                    id: reactor.windows[&wid].window_server_id.unwrap(),
+                    pid: 1,
+                    layer: 0,
+                    frame: apps.windows[&wid].frame,
+                })
+                .collect(),
+        );
+        reactor.handle_event(Event::SpaceChanged(vec![Some(space())], snapshot));
+        assert!(all_frame_writes(apps.requests()).is_empty());
+        assert_eq!(arranged, tiles(&reactor));
+        assert_eq!(vec![wid(4)], reactor.parked.keys().copied().collect::<Vec<_>>());
     }
 }

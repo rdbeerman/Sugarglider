@@ -763,8 +763,14 @@ impl Reactor {
                 Some(pid) => {
                     self.update_partial_window_server_info(on_screen);
                     // Notify the layout manager about visibility changes (e.g.,
-                    // when a window is minimized or unminimized).
-                    self.send_visible_windows_to_layout(pid);
+                    // when a window is minimized or unminimized). The update
+                    // that comes just before an app registers names none of
+                    // its windows, so with contexts in use it is not sent:
+                    // it would take the app's windows out of the layouts a
+                    // restart restored before they can rejoin their contexts.
+                    if self.apps.contains_key(&pid) || !self.contexts_in_use() {
+                        self.send_visible_windows_to_layout(pid);
+                    }
                 }
                 None => self.update_complete_window_server_info(on_screen),
             },
@@ -1543,6 +1549,7 @@ impl Reactor {
         //
         // TODO: Notice when returning from the login screen and ask again for
         // undiscovered windows.
+        let new_wids: Vec<WindowId> = new.iter().map(|&(wid, _)| wid).collect();
         self.window_ids
             .extend(new.iter().flat_map(|(wid, info)| info.sys_id.map(|wsid| (wsid, *wid))));
         self.windows.extend(new.into_iter().map(|(wid, info)| (wid, info.into())));
@@ -1570,10 +1577,17 @@ impl Reactor {
             self.visible_windows.retain(|wsid| !self.hidden_windows.contains(wsid));
         }
 
-        // Windows parked before a restart go back first, so the layout sees
-        // them at their frames from before parking.
+        // The windows found for the first time rejoin their contexts before
+        // the layout sees them. Windows parked before a restart go back first,
+        // so the layout sees them at their frames from before parking.
+        let rejoined = self.rejoin_windows(&new_wids);
         self.restore_from_journal(pid);
         self.send_visible_windows_to_layout(pid);
+        // The active context is applied again, so that it shows the windows
+        // that rejoined it and parks the ones that must not show.
+        if rejoined && let Some(response) = self.show_visible_spaces() {
+            self.handle_layout_response(response);
+        }
     }
 
     /// Sends the current list of visible windows for the given app to the
