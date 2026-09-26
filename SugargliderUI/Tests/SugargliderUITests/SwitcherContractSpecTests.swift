@@ -29,7 +29,8 @@ final class SwitcherContractSpecTests: SwitcherSpecTestCase {
     "everything": ["active": false, "hotkey": "⌃⌥0"],
     "windows": [
       [
-        "id": ["pid": 650, "idx": 7001], "title": "Inbox", "app": "Mail", "pinned": false,
+        "id": ["pid": 650, "idx": 7001], "title": "Inbox", "app": "Mail", "tab_count": 1,
+        "pinned": false,
       ]
     ],
   ]
@@ -48,7 +49,7 @@ final class SwitcherContractSpecTests: SwitcherSpecTestCase {
       unsorted: SwitcherUnsorted(windows: 0, active: false),
       everything: SwitcherEverything(active: false, hotkey: "⌃⌥0"),
       windows: [
-        SwitcherWindow(id: mail, title: "Inbox", app: "Mail", pinned: false)
+        SwitcherWindow(id: mail, title: "Inbox", app: "Mail", tabCount: 1, pinned: false)
       ]
     )
   }
@@ -105,7 +106,7 @@ final class SwitcherContractSpecTests: SwitcherSpecTestCase {
         "everything": { "active": false, "hotkey": "⌃⌥0", "layout": "bsp" },
         "windows": [
           { "id": { "pid": 650, "idx": 7001, "space": null }, "title": "Inbox", "app": "Mail",
-            "contexts": [{ "id": 1, "name": "Comms" }], "pinned": false,
+            "contexts": [{ "id": 1, "name": "Comms" }], "tab_count": 1, "pinned": false,
             "frame": [0, 0, 800, 600] }
         ],
         "scope": "global"
@@ -188,7 +189,7 @@ final class SwitcherContractSpecTests: SwitcherSpecTestCase {
       "contexts.0.members.0.window.pid", "contexts.0.members.0.window.idx",
       "unsorted.windows", "unsorted.active", "everything.active",
       "windows.0.id", "windows.0.id.pid", "windows.0.id.idx", "windows.0.title", "windows.0.app",
-      "windows.0.pinned",
+      "windows.0.tab_count", "windows.0.pinned",
     ]
     for path in required {
       XCTAssertThrowsError(try decodePayload(removing: path), path)

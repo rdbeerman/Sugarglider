@@ -34,15 +34,15 @@ enum Fixtures {
       "everything": { "active": false, "hotkey": "⌃⌥0" },
       "windows": [
         { "id": { "pid": 640, "idx": 8812 }, "title": "~/src/sugarglider",
-          "app": "Ghostty", "pinned": false },
+          "app": "Ghostty", "tab_count": 1, "pinned": false },
         { "id": { "pid": 812, "idx": 9123 }, "title": "Docs",
-          "app": "Google Chrome", "pinned": false },
+          "app": "Google Chrome", "tab_count": 3, "pinned": false },
         { "id": { "pid": 903, "idx": 9201 }, "title": "WhatsApp",
-          "app": "WhatsApp", "pinned": true },
+          "app": "WhatsApp", "tab_count": 1, "pinned": true },
         { "id": { "pid": 977, "idx": 9310 }, "title": "Downloads",
-          "app": "Finder", "pinned": false },
+          "app": "Finder", "tab_count": 1, "pinned": false },
         { "id": { "pid": 988, "idx": 9402 }, "title": "general",
-          "app": "Slack", "pinned": false }
+          "app": "Slack", "tab_count": 1, "pinned": false }
       ]
     }
     """

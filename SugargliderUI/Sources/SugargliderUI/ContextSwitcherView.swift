@@ -195,7 +195,7 @@ struct ContextSwitcherView: View {
         .foregroundStyle(item.checked && !item.pinned ? Color.accentColor : Color.secondary)
       Text(item.title.isEmpty ? "Untitled" : item.title)
         .lineLimit(1)
-      Text(item.app)
+      Text(item.detail)
         .foregroundStyle(.secondary)
         .lineLimit(1)
       Spacer(minLength: 8)
@@ -285,7 +285,7 @@ struct ContextSwitcherView: View {
         }
       }
       if model.mode == .list, let target = model.targetWindow {
-        Text("Window: \(target.title.isEmpty ? "Untitled" : target.title) — \(target.app)")
+        Text("Window: \(target.title.isEmpty ? "Untitled" : target.title) — \(target.detail)")
           .lineLimit(1)
       }
     }

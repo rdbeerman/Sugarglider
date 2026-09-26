@@ -187,7 +187,7 @@ final class SwitcherChecklistSpecTests: SwitcherSpecTestCase {
         "everything": { "active": false },
         "windows": [
           { "id": { "pid": 650, "idx": 7001 }, "title": "Inbox", "app": "Mail",
-            "pinned": false }
+            "tab_count": 1, "pinned": false }
         ]
       }
       """

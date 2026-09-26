@@ -163,6 +163,24 @@ struct SwitcherChecklistItem: Equatable {
   /// A pinned window is a member of every context (R3). It shows checked,
   /// can't be unchecked, and is never sent.
   var pinned = false
+  /// How many tabs the window's native tab group has (R36).
+  var tabCount = 1
+
+  /// The app name, and the number of tabs when there are several.
+  var detail: String {
+    SwitcherWindow.detail(app: app, tabCount: tabCount)
+  }
+}
+
+extension SwitcherWindow {
+  /// The app name, and the number of tabs when there are several.
+  var detail: String {
+    Self.detail(app: app, tabCount: tabCount)
+  }
+
+  static func detail(app: String, tabCount: Int) -> String {
+    tabCount > 1 ? "\(app) (\(tabCount) tabs)" : app
+  }
 }
 
 enum SwitcherMode: Equatable {
@@ -530,7 +548,8 @@ final class ContextSwitcherModel: ObservableObject {
           app: window.app,
           checked: true,
           initiallyChecked: true,
-          pinned: window.pinned
+          pinned: window.pinned,
+          tabCount: window.tabCount
         )
       }
     rejectedChecklist = nil
@@ -550,7 +569,8 @@ final class ContextSwitcherModel: ObservableObject {
         app: window.app,
         checked: member,
         initiallyChecked: member,
-        pinned: window.pinned
+        pinned: window.pinned,
+        tabCount: window.tabCount
       )
     }
     for member in context.members {

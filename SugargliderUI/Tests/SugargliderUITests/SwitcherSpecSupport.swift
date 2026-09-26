@@ -33,9 +33,10 @@ enum SpecPayload {
     _ id: SwitcherWindowId,
     _ title: String,
     _ app: String,
+    tabs: Int = 1,
     pinned: Bool = false
   ) -> SwitcherWindow {
-    SwitcherWindow(id: id, title: title, app: app, pinned: pinned)
+    SwitcherWindow(id: id, title: title, app: app, tabCount: tabs, pinned: pinned)
   }
 
   /// A payload for the first time: no named context, Everything active.

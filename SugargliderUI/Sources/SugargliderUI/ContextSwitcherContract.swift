@@ -83,15 +83,15 @@ import Foundation
 ///   "everything": { "active": false, "hotkey": "⌃⌥0" },
 ///   "windows": [
 ///     { "id": { "pid": 640, "idx": 8812 }, "title": "~/src/sugarglider",
-///       "app": "Ghostty", "pinned": false },
+///       "app": "Ghostty", "tab_count": 1, "pinned": false },
 ///     { "id": { "pid": 812, "idx": 9123 }, "title": "Docs",
-///       "app": "Google Chrome", "pinned": false },
+///       "app": "Google Chrome", "tab_count": 3, "pinned": false },
 ///     { "id": { "pid": 903, "idx": 9201 }, "title": "WhatsApp",
-///       "app": "WhatsApp", "pinned": true },
+///       "app": "WhatsApp", "tab_count": 1, "pinned": true },
 ///     { "id": { "pid": 977, "idx": 9310 }, "title": "Downloads",
-///       "app": "Finder", "pinned": false },
+///       "app": "Finder", "tab_count": 1, "pinned": false },
 ///     { "id": { "pid": 988, "idx": 9402 }, "title": "general",
-///       "app": "Slack", "pinned": false }
+///       "app": "Slack", "tab_count": 1, "pinned": false }
 ///   ]
 /// }
 /// ```
@@ -119,8 +119,13 @@ import Foundation
 ///   These are the tracked windows that show now on the visible Spaces (the
 ///   focused screen in `per_screen` scope), including the target window.
 ///   They leave out parked windows, Sugarglider's own windows, and untracked
-///   windows. `pinned` says whether it is pinned (R3). Which contexts hold
-///   a window is only in `contexts[].members`.
+///   windows. A native tab group is one entry, its main tab, and
+///   `tab_count` says how many tabs it has (R36). `pinned` says whether it
+///   is pinned (R3). Which contexts hold a window is only in
+///   `contexts[].members`.
+///
+/// Every window id in the payload names a tab group by its main tab, and a
+/// command about a window applies to its whole group (R36).
 ///
 /// Exactly one of the `active` flags is true. A key whose value can be null
 /// may also be missing.
@@ -404,12 +409,23 @@ struct SwitcherEverything: Codable, Equatable, Sendable {
   var hotkey: String?
 }
 
-/// A window on screen.
+/// A window on screen: a window without tabs, or the main tab of a native
+/// tab group (R36).
 struct SwitcherWindow: Codable, Equatable, Sendable {
   var id: SwitcherWindowId
   var title: String
   var app: String
+  /// How many tabs its group has, 1 for a window without tabs.
+  var tabCount: Int
   var pinned: Bool
+
+  enum CodingKeys: String, CodingKey {
+    case id
+    case title
+    case app
+    case tabCount = "tab_count"
+    case pinned
+  }
 }
 
 // MARK: - Rank result

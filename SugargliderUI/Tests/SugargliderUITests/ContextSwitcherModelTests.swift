@@ -801,6 +801,40 @@ final class ContextSwitcherModelTests: XCTestCase {
     )
   }
 
+  // MARK: Tab groups
+
+  /// R36: a native tab group is one row, named by its main tab, with its
+  /// number of tabs. Commands carry the main tab, and Rust applies them to
+  /// the whole group.
+  func testATabGroupIsOneRowWithItsTabCount() throws {
+    let model = try makeModel()
+    XCTAssertEqual(model.targetWindow?.detail, "Google Chrome (3 tabs)")
+
+    model.handle(.up)
+    model.handle(.commandE)
+    XCTAssertEqual(
+      model.checklist.map(\.detail),
+      ["Ghostty", "Google Chrome (3 tabs)", "WhatsApp", "Finder", "Slack", "Zed", "Mail"]
+    )
+    XCTAssertEqual(model.checklist.map(\.tabCount), [1, 3, 1, 1, 1, 1, 1])
+
+    model.toggleItem(at: 1)
+    model.handle(.enter)
+    XCTAssertEqual(
+      backend.sent,
+      [.edit(context: Fixtures.sugarglider, add: [], remove: [Fixtures.chrome], removeRecords: [])]
+    )
+  }
+
+  func testTheCreateViewShowsTheTabsOfAGroup() throws {
+    let model = try makeModel()
+    model.query = "Tabs"
+    model.handle(.enter)
+    XCTAssertEqual(model.mode, .create(name: "Tabs"))
+    XCTAssertEqual(model.checklist[1].source, .window(Fixtures.chrome))
+    XCTAssertEqual(model.checklist[1].detail, "Google Chrome (3 tabs)")
+  }
+
   // MARK: Pinned windows
 
   /// R3: a pinned window is a member of every context. The create view

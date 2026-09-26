@@ -39,7 +39,8 @@ final class ContextSwitcherContractTests: XCTestCase {
     XCTAssertEqual(payload.windows.count, 5)
     XCTAssertEqual(
       payload.windows[1],
-      SwitcherWindow(id: Fixtures.chrome, title: "Docs", app: "Google Chrome", pinned: false)
+      SwitcherWindow(
+        id: Fixtures.chrome, title: "Docs", app: "Google Chrome", tabCount: 3, pinned: false)
     )
     XCTAssertTrue(payload.windows[2].pinned)
   }

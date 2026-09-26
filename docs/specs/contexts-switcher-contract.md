@@ -71,20 +71,20 @@ The reactor logs failures that come later, for example a failed journal write (R
   "everything": { "active": false, "hotkey": "⌃⌥0" },
   "windows": [
     { "id": { "pid": 640, "idx": 8812 }, "title": "~/src/sugarglider",
-      "app": "Ghostty", "pinned": false },
+      "app": "Ghostty", "tab_count": 1, "pinned": false },
     { "id": { "pid": 812, "idx": 9123 }, "title": "Docs",
-      "app": "Google Chrome", "pinned": false },
+      "app": "Google Chrome", "tab_count": 3, "pinned": false },
     { "id": { "pid": 903, "idx": 9201 }, "title": "WhatsApp",
-      "app": "WhatsApp", "pinned": true },
+      "app": "WhatsApp", "tab_count": 1, "pinned": true },
     { "id": { "pid": 977, "idx": 9310 }, "title": "Downloads",
-      "app": "Finder", "pinned": false },
+      "app": "Finder", "tab_count": 1, "pinned": false },
     { "id": { "pid": 988, "idx": 9402 }, "title": "general",
-      "app": "Slack", "pinned": false }
+      "app": "Slack", "tab_count": 1, "pinned": false }
   ]
 }
 ```
 
-In this example the Zed window (record 1) is open but not on screen (another Space, minimized, or parked), and the Mail window (record 3) is gone. The WhatsApp window is pinned, so it doesn't count as unsorted; Finder and Slack are the 2 unsorted windows.
+In this example the Zed window (record 1) is open but not on screen (another Space, minimized, or parked), and the Mail window (record 3) is gone. The Chrome window is the main tab of a group of 3 tabs. The WhatsApp window is pinned, so it doesn't count as unsorted; Finder and Slack are the 2 unsorted windows.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -107,12 +107,15 @@ In this example the Zed window (record 1) is open but not on screen (another Spa
 | `unsorted.active` | bool | Whether Unsorted is active. |
 | `everything.active` | bool | Whether Everything is active. |
 | `everything.hotkey` | string or null | The binding that runs `show_everything`, or null. |
-| `windows` | array | The windows on screen that the create and edit views list: the tracked windows that show now on the visible Spaces (the focused screen in `per_screen` scope), including the target window. Leave out parked windows, Sugarglider's own windows, and untracked windows. |
+| `windows` | array | The windows on screen that the create and edit views list: the tracked windows that show now on the visible Spaces (the focused screen in `per_screen` scope), including the target window. Leave out parked windows, Sugarglider's own windows, and untracked windows. A native tab group is one entry, its main tab (R36). |
 | `windows[].id` | window | The window. |
 | `windows[].title`, `windows[].app` | string | Its title and app name. |
+| `windows[].tab_count` | integer | How many tabs the window's native tab group has, or 1 for a window without tabs. The create and edit views show "(n tabs)" when it is more than 1. |
 | `windows[].pinned` | bool | Whether it is pinned (R3). The create and edit views show a pinned window checked and fixed. |
 
 Exactly one of the `active` flags is true. Keys whose type says "or null" may also be missing.
+
+Tabs that share a frame share membership (R36). Every window id in the payload (`target_window`, `windows[].id`, and `members[].window`) names a tab group by its main tab, so the panel shows one row per group. Every command that carries a window (`add_window`, `move_window`, `toggle_pinned`, `create.windows`, `edit.add`, and `edit.remove`) applies to the window's whole group. Rust resolves a tab to its group, as R36 requires.
 
 Which contexts hold a window is only in `contexts[].members`: a window is a member of a context when one of the context's records has it as `window`. The edit view checks a window on screen by that rule.
 
