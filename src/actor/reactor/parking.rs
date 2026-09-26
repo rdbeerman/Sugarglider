@@ -16,6 +16,7 @@ use crate::actor::parked_journal::JournalEntry;
 use crate::collections::HashSet;
 use crate::model::parking_origin;
 use crate::sys::app::Process;
+use crate::sys::geometry::CGRectExt;
 use crate::sys::window_server::WindowServerId;
 
 /// Finds the process that has a pid now.
@@ -52,6 +53,10 @@ impl Reactor {
     /// have no window server id, or that are on no screen are left where they
     /// are, and are not returned. A window listed more than once is parked
     /// once.
+    ///
+    /// A window that shows 1 square point or less of its screen, as a parked
+    /// window does, keeps the frame in its journal entry. Without an entry it
+    /// is left where it is, because no frame is known to put it back to.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "only tests park windows until context switching")
@@ -69,9 +74,23 @@ impl Reactor {
                 debug!(?wid, "Not parking a window without a window server id");
                 continue;
             };
-            let frame = window.frame_monotonic;
-            let Some(parked_frame) = self.parked_frame(frame) else {
-                debug!(?wid, ?frame, "Not parking a window that is on no screen");
+            let current = window.frame_monotonic;
+            let Some(parked_frame) = self.parked_frame(current) else {
+                debug!(?wid, ?current, "Not parking a window that is on no screen");
+                continue;
+            };
+            let frame = if !self.shows_at_most_a_point(current) {
+                current
+            } else if let Some(entry) = self.journal.get(wid.pid, wsid) {
+                // The window was put back, but no write has moved it out of
+                // its corner.
+                CGRect::from(entry.frame)
+            } else {
+                debug!(
+                    ?wid,
+                    ?current,
+                    "Not parking a window that is already in a corner"
+                );
                 continue;
             };
             entries.push(JournalEntry {
@@ -109,6 +128,11 @@ impl Reactor {
         for wid in wids {
             let Some(frame) = self.parked.remove(wid) else { continue };
             self.frame_attempts.remove(wid);
+            // The user can't be resizing a window in a corner, and
+            // `update_layout` doesn't write to the window being resized.
+            if self.resizing_window == Some(*wid) {
+                self.resizing_window = None;
+            }
             if !laid_out.contains(wid) {
                 self.pending_frame_overrides.insert(*wid, frame);
             }
@@ -125,6 +149,13 @@ impl Reactor {
             .flat_map(|(space, frame)| self.layout.calculate_layout(space, frame, &self.config))
             .map(|(wid, _)| wid)
             .collect()
+    }
+
+    /// Whether a window at `frame` shows 1 square point or less of the screen
+    /// it is on.
+    fn shows_at_most_a_point(&self, frame: CGRect) -> bool {
+        self.best_screen_idx_for_window(&frame)
+            .is_none_or(|idx| self.screens[idx].frame.intersection(&frame).area() <= 1.0)
     }
 
     /// The frame that parks a window now at `frame`. It keeps 1 point in a
@@ -1542,5 +1573,98 @@ mod tests {
         s.handle_requests(requests);
         assert_eq!(floating, s.frame(wid(1)));
         assert!(s.journal_on_disk().is_empty());
+    }
+
+    #[test]
+    fn h3_an_unpark_puts_back_a_window_left_marked_as_being_resized() {
+        let mut s = Setup::new(2);
+        let tile = s.frame(wid(1));
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        // A mouse-up was missed, so the window still counts as being resized.
+        s.reactor.resizing_window = Some(wid(1));
+
+        s.reactor.unpark_windows(&[wid(1)]);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(tile, s.frame(wid(1)));
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        assert_eq!(vec![entry(1, 1, tile)], s.journal_on_disk());
+    }
+
+    #[test]
+    fn r30_a_window_still_in_its_corner_keeps_its_entry_when_parked_again() {
+        let mut s = Setup::new(2);
+        let tile = s.frame(wid(1));
+        let corner = rect(999., 999., tile.size.width, tile.size.height);
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        // The window is no longer parked, but no write has moved it out of
+        // its corner.
+        s.reactor.parked.remove(&wid(1));
+        assert_eq!(corner, s.reactor.windows[&wid(1)].frame_monotonic);
+
+        assert_eq!(vec![wid(1)], s.reactor.park_windows(&[wid(1)]).unwrap());
+
+        assert_eq!(vec![entry(1, 1, tile)], s.journal_on_disk());
+        assert_eq!(Some(&tile), s.reactor.parked.get(&wid(1)));
+    }
+
+    #[test]
+    fn r30_a_window_moved_after_it_was_put_back_is_journaled_where_it_is() {
+        let mut s = Setup::new(2);
+        s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        s.reactor.send_layout_event(LayoutEvent::WindowFocused(vec![space()], wid(1)));
+        s.reactor.handle_event(Event::Command(Command::Layout(
+            LayoutCommand::ToggleWindowFloating,
+        )));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s.reactor.unpark_windows(&[wid(1)]);
+        _ = s.apps.requests();
+        assert_eq!(1, s.journal_on_disk().len(), "no echo has confirmed the unpark");
+
+        // The user moves the floating window.
+        let moved = rect(300., 400., 50., 50.);
+        let txid = s.reactor.windows[&wid(1)].last_sent_txid;
+        s.reactor.handle_event(Event::WindowFrameChanged(
+            wid(1),
+            moved,
+            txid,
+            Requested(false),
+            None,
+        ));
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+
+        assert_eq!(vec![entry(1, 1, moved)], s.journal_on_disk());
+    }
+
+    #[test]
+    fn r30_a_window_in_a_corner_without_an_entry_is_not_parked() {
+        let mut s = Setup::new(2);
+        s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        s.reactor.send_layout_event(LayoutEvent::WindowFocused(vec![space()], wid(1)));
+        s.reactor.handle_event(Event::Command(Command::Layout(
+            LayoutCommand::ToggleWindowFloating,
+        )));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        // The floating window is moved into a corner, as parking would.
+        let corner = rect(999., 999., 50., 50.);
+        let txid = s.reactor.windows[&wid(1)].last_sent_txid;
+        s.reactor.handle_event(Event::WindowFrameChanged(
+            wid(1),
+            corner,
+            txid,
+            Requested(false),
+            None,
+        ));
+        assert!(s.apps.requests().is_empty());
+
+        assert!(s.reactor.park_windows(&[wid(1)]).unwrap().is_empty());
+
+        assert!(s.apps.requests().is_empty());
+        assert!(s.reactor.parked.is_empty());
+        assert!(file_names(s.dir.path()).is_empty());
     }
 }
