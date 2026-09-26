@@ -453,6 +453,30 @@ mod tests {
         }
     }
 
+    /// Menu bar, with the spec's term: the active context is the context a
+    /// screen shows. While the screens show Everything and the model's
+    /// active context stays, during a quit that waits for parked windows
+    /// (R32) or before the Space change that turns a Space off (R33), the
+    /// title adds nothing. The reactor publishes this snapshot, as
+    /// `a_quit_that_waits_publishes_everything_on_each_screen` and the
+    /// `ShowEverythingOn` step of `a_snapshot_is_published_after_each_kind_of_change`
+    /// show.
+    #[test]
+    #[ignore = "bug: the title names the model's context while the screens show Everything"]
+    fn while_the_screens_show_everything_the_title_adds_nothing() {
+        let mut contexts = Contexts::new();
+        let comms = contexts.create("Comms").unwrap();
+        contexts.switch_to(ContextKey::Named(comms)).unwrap();
+        let screens = vec![ScreenContext {
+            id: 1,
+            shows: ContextKey::Everything,
+        }];
+        let everything_shown = ContextsSnapshot::new(&contexts, screens, 0);
+
+        assert_eq!("", title(None, &everything_shown));
+        assert_eq!("2", title(Some(2), &everything_shown));
+    }
+
     /// Menu bar. The title shows the context's name as the model stores it,
     /// with its case and accents.
     #[test]

@@ -702,6 +702,31 @@ mod tests {
         }
     }
 
+    /// Menu bar, with the spec's term: the active context is the context a
+    /// screen shows. While the screens show Everything and the model's
+    /// active context stays, during a quit that waits for parked windows
+    /// (R32) or before the Space change that turns a Space off (R33), the
+    /// checkmark is on Show Everything. The reactor publishes this snapshot,
+    /// as `a_quit_that_waits_publishes_everything_on_each_screen` and the
+    /// `ShowEverythingOn` step of `a_snapshot_is_published_after_each_kind_of_change`
+    /// show.
+    #[test]
+    #[ignore = "bug: the checkmark is on the model's context while the screens show Everything"]
+    fn while_the_screens_show_everything_show_everything_is_checked() {
+        let mut contexts = Contexts::new();
+        let comms = contexts.create("Comms").unwrap();
+        contexts.switch_to(ContextKey::Named(comms)).unwrap();
+        let screens = vec![ScreenContext {
+            id: 1,
+            shows: ContextKey::Everything,
+        }];
+        let everything_shown = ContextsSnapshot::new(&contexts, screens, 0);
+
+        let entries = context_menu(&everything_shown, &keys(), all);
+
+        assert_eq!(vec!["Show Everything"], checked(&entries));
+    }
+
     /// Menu bar. Send Window to offers each named context in order, never
     /// Unsorted or Everything, and not the active context, which already
     /// shows the window. With only the active context to offer, the submenu
