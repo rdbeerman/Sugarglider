@@ -96,10 +96,10 @@ pub(super) mod tests {
     use test_log::test;
 
     use super::super::testing::*;
-    use super::super::{Command, ContextCommand, ContextRef, Event, Reactor};
+    use super::super::{Command, ContextCommand, ContextRef, Event, Reactor, ReactorCommand};
     use crate::actor::app::WindowId;
     use crate::actor::contexts_store::{ContextsStore, Loaded};
-    use crate::actor::layout::LayoutManager;
+    use crate::actor::layout::{LayoutCommand, LayoutEvent, LayoutManager};
     use crate::actor::parked_journal::ParkedJournal;
     use crate::actor::server::{ContextRequest, Response, answer_context_request};
     use crate::config::Config;
@@ -395,5 +395,399 @@ pub(super) mod tests {
             panic!("{ron}");
         };
         assert_eq!(ContextCommand::CreateContext("Client work".into()), command);
+    }
+
+    /// Makes app 1's window float at the frame it had before it was tiled.
+    fn float(s: &mut Setup, idx: u32) {
+        s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        s.reactor.send_layout_event(LayoutEvent::WindowFocused(vec![space()], wid(idx)));
+        s.reactor.handle_event(Event::Command(Command::Layout(
+            LayoutCommand::ToggleWindowFloating,
+        )));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+    }
+
+    fn tiles(s: &Setup, space: SpaceId, screen: CGRect) -> Vec<(WindowId, CGRect)> {
+        let mut tiles = s.reactor.layout.calculate_layout(space, screen, &s.reactor.config);
+        tiles.sort_by_key(|(wid, _)| *wid);
+        tiles
+    }
+
+    /// Launches app `pid` with `windows`. Its window server snapshot also
+    /// lists the windows in `also` at their frames, since the window server
+    /// always lists every window on screen.
+    fn launch(s: &mut Setup, pid: i32, windows: Vec<WindowInfo>, also: &[WindowId]) {
+        let mut listed: Vec<WindowServerInfo> = also
+            .iter()
+            .map(|&wid| WindowServerInfo {
+                id: s.reactor.windows[&wid].window_server_id.unwrap(),
+                pid: wid.pid,
+                layer: 0,
+                frame: s.apps.windows[&wid].frame,
+            })
+            .collect();
+        let mut events = s.apps.make_app(pid, windows);
+        for event in &mut events {
+            if let Event::WindowsOnScreenUpdated { on_screen, .. } = event {
+                listed.append(&mut on_screen.info);
+                *on_screen = WindowsOnScreen::new(std::mem::take(&mut listed));
+            }
+        }
+        s.reactor.handle_events(events);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+    }
+
+    /// Sends the command as the message server does, and lets the apps
+    /// answer.
+    fn run_sent(s: &mut Setup, sent: Option<ContextCommand>) {
+        s.run(sent.expect("the server sends the command"));
+    }
+
+    /// M5c, L7. A window the user floats and a window that floats by default
+    /// are tracked windows on screen, so the new context holds them. They
+    /// stay where they float, and the tiles don't change.
+    #[test]
+    fn a_new_context_holds_the_floating_windows_where_they_float() {
+        let mut s = Setup::new(3);
+        float(&mut s, 1);
+        let fixed = WindowId::new(2, 1);
+        let fixed_window = WindowInfo {
+            is_resizable: false,
+            sys_id: Some(WindowServerId::new(21)),
+            frame: rect(500., 500., 80., 80.),
+            ..make_window(1)
+        };
+        launch(&mut s, 2, vec![fixed_window], &[wid(1), wid(2), wid(3)]);
+        let all = [wid(1), wid(2), wid(3), fixed];
+        let before = vec![
+            (wid(1), rect(100., 100., 50., 50.)),
+            (wid(2), rect(0., 0., 600., 1000.)),
+            (wid(3), rect(600., 0., 600., 1000.)),
+            (fixed, rect(500., 500., 80., 80.)),
+        ];
+        assert_eq!(before, s.frames(&all));
+        let tiled = vec![before[1], before[2]];
+        assert_eq!(tiled, tiles(&s, space(), screen()));
+
+        s.create("Work");
+
+        assert_eq!(all.to_vec(), s.members("Work"));
+        assert_eq!(ContextKey::Named(s.id("Work")), s.reactor.contexts.active());
+        assert!(s.parked().is_empty());
+        assert_eq!(before, s.frames(&all));
+        assert_eq!(tiled, tiles(&s, space(), screen()));
+
+        s.run(ContextCommand::ShowEverything);
+        s.run(ContextCommand::SwitchContext(ContextRef::Name("Work".into())));
+        assert_eq!(before, s.frames(&all));
+        assert!(s.parked().is_empty());
+    }
+
+    /// M5c, R1. Under Everything, the new context takes every window on
+    /// screen, also the windows that are in other contexts, and those
+    /// contexts keep them. The window of an app the user hid is not on
+    /// screen and stays out.
+    #[test]
+    fn a_new_context_takes_windows_that_other_contexts_hold_too() {
+        let mut s = Setup::new(4);
+        let hidden = WindowId::new(2, 1);
+        let hidden_window = WindowInfo {
+            sys_id: Some(WindowServerId::new(21)),
+            ..make_window(5)
+        };
+        launch(&mut s, 2, vec![hidden_window], &[wid(1), wid(2), wid(3), wid(4)]);
+        let c = s.reactor.contexts.create("C").unwrap();
+        let d = s.reactor.contexts.create("D").unwrap();
+        for (id, idx) in [(c, 1), (c, 2), (d, 2), (d, 3)] {
+            let desc = s.reactor.window_desc(wid(idx)).unwrap();
+            s.reactor.contexts.add_window(id, &desc).unwrap();
+        }
+        // App 2 is hidden, so the window server lists only app 1's windows.
+        let listed: Vec<WindowServerInfo> = (1..=4)
+            .map(|idx| WindowServerInfo {
+                id: WindowServerId::new(idx),
+                pid: 1,
+                layer: 0,
+                frame: s.apps.windows[&wid(idx)].frame,
+            })
+            .collect();
+        s.reactor.handle_event(Event::WindowsOnScreenUpdated {
+            pid: None,
+            on_screen: WindowsOnScreen::new(listed),
+        });
+        s.reactor.update_visible_windows();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let shown = [wid(1), wid(2), wid(3), wid(4)];
+        let frames = vec![
+            (wid(1), rect(0., 0., 300., 1000.)),
+            (wid(2), rect(300., 0., 300., 1000.)),
+            (wid(3), rect(600., 0., 300., 1000.)),
+            (wid(4), rect(900., 0., 300., 1000.)),
+        ];
+        assert_eq!(frames, s.frames(&shown));
+        let hidden_frame = s.apps.windows[&hidden].frame;
+
+        s.create("New");
+
+        assert_eq!(shown.to_vec(), s.members("New"));
+        assert_eq!(vec![wid(1), wid(2)], s.members("C"));
+        assert_eq!(vec![wid(2), wid(3)], s.members("D"));
+        assert!(s.parked().is_empty());
+        assert_eq!(frames, s.frames(&shown));
+        assert_eq!(frames, tiles(&s, space(), screen()));
+        assert_eq!(hidden_frame, s.apps.windows[&hidden].frame);
+
+        s.run(ContextCommand::SwitchContext(ContextRef::Id(d)));
+        assert_eq!(vec![wid(1), wid(4)], s.parked());
+        s.run(ContextCommand::SwitchContext(ContextRef::Name("New".into())));
+        assert!(s.parked().is_empty());
+        assert_eq!(frames, s.frames(&shown));
+    }
+
+    /// M5c, R7, L3. In global scope the new context takes the windows on
+    /// every visible Space, and each Space keeps its arrangement.
+    #[test]
+    fn a_new_context_takes_the_windows_on_both_displays() {
+        let right = rect(1200., 0., 1200., 1000.);
+        let space2 = SpaceId::new(2);
+        let mut s = Setup::on(vec![screen(), right], vec![Some(space()), Some(space2)]);
+        let mut windows = make_windows(3);
+        windows[1].frame = rect(1300., 100., 50., 50.);
+        s.reactor.handle_events(s.apps.make_app(1, windows));
+        s.reactor.handle_event(Event::StartupComplete);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let all = [wid(1), wid(2), wid(3)];
+        let frames = vec![
+            (wid(1), rect(0., 0., 600., 1000.)),
+            (wid(2), right),
+            (wid(3), rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(frames, s.frames(&all));
+
+        s.create("Both");
+
+        assert_eq!(all.to_vec(), s.members("Both"));
+        assert!(s.parked().is_empty());
+        assert_eq!(frames, s.frames(&all));
+        assert_eq!(vec![frames[0], frames[2]], tiles(&s, space(), screen()));
+        assert_eq!(vec![frames[1]], tiles(&s, space2, right));
+    }
+
+    /// M5c. With no window on screen, the new context has no members, and
+    /// it still becomes active and is saved.
+    #[test]
+    fn a_new_context_with_no_window_on_screen_is_empty_and_active() {
+        let mut s = Setup::on(vec![screen()], vec![Some(space())]);
+        s.reactor.handle_event(Event::StartupComplete);
+
+        s.create("Empty");
+
+        let empty = s.reactor.contexts.by_name("Empty").unwrap();
+        assert!(empty.members.is_empty());
+        assert_eq!(Some(1), empty.number);
+        assert_eq!(ContextKey::Named(empty.id), s.reactor.contexts.active());
+        assert_eq!(ContextKey::Named(empty.id), s.saved().active());
+        assert!(s.saved().by_name("Empty").unwrap().members.is_empty());
+    }
+
+    /// M5c, R3, R29. Under Unsorted the new context takes the unsorted
+    /// windows. The pinned window shows there too, gets no record, and
+    /// still shows under the new context. The parked member of C stays
+    /// out.
+    #[test]
+    fn a_new_context_under_unsorted_takes_the_unsorted_windows() {
+        let mut s = Setup::new(4);
+        let c = s.reactor.contexts.create("C").unwrap();
+        let desc = s.reactor.window_desc(wid(1)).unwrap();
+        s.reactor.contexts.add_window(c, &desc).unwrap();
+        let pinned = s.reactor.window_desc(wid(4)).unwrap();
+        s.reactor.contexts.pin(&pinned);
+        s.run(ContextCommand::SwitchContext(ContextRef::Name(
+            "Unsorted".into(),
+        )));
+        assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+        assert_eq!(vec![wid(1)], s.parked());
+        let shown = [wid(2), wid(3), wid(4)];
+        let frames = s.frames(&shown);
+
+        s.create("New");
+
+        let new = ContextKey::Named(s.id("New"));
+        assert_eq!(vec![wid(2), wid(3)], s.members("New"));
+        assert_eq!(new, s.reactor.contexts.active());
+        assert!(s.reactor.contexts.is_member(new, wid(4)));
+        assert_eq!(1, s.reactor.contexts.pinned().len());
+        assert_eq!(vec![wid(1)], s.parked());
+        assert_eq!(vec![wid(1)], s.members("C"));
+        assert_eq!(frames, s.frames(&shown));
+        assert_eq!(frames, tiles(&s, space(), screen()));
+    }
+
+    /// R4. The name is trimmed. A name that differs from a taken or reserved
+    /// one only in case or accents creates nothing and switches nowhere.
+    #[test]
+    fn a_new_context_name_is_trimmed_and_compared_without_case_or_accents() {
+        let mut s = Setup::new(2);
+
+        s.create("  Work  ");
+        let work = s.id("Work");
+        assert_eq!("Work", s.reactor.contexts.get(work).unwrap().name);
+        for name in ["WÖRK", " work", "Évérything", "UNSORTED", "", "\t"] {
+            s.create(name);
+        }
+
+        let names: Vec<&str> =
+            s.reactor.contexts.contexts().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(vec!["Work"], names);
+        assert_eq!(ContextKey::Named(work), s.reactor.contexts.active());
+        assert_eq!(
+            vec!["Work"],
+            s.saved().contexts().iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// R32, R5. While a quit waits for parked windows to come back, a new
+    /// context is ignored. After nine numbered contexts, a new one gets no
+    /// number.
+    #[test]
+    fn a_new_context_is_ignored_while_quitting_and_takes_the_lowest_free_number() {
+        let mut s = Setup::new(2);
+        let c = s.reactor.contexts.create("C").unwrap();
+        let desc = s.reactor.window_desc(wid(1)).unwrap();
+        s.reactor.contexts.add_window(c, &desc).unwrap();
+        s.run(ContextCommand::SwitchContext(ContextRef::Id(c)));
+        assert_eq!(vec![wid(2)], s.parked());
+        s.reactor
+            .handle_event(Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)));
+        assert!(s.reactor.pending_exit.is_some());
+        let unparking = s.apps.requests();
+        assert!(!unparking.is_empty());
+
+        s.reactor.handle_event(context(ContextCommand::CreateContext("Work".into())));
+
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(1, s.reactor.contexts.contexts().len());
+        assert_eq!(ContextKey::Named(c), s.reactor.contexts.active());
+
+        let mut s = Setup::new(1);
+        for name in ["A", "B", "C", "D", "E", "F", "G", "H", "I"] {
+            s.reactor.contexts.create(name).unwrap();
+        }
+        s.create("Tenth");
+        assert_eq!(None, s.reactor.contexts.by_name("Tenth").unwrap().number);
+        assert_eq!(ContextKey::Named(s.id("Tenth")), s.reactor.contexts.active());
+        let e = s.id("E");
+        s.reactor.delete_context(e).unwrap();
+        s.create("Eleventh");
+        assert_eq!(Some(5), s.reactor.contexts.by_name("Eleventh").unwrap().number);
+    }
+
+    /// M5c, I3. The switch after a create names the new context in another
+    /// case and with an accent. The stale snapshot matches it to nothing,
+    /// so the reactor resolves it.
+    #[test]
+    fn a_switch_right_after_a_create_finds_the_new_context_in_another_spelling() {
+        let mut s = Setup::new(2);
+        s.create("Comms");
+        s.run(ContextCommand::ShowEverything);
+        let stale = s.reactor.published_contexts.clone().unwrap();
+        let answer = |command| answer_context_request(ContextRequest::Run(command), Some(&stale));
+        let by_name = ContextCommand::SwitchContext(ContextRef::Name("CLIENT WÖRK".into()));
+
+        let (_, create) = answer(ContextCommand::CreateContext("Client work".into()));
+        let (reply, switch) = answer(by_name.clone());
+        assert_eq!((Response::Success, Some(by_name)), (reply, switch.clone()));
+        run_sent(&mut s, create);
+        s.run(ContextCommand::ShowEverything);
+        run_sent(&mut s, switch);
+
+        assert_eq!(
+            ContextKey::Named(s.id("Client work")),
+            s.reactor.contexts.active()
+        );
+    }
+
+    /// I3. Only names go to the reactor unresolved. A number that the stale
+    /// snapshot doesn't have fails at once and sends nothing. Once the
+    /// reactor has published the new context, its number resolves to it.
+    #[test]
+    fn a_number_right_after_a_create_fails_until_the_snapshot_has_the_context() {
+        let mut s = Setup::new(2);
+        s.create("Comms");
+        let stale = s.reactor.published_contexts.clone().unwrap();
+        let number = ContextCommand::SwitchContext(ContextRef::Number(2));
+
+        let (_, create) = answer_context_request(
+            ContextRequest::Run(ContextCommand::CreateContext("Client work".into())),
+            Some(&stale),
+        );
+        assert_eq!(
+            (Response::Error("No context has the number 2".into()), None),
+            answer_context_request(ContextRequest::Run(number.clone()), Some(&stale))
+        );
+        run_sent(&mut s, create);
+        s.run(ContextCommand::SwitchContext(ContextRef::Name("Comms".into())));
+
+        let fresh = s.reactor.published_contexts.clone().unwrap();
+        let (reply, switch) = answer_context_request(ContextRequest::Run(number), Some(&fresh));
+        let client = s.id("Client work");
+        assert_eq!(
+            (
+                Response::Success,
+                Some(ContextCommand::SwitchContext(ContextRef::Id(client)))
+            ),
+            (reply, switch.clone())
+        );
+        run_sent(&mut s, switch);
+        assert_eq!(ContextKey::Named(client), s.reactor.contexts.active());
+    }
+
+    /// I3. The server sends a switch by name with the id it resolved, so
+    /// renaming contexts before the reactor runs it can't send it to
+    /// another context.
+    #[test]
+    fn a_rename_before_the_switch_runs_cannot_redirect_it() {
+        let mut s = Setup::new(2);
+        s.create("Client work");
+        s.create("Comms");
+        let snapshot = s.reactor.published_contexts.clone().unwrap();
+        let (_, switch) = answer_context_request(
+            ContextRequest::Run(ContextCommand::SwitchContext(ContextRef::Name("cli".into()))),
+            Some(&snapshot),
+        );
+        let client = s.id("Client work");
+        let comms = s.id("Comms");
+
+        s.reactor.contexts.rename(client, "Old clients").unwrap();
+        s.reactor.contexts.rename(comms, "Client work").unwrap();
+        run_sent(&mut s, switch);
+
+        assert_eq!(ContextKey::Named(client), s.reactor.contexts.active());
+    }
+
+    /// M5c, I3. `sugarglider context create Work` followed at once by
+    /// `sugarglider context switch Work`, while "Client work" exists. The
+    /// stale snapshot doesn't have Work, and "Work" starts a word of "Client
+    /// work".
+    #[test]
+    #[ignore = "bug: a switch right after a create goes to an older context that the new name matches in the stale snapshot"]
+    fn a_switch_right_after_a_create_goes_to_the_new_context_when_its_name_matches_another() {
+        let mut s = Setup::new(2);
+        s.create("Client work");
+        s.run(ContextCommand::ShowEverything);
+        let stale = s.reactor.published_contexts.clone().unwrap();
+        let answer = |command| answer_context_request(ContextRequest::Run(command), Some(&stale));
+
+        let (reply, create) = answer(ContextCommand::CreateContext("Work".into()));
+        assert_eq!(Response::Success, reply);
+        let (reply, switch) =
+            answer(ContextCommand::SwitchContext(ContextRef::Name("Work".into())));
+        assert_eq!(Response::Success, reply);
+        run_sent(&mut s, create);
+        let work = ContextKey::Named(s.id("Work"));
+        assert_eq!(work, s.reactor.contexts.active());
+        run_sent(&mut s, switch);
+
+        assert_eq!(work, s.reactor.contexts.active());
     }
 }
