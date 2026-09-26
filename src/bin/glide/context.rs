@@ -48,6 +48,41 @@ pub enum CmdContext {
     Add(Query),
     /// Show every window.
     Everything,
+    /// Switch back to the context used before the current one.
+    Previous,
+    /// Move the focused window out of the active context and into another.
+    Move(Query),
+    /// Remove the focused window from the active context.
+    Remove,
+    /// Rename a context.
+    Rename {
+        /// The context's number from 1 to 9, or its name or part of it.
+        #[command(flatten)]
+        query: Query,
+        /// The new name.
+        new_name: String,
+    },
+    /// Delete a context. Its windows stay open.
+    Delete(Query),
+    /// Give a context a number from 1 to 9.
+    Number {
+        /// The context's number from 1 to 9, or its name or part of it.
+        #[command(flatten)]
+        query: Query,
+        /// The number to give the context, from 1 to 9.
+        number: u8,
+    },
+    /// Pin the focused window, or unpin it. A pinned window is a member of
+    /// every context.
+    Pin,
+    /// Remove the member record of a window that is gone.
+    Forget {
+        /// The context's number from 1 to 9, or its name or part of it.
+        #[command(flatten)]
+        query: Query,
+        /// The record's index, as `list --json` prints it in `members`.
+        record: usize,
+    },
 }
 
 /// Names a context.
@@ -112,6 +147,23 @@ fn execute<T: Transport>(
         CmdContext::Switch(query) => run(ContextCommand::SwitchContext(parse_query(query)?)),
         CmdContext::Add(query) => run(ContextCommand::AddWindowToContext(parse_query(query)?)),
         CmdContext::Everything => run(ContextCommand::ShowEverything),
+        CmdContext::Previous => run(ContextCommand::PreviousContext),
+        CmdContext::Move(query) => run(ContextCommand::MoveWindowToContext(parse_query(query)?)),
+        CmdContext::Remove => run(ContextCommand::RemoveWindowFromContext),
+        CmdContext::Rename { query, new_name } => run(ContextCommand::RenameContext {
+            context: parse_query(query)?,
+            name: new_name.clone(),
+        }),
+        CmdContext::Delete(query) => run(ContextCommand::DeleteContext(parse_query(query)?)),
+        CmdContext::Number { query, number } => run(ContextCommand::SetContextNumber {
+            context: parse_query(query)?,
+            number: check_number(*number)?,
+        }),
+        CmdContext::Pin => run(ContextCommand::ToggleWindowPinned),
+        CmdContext::Forget { query, record } => run(ContextCommand::RemoveRecord {
+            context: parse_query(query)?,
+            record: *record,
+        }),
     };
     let mut transport = connect().ok_or("Sugarglider isn't running.")?;
     match (send(&mut transport, request)?, command) {
@@ -128,7 +180,15 @@ fn execute<T: Transport>(
             CmdContext::Create { .. }
             | CmdContext::Switch(_)
             | CmdContext::Add(_)
-            | CmdContext::Everything,
+            | CmdContext::Everything
+            | CmdContext::Previous
+            | CmdContext::Move(_)
+            | CmdContext::Remove
+            | CmdContext::Rename { .. }
+            | CmdContext::Delete(_)
+            | CmdContext::Number { .. }
+            | CmdContext::Pin
+            | CmdContext::Forget { .. },
         ) => wait_for_result(&mut transport, id).map(|()| String::new()),
         (Response::Error(reason), _) => Err(reason),
         (response, _) => Err(unexpected(&response)),
@@ -177,6 +237,14 @@ fn parse_query(query: &Query) -> Result<ContextRef, String> {
              add --name."
         )),
     }
+}
+
+/// Checks a number from 1 to 9, the numbers a context can have (R5).
+fn check_number(number: u8) -> Result<u8, String> {
+    if (1..=9).contains(&number) {
+        return Ok(number);
+    }
+    Err(format!("Context numbers go from 1 to 9, not {number}"))
 }
 
 fn send(transport: &mut impl Transport, request: ContextRequest) -> Result<Response, String> {
@@ -553,6 +621,47 @@ mod tests {
             (&["add", "Comms"], CmdContext::Add(query("Comms"))),
             (&["add", "--name", "3"], CmdContext::Add(by_name("3"))),
             (&["everything"], CmdContext::Everything),
+            (&["previous"], CmdContext::Previous),
+            (&["move", "Comms"], CmdContext::Move(query("Comms"))),
+            (&["remove"], CmdContext::Remove),
+            (
+                &["rename", "Comms", "Client work"],
+                CmdContext::Rename {
+                    query: query("Comms"),
+                    new_name: "Client work".into(),
+                },
+            ),
+            (
+                &["rename", "--name", "2024", "Twenty"],
+                CmdContext::Rename {
+                    query: by_name("2024"),
+                    new_name: "Twenty".into(),
+                },
+            ),
+            (&["delete", "2"], CmdContext::Delete(query("2"))),
+            (&["delete", "--name", "2024"], CmdContext::Delete(by_name("2024"))),
+            (
+                &["number", "Comms", "3"],
+                CmdContext::Number {
+                    query: query("Comms"),
+                    number: 3,
+                },
+            ),
+            (
+                &["number", "--name", "3", "9"],
+                CmdContext::Number {
+                    query: by_name("3"),
+                    number: 9,
+                },
+            ),
+            (&["pin"], CmdContext::Pin),
+            (
+                &["forget", "Comms", "0"],
+                CmdContext::Forget {
+                    query: query("Comms"),
+                    record: 0,
+                },
+            ),
         ] {
             assert_eq!(command, parse(args).unwrap(), "{args:?}");
         }
@@ -562,6 +671,11 @@ mod tests {
             &["switch", "a", "b"],
             &["switch", "--name"],
             &["add"],
+            &["rename", "Comms"],
+            &["number", "Comms"],
+            &["number", "Comms", "ten"],
+            &["forget", "Comms"],
+            &["forget", "Comms", "-1"],
             &["list", "--yaml"],
         ] {
             let err = parse(args).unwrap_err();
@@ -708,6 +822,113 @@ mod tests {
             assert_eq!(vec![command], ran.commands());
             assert_eq!(1, ran.asks());
             assert_eq!(vec![RESULT_POLL_INTERVAL], ran.pauses);
+        }
+    }
+
+    /// M6. Every subcommand that changes a context sends its command, waits
+    /// for its result, and prints nothing on success. A number outside 1 to
+    /// 9 fails before anything is sent.
+    #[test]
+    fn the_new_subcommands_send_their_command_and_print_nothing() {
+        for (args, command) in [
+            (&["previous"][..], ContextCommand::PreviousContext),
+            (
+                &["move", "Comms"],
+                ContextCommand::MoveWindowToContext(ContextRef::Name("Comms".into())),
+            ),
+            (&["remove"], ContextCommand::RemoveWindowFromContext),
+            (
+                &["rename", "2", "Client work"],
+                ContextCommand::RenameContext {
+                    context: ContextRef::Number(2),
+                    name: "Client work".into(),
+                },
+            ),
+            (
+                &["delete", "Comms"],
+                ContextCommand::DeleteContext(ContextRef::Name("Comms".into())),
+            ),
+            (
+                &["number", "Comms", "3"],
+                ContextCommand::SetContextNumber {
+                    context: ContextRef::Name("Comms".into()),
+                    number: 3,
+                },
+            ),
+            (&["pin"], ContextCommand::ToggleWindowPinned),
+            (
+                &["forget", "Comms", "1"],
+                ContextCommand::RemoveRecord {
+                    context: ContextRef::Name("Comms".into()),
+                    record: 1,
+                },
+            ),
+        ] {
+            let ran = run_with(args, Response::Success);
+            assert_eq!((0, "", ""), (ran.status, &*ran.out, &*ran.err), "{args:?}");
+            assert_eq!(vec![command], ran.commands(), "{args:?}");
+            assert_eq!(1, ran.asks(), "{args:?}");
+            assert_eq!(vec![RESULT_POLL_INTERVAL], ran.pauses, "{args:?}");
+        }
+
+        for number in ["0", "10", "255"] {
+            let ran = run_with(&["number", "Comms", number], Response::Success);
+            assert_eq!(
+                (
+                    1,
+                    "",
+                    format!("Context numbers go from 1 to 9, not {number}\n")
+                ),
+                (ran.status, &*ran.out, ran.err),
+                "{number}"
+            );
+            assert!(ran.requests.is_empty(), "{number}");
+        }
+    }
+
+    /// M6. `list --json` prints the index of each member record, and that
+    /// index is what `context forget` takes.
+    #[test]
+    fn a_forget_index_is_the_record_index_of_list_json() {
+        let printed = printed_json(&["list", "--json"], snapshot());
+        assert_eq!(json!(2), printed["contexts"][0]["members"][2]["record"]);
+        assert_eq!(
+            json!("Inbox"),
+            printed["contexts"][0]["members"][2]["title"]
+        );
+        assert_eq!(json!(null), printed["contexts"][0]["members"][2]["window"]);
+
+        let ran = run_with(&["forget", "Comms", "2"], Response::Success);
+        assert_eq!(
+            vec![ContextCommand::RemoveRecord {
+                context: ContextRef::Name("Comms".into()),
+                record: 2,
+            }],
+            ran.commands()
+        );
+    }
+
+    /// M6. The reactor's reason for a command that did nothing goes to
+    /// stderr, and the exit status is 1, for every new subcommand.
+    #[test]
+    fn a_new_subcommand_that_did_nothing_prints_the_reason() {
+        let reason = "Only a named context can be deleted";
+        for args in [
+            &["previous"][..],
+            &["move", "Comms"],
+            &["remove"],
+            &["rename", "Comms", "Work"],
+            &["delete", "Unsorted"],
+            &["number", "Comms", "3"],
+            &["pin"],
+            &["forget", "Comms", "0"],
+        ] {
+            let ran = run_with_results(args, vec![Response::Error(reason.into())]);
+            assert_eq!(
+                (1, "", format!("{reason}\n")),
+                (ran.status, &*ran.out, ran.err),
+                "{args:?}"
+            );
         }
     }
 
@@ -892,7 +1113,7 @@ mod tests {
     }
 
     /// Every subcommand, with each output form.
-    const EVERY_SUBCOMMAND: [&[&str]; 11] = [
+    const EVERY_SUBCOMMAND: [&[&str]; 19] = [
         &["list"],
         &["list", "--json"],
         &["current"],
@@ -904,6 +1125,14 @@ mod tests {
         &["add", "Comms"],
         &["add", "--name", "3"],
         &["everything"],
+        &["previous"],
+        &["move", "Comms"],
+        &["remove"],
+        &["rename", "Comms", "Client work"],
+        &["delete", "Comms"],
+        &["number", "Comms", "3"],
+        &["pin"],
+        &["forget", "Comms", "0"],
     ];
 
     /// I4. A server from before contexts can't read any context request and
