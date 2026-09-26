@@ -26,7 +26,7 @@ public struct PreferencesConfig: Codable {
     // Experimental features
     public var contextsEnable: Bool
     /// Which screens a context switch changes: "global" or "per_screen".
-    /// Optional because Rust doesn't send the key yet.
+    /// Optional for Preferences payloads that omit the key.
     public var contextsScope: String?
 
     // Window rules
