@@ -75,11 +75,19 @@ enum Command {
         interval_ms: u64,
     },
     /// Park a window in a corner of its screen with 1 point left on screen.
-    /// Prints a set-frame command that puts it back.
+    /// Prints a set-frame command that puts it back, and the four corners with
+    /// how much a window parked there overlaps other displays.
     #[command()]
     Park {
         pid: pid_t,
         window_server_id: CGWindowID,
+        /// The corner to park in. Without it, the corner the parking rule picks.
+        #[arg(long, value_enum)]
+        corner: Option<Corner>,
+        /// Park the window even if it looks parked already. The printed
+        /// set-frame command then puts it back at its parked frame.
+        #[arg(long)]
+        force: bool,
     },
     /// Write a frame to a window, in the top-left coordinates that `list ax`
     /// prints.
@@ -94,6 +102,36 @@ enum Command {
         width: f64,
         height: f64,
     },
+}
+
+/// A corner of a screen, in the order the parking rule tries them.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Corner {
+    BottomRight,
+    BottomLeft,
+    TopRight,
+    TopLeft,
+}
+
+impl Corner {
+    fn name(self) -> String {
+        self.to_possible_value().expect("no corner is skipped").get_name().to_owned()
+    }
+
+    /// The origin at which a window of `size` shows 1 point of `target` in
+    /// this corner.
+    fn origin(self, size: CGSize, target: CGRect) -> CGPoint {
+        let right = target.max().x - 1.0;
+        let bottom = target.max().y - 1.0;
+        let left = target.min().x - size.width + 1.0;
+        let top = target.min().y - size.height + 1.0;
+        match self {
+            Corner::BottomRight => CGPoint::new(right, bottom),
+            Corner::BottomLeft => CGPoint::new(left, bottom),
+            Corner::TopRight => CGPoint::new(right, top),
+            Corner::TopLeft => CGPoint::new(left, top),
+        }
+    }
 }
 
 #[derive(Subcommand, Clone)]
@@ -360,9 +398,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Inspect => inspect(MainThreadMarker::new().unwrap()),
         Command::Focus { interval_ms } => watch_focus(Duration::from_millis(interval_ms)),
-        Command::Park { pid, window_server_id } => {
-            park(pid, window_server_id, MainThreadMarker::new().unwrap())?
-        }
+        Command::Park {
+            pid,
+            window_server_id,
+            corner,
+            force,
+        } => park(
+            pid,
+            window_server_id,
+            corner,
+            force,
+            MainThreadMarker::new().unwrap(),
+        )?,
         Command::SetFrame {
             pid,
             window_server_id,
@@ -396,9 +443,30 @@ fn find_window(
     Ok(window.clone())
 }
 
-fn park(pid: pid_t, window_server_id: CGWindowID, mtm: MainThreadMarker) -> anyhow::Result<()> {
+fn park(
+    pid: pid_t,
+    window_server_id: CGWindowID,
+    corner: Option<Corner>,
+    force: bool,
+    mtm: MainThreadMarker,
+) -> anyhow::Result<()> {
     let window = find_window(pid, window_server_id)?;
     let frame = window.frame()?;
+    let (screens, _) = ScreenCache::new()
+        .update_screen_config(screen::get_ns_screens(mtm))
+        .context("Could not read the screen configuration")?;
+    let screens: Vec<CGRect> = screens.iter().map(|screen| screen.visible_frame).collect();
+    let screen = best_screen_for_window(&screens, &frame).context("Window is on no screen")?;
+    let target = screens[screen];
+    if looks_parked(frame, target) {
+        println!("The window shows at most 1 point in a corner of screen {screen} {target:?}.");
+        if !force {
+            println!("Pass --force to park it anyway.");
+            bail!("window looks parked; restore it first");
+        }
+        println!("Parking it anyway. The command below puts it back at its parked frame.");
+    }
+
     println!("Current frame is {frame:?}. To put the window back, run:");
     let devtool = std::env::args().next().unwrap_or_else(|| "devtool".to_string());
     println!(
@@ -406,20 +474,60 @@ fn park(pid: pid_t, window_server_id: CGWindowID, mtm: MainThreadMarker) -> anyh
         frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
     );
 
-    let (screens, _) = ScreenCache::new()
-        .update_screen_config(screen::get_ns_screens(mtm))
-        .context("Could not read the screen configuration")?;
-    let screens: Vec<CGRect> = screens.iter().map(|screen| screen.visible_frame).collect();
-    let screen = best_screen_for_window(&screens, &frame).context("Window is on no screen")?;
-    let target = screens[screen];
     let others: Vec<CGRect> = display_bounds()?
         .into_iter()
         .filter(|bounds| !bounds.contains(target.mid()))
         .collect();
-    let origin = parking_origin(frame.size, target, &others);
+    let automatic = parking_origin(frame.size, target, &others);
+    println!("Corners of screen {screen} {target:?}, with the area that overlaps other displays:");
+    for (candidate, origin, overlap) in corner_candidates(frame.size, target, &others) {
+        let choice = if origin == automatic {
+            " (automatic choice)"
+        } else {
+            ""
+        };
+        println!(
+            "  {:<12} origin ({}, {}), overlap {overlap}{choice}",
+            candidate.name(),
+            origin.x,
+            origin.y,
+        );
+    }
+    let origin = match corner {
+        Some(corner) => corner.origin(frame.size, target),
+        None => automatic,
+    };
     let parked = CGRect { origin, size: frame.size };
-    println!("Parking on screen {screen} {target:?} at {parked:?}");
+    println!("Parking at {parked:?}");
     write_frame(pid, &window, parked)
+}
+
+/// Each corner with the origin of a window of `size` parked there and the area
+/// that window overlaps `others`, in the order the parking rule tries them.
+fn corner_candidates(
+    size: CGSize,
+    target: CGRect,
+    others: &[CGRect],
+) -> Vec<(Corner, CGPoint, f64)> {
+    Corner::value_variants()
+        .iter()
+        .map(|&corner| {
+            let origin = corner.origin(size, target);
+            let frame = CGRect { origin, size };
+            let overlap = others.iter().map(|other| other.intersection(&frame).area()).sum();
+            (corner, origin, overlap)
+        })
+        .collect()
+}
+
+/// Whether a window at `frame` shows at most a 1-point strip of `screen`, in
+/// one of its corners, the way a parked window does.
+fn looks_parked(frame: CGRect, screen: CGRect) -> bool {
+    let shown = screen.intersection(&frame);
+    let thin = shown.size.width <= 1.0 || shown.size.height <= 1.0;
+    let covers_corner = (frame.min().x <= screen.min().x || frame.max().x >= screen.max().x)
+        && (frame.min().y <= screen.min().y || frame.max().y >= screen.max().y);
+    thin && covers_corner
 }
 
 /// The full bounds of every active display, in the same top-left coordinates
@@ -450,6 +558,7 @@ fn best_screen_for_window(screens: &[CGRect], frame: &CGRect) -> Option<usize> {
 
 /// Writes a frame the way the app actor handles `SetWindowFrame`: with enhanced
 /// UI off, size then position, reading the frame back after each attempt.
+/// Returns an error if the window does not take the frame.
 fn write_frame(pid: pid_t, window: &AXUIElement, frame: CGRect) -> anyhow::Result<()> {
     const ATTEMPTS: usize = 3;
     let app = AXUIElement::application(pid);
@@ -470,8 +579,7 @@ fn write_frame(pid: pid_t, window: &AXUIElement, frame: CGRect) -> anyhow::Resul
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        println!("The window did not take the requested frame");
-        Ok(())
+        bail!("The window did not take the requested frame");
     })();
     if enhanced {
         _ = app.set_enhanced_user_interface(true);
@@ -942,8 +1050,14 @@ async fn time<O, F: Future<Output = O>>(desc: &str, f: impl FnOnce() -> F) -> O 
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+    use sugarglider::model::parking_origin;
 
-    use super::{Command, Opt};
+    use super::{Command, Corner, Opt, corner_candidates, looks_parked};
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
+        CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
+    }
 
     #[test]
     fn set_frame_accepts_negative_coordinates() {
@@ -973,5 +1087,93 @@ mod tests {
             (123, 456, -2999., -1.5, 400., 300.),
             (pid, window_server_id, x, y, width, height)
         );
+    }
+
+    #[test]
+    fn park_takes_a_corner_and_force() {
+        let opt = Opt::try_parse_from([
+            "devtool", "park", "123", "456", "--corner", "top-left", "--force",
+        ])
+        .unwrap();
+        let Command::Park {
+            pid,
+            window_server_id,
+            corner,
+            force,
+        } = opt.command
+        else {
+            panic!("parsed the wrong command");
+        };
+        assert_eq!(
+            (123, 456, Some(Corner::TopLeft), true),
+            (pid, window_server_id, corner, force)
+        );
+
+        let opt = Opt::try_parse_from(["devtool", "park", "123", "456"]).unwrap();
+        let Command::Park { corner, force, .. } = opt.command else {
+            panic!("parsed the wrong command");
+        };
+        assert_eq!((None, false), (corner, force));
+    }
+
+    #[test]
+    fn park_lists_every_corner() {
+        // One display with a 25-point menu bar and a hidden Dock.
+        let screen = rect(0., 25., 1512., 957.);
+        let candidates = corner_candidates(CGSize::new(800., 600.), screen, &[]);
+        assert_eq!(
+            vec![
+                (Corner::BottomRight, CGPoint::new(1511., 981.), 0.),
+                (Corner::BottomLeft, CGPoint::new(-799., 981.), 0.),
+                (Corner::TopRight, CGPoint::new(1511., -574.), 0.),
+                (Corner::TopLeft, CGPoint::new(-799., -574.), 0.),
+            ],
+            candidates
+        );
+    }
+
+    #[test]
+    fn park_candidates_agree_with_the_parking_rule() {
+        let size = CGSize::new(400., 300.);
+        let screen = rect(0., 0., 1000., 1000.);
+        let layouts = [
+            vec![],
+            vec![rect(1000., 0., 1000., 1000.)],
+            vec![
+                rect(0., -1000., 1000., 1000.),
+                rect(0., 1000., 1000., 1000.),
+            ],
+            vec![
+                rect(1000., 0., 1000., 1000.),
+                rect(-1000., 0., 1000., 1000.),
+                rect(500., 1000., 500., 1000.),
+                rect(0., -1000., 500., 1000.),
+            ],
+        ];
+        for others in layouts {
+            let candidates = corner_candidates(size, screen, &others);
+            let least = candidates.iter().map(|&(_, _, overlap)| overlap).fold(f64::MAX, f64::min);
+            let (_, first_least, _) =
+                candidates.into_iter().find(|&(_, _, overlap)| overlap == least).unwrap();
+            assert_eq!(parking_origin(size, screen, &others), first_least, "{others:?}");
+        }
+    }
+
+    #[test]
+    fn park_recognizes_a_parked_window() {
+        let screen = rect(0., 25., 1512., 957.);
+        let size = CGSize::new(800., 600.);
+        for (corner, origin, _) in corner_candidates(size, screen, &[]) {
+            assert!(looks_parked(CGRect { origin, size }, screen), "{corner:?}");
+        }
+        // macOS keeps the title bar below the menu bar, so a window parked at
+        // a top corner can end up as a strip along the side.
+        assert!(looks_parked(rect(-799., 25., 800., 600.), screen));
+
+        assert!(!looks_parked(rect(100., 100., 800., 600.), screen));
+        assert!(!looks_parked(rect(0., 25., 1512., 957.), screen));
+        // A 1-point strip along an edge, away from the corners.
+        assert!(!looks_parked(rect(1511., 300., 800., 300.), screen));
+        assert!(!looks_parked(rect(300., 981., 800., 600.), screen));
     }
 }

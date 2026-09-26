@@ -26,6 +26,10 @@ test = false
 name = "sugarglider"
 path = "src/bin/glide.rs"
 
+[[example]]
+name = "devtool"
+test = true
+
 # We don't have a need for unwinding, and aborting means we don't have to worry
 # about propagating panics to the main CFRunLoop thread.
 #
