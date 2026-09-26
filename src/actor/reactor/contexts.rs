@@ -727,6 +727,10 @@ mod tests {
         assert_eq!(in_c, s.frames(&[wid(1), wid(2), wid(3)]));
         assert_eq!(in_c, s.tiles());
         assert_eq!(corner(CGSize::new(300., 1000.)), s.frame(wid(4)));
+        // The parked window reaches the layout again and gets no tile in C.
+        s.reactor.update_visible_windows();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(in_c, s.tiles());
 
         s.switch(d);
         s.move_window(wid(4), Direction::Left);
@@ -1126,7 +1130,7 @@ mod tests {
         assert_eq!(vec![(wid(1), screen())], s.tiles());
     }
 
-    /// R18.
+    /// R18, R19.
     #[test]
     fn r18_previous_context_goes_back_to_the_context_used_before() {
         let mut s = Setup::new(2);
@@ -1142,6 +1146,8 @@ mod tests {
 
         s.switch(c);
         s.switch(d);
+        let used = |s: &Setup, key| s.reactor.contexts.last_used(key);
+        assert!(used(&s, d) > used(&s, c) && used(&s, c) > 0, "R19");
         previous(&mut s);
         assert_eq!(c, s.reactor.contexts.active());
         assert_eq!(vec![wid(2)], s.parked());
@@ -1770,5 +1776,133 @@ mod tests {
         assert_eq!(frames, s.frames(&[wid(1), wid(2)]));
         assert_eq!(0, s.reactor.layout.context_ids().count());
         assert_eq!(ContextKey::Everything, s.saved_active());
+    }
+
+    /// L8. The app quits and starts again while another context is active,
+    /// and its new window joins C there.
+    #[test]
+    fn l8_a_window_of_a_relaunched_app_is_tiled_when_its_context_becomes_active() {
+        let mut s = Setup::new(1);
+        let window = |idx: u32| WindowInfo {
+            sys_id: Some(WindowServerId::new(20 + idx)),
+            frame: rect(700., 100., 50., 50.),
+            ..make_window(idx as usize)
+        };
+        s.reactor.handle_events(s.apps.make_app(2, vec![window(1)]));
+        s.reactor.handle_event(Event::WindowsOnScreenUpdated {
+            pid: None,
+            on_screen: on_screen(&s, &[wid(1), WindowId::new(2, 1)]),
+        });
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let c = s.create("C", &[wid(1), WindowId::new(2, 1)]);
+        let d = s.create("D", &[wid(1)]);
+        s.switch(c);
+        s.switch(d);
+        assert_eq!(vec![WindowId::new(2, 1)], s.parked());
+
+        s.reactor.handle_event(Event::ApplicationTerminated(2));
+        s.reactor.handle_event(Event::ApplicationThreadTerminated(2));
+        s.apps.windows.remove(&WindowId::new(2, 1));
+        s.reactor.handle_events(s.apps.make_app(3, vec![window(1)]));
+        let relaunched = WindowId::new(3, 1);
+        s.reactor.handle_event(Event::WindowsOnScreenUpdated {
+            pid: None,
+            on_screen: on_screen(&s, &[wid(1), relaunched]),
+        });
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s.add(c, relaunched);
+
+        s.switch(c);
+
+        let tiles = vec![
+            (wid(1), rect(0., 0., 600., 1000.)),
+            (relaunched, rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(tiles, s.tiles());
+        assert_eq!(tiles, s.frames(&[wid(1), relaunched]));
+        assert!(s.parked().is_empty());
+    }
+
+    /// L6.
+    #[test]
+    fn l6_a_minimized_member_leaves_the_layout_and_stays_a_member() {
+        let mut s = Setup::new(3);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        s.switch(c);
+        assert_eq!(vec![wid(3)], s.parked());
+
+        // Window 2 is minimized.
+        s.reactor.handle_event(Event::WindowsOnScreenUpdated {
+            pid: None,
+            on_screen: on_screen(&s, &[wid(1), wid(3)]),
+        });
+        s.reactor.update_visible_windows();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+        s.switch(ContextKey::Everything);
+        s.switch(c);
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+        assert_eq!(vec![wid(3)], s.parked());
+        assert!(s.reactor.contexts.is_member(c, wid(2)));
+
+        // It comes back.
+        s.reactor.handle_event(Event::WindowsOnScreenUpdated {
+            pid: None,
+            on_screen: on_screen(&s, &[wid(1), wid(2), wid(3)]),
+        });
+        s.reactor.update_visible_windows();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let tiles = vec![
+            (wid(1), rect(0., 0., 600., 1000.)),
+            (wid(2), rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(tiles, s.tiles());
+        assert_eq!(tiles, s.frames(&[wid(1), wid(2)]));
+    }
+
+    /// L2, L8, L9. Floating a window under C leaves its node in Everything's
+    /// layout for another screen size.
+    #[test]
+    fn l2_a_display_change_leaves_a_window_that_floats_out_of_the_new_sizes_layout() {
+        let mut s = Setup::new(2);
+        let shorter = rect(0., 0., 1200., 800.);
+        let display = |s: &Setup, frame| match screens(vec![frame], vec![Some(space())]) {
+            Event::ScreenParametersChanged {
+                frames,
+                bounds,
+                spaces,
+                scale_factors,
+                converter,
+                ..
+            } => Event::ScreenParametersChanged {
+                frames,
+                bounds,
+                spaces,
+                scale_factors,
+                converter,
+                on_screen: on_screen(s, &[wid(1), wid(2)]),
+            },
+            _ => unreachable!(),
+        };
+        // Everything gets a layout of its own for each screen size.
+        s.move_window(wid(1), Direction::Right);
+        s.reactor.handle_event(display(&s, shorter));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s.move_window(wid(1), Direction::Left);
+        s.reactor.handle_event(display(&s, screen()));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        s.switch(c);
+        float_window_1(&mut s);
+        let floating = rect(100., 100., 50., 50.);
+        s.switch(ContextKey::Everything);
+        assert_eq!(vec![(wid(2), screen())], s.tiles());
+
+        s.reactor.handle_event(display(&s, shorter));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(vec![(wid(2), shorter)], s.tiles_on(space(), shorter));
+        assert_eq!(shorter, s.frame(wid(2)));
+        assert_eq!(floating, s.frame(wid(1)));
     }
 }
