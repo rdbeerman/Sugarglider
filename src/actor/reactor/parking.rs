@@ -43,17 +43,19 @@ fn same_app(journal: &Option<String>, running: &Option<String>) -> bool {
 }
 
 impl Reactor {
-    /// Parks each window in a corner of the screen it is on.
+    /// Parks each window in a corner of the screen it is on, and returns the
+    /// windows it parked.
     ///
     /// The journal entries of all the windows are written first. If that
     /// write fails, no window is parked. Windows that are already parked, that
     /// have no window server id, or that are on no screen are left where they
-    /// are. A window listed more than once is parked once.
+    /// are, and are not returned. A window listed more than once is parked
+    /// once.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "only tests park windows until context switching")
     )]
-    pub(super) fn park_windows(&mut self, wids: &[WindowId]) -> io::Result<()> {
+    pub(super) fn park_windows(&mut self, wids: &[WindowId]) -> io::Result<Vec<WindowId>> {
         let mut entries = vec![];
         let mut parking: Vec<(WindowId, CGRect, CGRect)> = vec![];
         for &wid in wids {
@@ -81,7 +83,7 @@ impl Reactor {
             parking.push((wid, frame, parked_frame));
         }
         if parking.is_empty() {
-            return Ok(());
+            return Ok(vec![]);
         }
         self.journal.record(entries)?;
         let mut writes = vec![];
@@ -90,7 +92,7 @@ impl Reactor {
             writes.push((wid, parked_frame));
         }
         self.write_frames_now(&writes);
-        Ok(())
+        Ok(writes.into_iter().map(|(wid, _)| wid).collect())
     }
 
     /// Puts parked windows back at the frames they had before they were
@@ -1448,5 +1450,35 @@ mod tests {
         s.reactor.handle_event(Event::StartupComplete);
 
         assert_eq!(vec![(2, 21, frame)], summary(s.journal_on_disk()));
+    }
+
+    #[test]
+    fn r30_parking_returns_only_the_windows_it_parked() {
+        let mut s = Setup::launching(vec![]);
+        let without_window_server_id = WindowInfo { sys_id: None, ..make_window(2) };
+        let on_no_screen = WindowInfo {
+            frame: rect(5000., 5000., 50., 50.),
+            ..make_window(3)
+        };
+        s.reactor.handle_events(s.apps.make_app(
+            1,
+            vec![
+                make_window(1),
+                without_window_server_id,
+                on_no_screen,
+                make_window(4),
+            ],
+        ));
+        s.reactor.handle_event(Event::StartupComplete);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![wid(1)], s.reactor.park_windows(&[wid(1)]).unwrap());
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        let batch = [wid(1), wid(2), wid(3), wid(4), wid(4), WindowId::new(7, 1)];
+        let parked = s.reactor.park_windows(&batch);
+
+        assert_eq!(vec![wid(4)], parked.unwrap());
+        assert_eq!(vec![wid(1), wid(4)], s.parked_windows());
+        assert!(s.reactor.park_windows(&[]).unwrap().is_empty());
     }
 }
