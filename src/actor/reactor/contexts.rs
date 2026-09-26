@@ -706,6 +706,7 @@ mod tests {
 
     mod focus;
     mod membership;
+    mod membership_rules;
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
