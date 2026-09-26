@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::actor::app::WindowId;
 use crate::model::contexts::{
-    Context, ContextId, ContextKey, Contexts, EVERYTHING_NAME, MemberRecord, UNSORTED_NAME,
+    Context, ContextError, ContextId, ContextKey, Contexts, EVERYTHING_NAME, MemberRecord, NameMatch,
+    Query, UNSORTED_NAME, rank_entries, resolve_name,
 };
 
 /// The app name that stands in when a record names no app.
@@ -262,6 +263,57 @@ impl ContextsSnapshot {
     pub fn result(&self, request: RequestId) -> Option<&CommandResult> {
         self.results.iter().rev().find(|result| result.request == request)
     }
+
+    /// Ranks the entries for a query, best first, as [`crate::model::contexts::rank`]
+    /// ranks the live contexts: the named contexts, Unsorted while it is
+    /// listed, and Everything. Ties go to the most recently used entry.
+    pub fn rank(&self, query: &str) -> Vec<(ContextKey, NameMatch)> {
+        let mut entries: Vec<(ContextKey, &str, u64)> = self
+            .contexts
+            .iter()
+            .map(|context| {
+                (ContextKey::Named(context.id), context.name.as_str(), context.last_used)
+            })
+            .collect();
+        if self.unsorted.listed {
+            entries.push((
+                ContextKey::Unsorted,
+                UNSORTED_NAME,
+                self.unsorted.last_used,
+            ));
+        }
+        entries.push((
+            ContextKey::Everything,
+            EVERYTHING_NAME,
+            self.everything.last_used,
+        ));
+        rank_entries(query, entries)
+    }
+
+    /// The entry that a query names, as [`crate::model::contexts::resolve`]
+    /// names it against the live contexts. A client resolves a query here
+    /// before it sends a command that needs to name a record, so a snapshot
+    /// that lags behind the reactor fails instead of naming another record.
+    pub fn resolve(&self, query: Query<'_>) -> Result<ContextKey, ContextError> {
+        match query {
+            Query::Number(number) => self
+                .contexts
+                .iter()
+                .find(|context| context.number == Some(number))
+                .map(|context| ContextKey::Named(context.id))
+                .ok_or(ContextError::NoContextNumbered(number)),
+            Query::Id(id) => self
+                .get(id)
+                .map(|context| ContextKey::Named(context.id))
+                .ok_or(ContextError::NoSuchContext),
+            Query::Name(name) if name.trim().is_empty() => Err(ContextError::NoQuery),
+            Query::Name(name) => resolve_name(
+                name,
+                self.rank(name),
+                self.unsorted.listed && !self.contexts.is_empty(),
+            ),
+        }
+    }
 }
 
 impl ContextSummary {
@@ -342,7 +394,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::model::contexts::WindowDesc;
+    use crate::model::contexts::{Query, WindowDesc, rank, resolve};
 
     fn window(pid: i32, idx: u32, bundle_id: Option<&str>, app_name: Option<&str>) -> WindowDesc {
         WindowDesc {
@@ -544,6 +596,57 @@ mod tests {
         );
         let off = ContextsSnapshot { enabled: false, ..on(&[comms]) };
         assert_eq!(None, off.shown());
+    }
+
+    /// A snapshot resolves a query as the model resolves it against the
+    /// live contexts. A client resolves a name against the snapshot before
+    /// it sends a command that names a record, so the two must agree on
+    /// numbers, ids, exact and partial names, Unsorted while it is listed,
+    /// and the reasons for failure.
+    #[test]
+    fn a_query_resolves_against_the_snapshot_as_it_does_against_the_contexts() {
+        let mut contexts = three();
+        let comms = contexts.by_name("Comms").unwrap().id;
+        let client = contexts.by_name("Client work").unwrap().id;
+        contexts.switch_to(ContextKey::Named(client)).unwrap();
+        let missing: ContextId = serde_json::from_value(serde_json::json!(99)).unwrap();
+
+        for unsorted in [0, 2] {
+            let snapshot = snapshot(&contexts, unsorted);
+            for query in [
+                Query::Number(1),
+                Query::Number(9),
+                Query::Id(comms),
+                Query::Id(missing),
+                Query::Name("comms"),
+                Query::Name("cli"),
+                Query::Name("nothing"),
+                Query::Name("Unsorted"),
+                Query::Name("Everything"),
+                Query::Name("  "),
+            ] {
+                assert_eq!(
+                    resolve(query, &contexts, unsorted > 0),
+                    snapshot.resolve(query),
+                    "{query:?} with {unsorted} unsorted windows"
+                );
+            }
+        }
+    }
+
+    /// The snapshot ranks as the model ranks the live contexts: the same
+    /// entries for a query, and the most recently used entry first among
+    /// equals.
+    #[test]
+    fn the_snapshot_ranks_as_the_model_ranks() {
+        let mut contexts = three();
+        let client = contexts.by_name("Client work").unwrap().id;
+        contexts.switch_to(ContextKey::Named(client)).unwrap();
+        let snapshot = snapshot(&contexts, 2);
+
+        for query in ["", "c", "cli", "work", "zzz"] {
+            assert_eq!(rank(query, &contexts, true), snapshot.rank(query), "{query:?}");
+        }
     }
 
     #[test]
