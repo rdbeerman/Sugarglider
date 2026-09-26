@@ -55,10 +55,10 @@ impl Reactor {
     }
 
     /// The context the Space shows when `active` is the active context. With
-    /// contexts off, and in place of a context that doesn't exist, that is
-    /// Everything.
+    /// contexts off, while quitting, and in place of a context that doesn't
+    /// exist, that is Everything.
     fn shown_with(&self, _space: SpaceId, active: ContextKey) -> ContextKey {
-        if !self.contexts_enabled() {
+        if !self.contexts_enabled() || self.pending_exit.is_some() {
             return ContextKey::Everything;
         }
         if let ContextKey::Named(id) = active
@@ -246,6 +246,10 @@ impl Reactor {
             debug!(?target, "Ignoring a context switch while contexts are off");
             return;
         }
+        if self.pending_exit.is_some() {
+            info!(?target, "Ignoring a context switch while quitting");
+            return;
+        }
         if let ContextKey::Named(id) = target
             && self.contexts.get(id).is_none()
         {
@@ -281,6 +285,14 @@ impl Reactor {
                     "Could not write the parked-window journal, so the context stays: {err}"
                 );
             }
+        }
+    }
+
+    /// Applies the context each visible Space shows again, and handles the
+    /// layout's response.
+    pub(super) fn apply_again(&mut self) {
+        if let Ok((_, Some(response))) = self.apply(Apply::Again) {
+            self.handle_layout_response(response);
         }
     }
 
@@ -324,9 +336,7 @@ impl Reactor {
         } else {
             info!("Contexts are off; showing every window");
         }
-        if let Ok((_, Some(response))) = self.apply(Apply::Again) {
-            self.handle_layout_response(response);
-        }
+        self.apply_again();
         if !self.contexts_enabled() {
             let rest: Vec<WindowId> = self.parked.keys().copied().collect();
             if !rest.is_empty() {
@@ -401,8 +411,8 @@ impl Reactor {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::Arc;
-    use std::time::SystemTime;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant, SystemTime};
 
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use tempfile::TempDir;
@@ -410,7 +420,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::super::testing::*;
-    use super::super::{Command, ContextCommand, ContextRef, Event, Reactor, Requested};
+    use super::super::{
+        Command, ContextCommand, ContextRef, Event, Reactor, ReactorCommand, Requested,
+    };
     use crate::actor::app::{Quiet, Request, WindowId};
     use crate::actor::contexts_store::{ContextsStore, Loaded};
     use crate::actor::layout::{LayoutCommand, LayoutEvent, LayoutManager};
@@ -1284,6 +1296,18 @@ mod tests {
             fs::read_dir(dir.path()).unwrap().next().is_none(),
             "no file is written"
         );
+
+        let exits = Arc::new(Mutex::new(vec![]));
+        let caught = exits.clone();
+        reactor.layout_file = Some(dir.path().join("layout.ron"));
+        reactor.exit = Box::new(move |code| caught.lock().unwrap().push(code));
+        reactor.handle_event(Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)));
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(vec!["layout.ron"], names);
     }
 
     /// R33, R28.
@@ -1455,5 +1479,97 @@ mod tests {
             };
             assert_eq!(command, back);
         }
+    }
+
+    /// Makes the reactor save its layout in the temporary directory, and
+    /// returns the exit codes it quits with.
+    fn catch_exits(s: &mut Setup) -> Arc<Mutex<Vec<i32>>> {
+        let exits = Arc::new(Mutex::new(vec![]));
+        let caught = exits.clone();
+        s.reactor.layout_file = Some(s.dir.path().join("layout.ron"));
+        s.reactor.exit = Box::new(move |code| caught.lock().unwrap().push(code));
+        exits
+    }
+
+    fn save_and_exit(s: &mut Setup) {
+        s.reactor
+            .handle_event(Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)));
+    }
+
+    /// R32.
+    #[test]
+    fn r32_quitting_puts_every_parked_window_back_and_quits_after_the_last_is_back() {
+        let mut s = Setup::new(3);
+        let all = [wid(1), wid(2), wid(3)];
+        let everything = s.frames(&all);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        let exits = catch_exits(&mut s);
+
+        save_and_exit(&mut s);
+
+        let requests = s.apps.requests();
+        assert_eq!(vec![everything[1].1], frame_writes(&requests, wid(2)));
+        assert_eq!(vec![everything[2].1], frame_writes(&requests, wid(3)));
+        assert!(exits.lock().unwrap().is_empty());
+        // Contexts commands wait for the quit.
+        s.command(ContextKey::Everything);
+        s.command(c);
+        assert!(s.apps.requests().is_empty());
+        assert!(s.parked().is_empty());
+
+        let mut echoes = s.apps.simulate_events_for_requests(requests).into_iter();
+        let first = echoes.next().unwrap();
+        s.reactor.handle_event(first);
+        assert!(exits.lock().unwrap().is_empty());
+        for event in echoes {
+            s.reactor.handle_event(event);
+        }
+
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert_eq!(everything, s.frames(&all));
+        assert!(s.journal_on_disk().is_empty());
+        assert_eq!(c, s.saved_active());
+        let saved = fs::read_to_string(s.dir.path().join("layout.ron")).unwrap();
+        assert!(saved.contains("context_layouts:{((1),Named(1))"), "{saved}");
+        s.reactor.exit_deadline_tick(Instant::now() + Duration::from_secs(10));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![0], *exits.lock().unwrap(), "the quit happens once");
+    }
+
+    /// R32.
+    #[test]
+    fn r32_when_the_deadline_passes_first_the_journal_stays() {
+        let mut s = Setup::new(3);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        let journal = s.journal_on_disk();
+        assert_eq!(2, journal.len());
+        let exits = catch_exits(&mut s);
+        let start = Instant::now();
+
+        save_and_exit(&mut s);
+        save_and_exit(&mut s);
+        s.reactor.exit_deadline_tick(start + Duration::from_millis(1900));
+        assert!(exits.lock().unwrap().is_empty());
+        s.reactor.exit_deadline_tick(Instant::now() + Duration::from_secs(2));
+
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert_eq!(journal, s.journal_on_disk());
+        assert_eq!(c, s.saved_active());
+        assert!(s.dir.path().join("layout.ron").exists());
+    }
+
+    /// R32.
+    #[test]
+    fn r32_with_nothing_parked_quitting_is_at_once() {
+        let mut s = Setup::new(2);
+        let exits = catch_exits(&mut s);
+
+        save_and_exit(&mut s);
+
+        assert_eq!(vec![0], *exits.lock().unwrap());
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(ContextKey::Everything, s.saved_active());
     }
 }

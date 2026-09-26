@@ -11,6 +11,7 @@ mod animation;
 mod contexts;
 mod main_window;
 mod parking;
+mod quit;
 mod replay;
 
 #[cfg(test)]
@@ -19,6 +20,7 @@ mod restore_snapshots;
 mod testing;
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use std::{mem, thread};
@@ -27,6 +29,7 @@ use animation::{Animation, AnimationManager, Message as AnimationMessage};
 use main_window::MainWindowTracker;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use parking::{Parked, ProcessLookup};
+use quit::PendingExit;
 use redact::Secret;
 pub use replay::{Record, replay};
 use serde::{Deserialize, Serialize};
@@ -371,6 +374,12 @@ pub struct Reactor {
     contexts_store: ContextsStore,
     /// Names the boot of the Mac, saved with the contexts.
     boot_id: Option<String>,
+    /// A quit that waits for parked windows to come back.
+    pending_exit: Option<PendingExit>,
+    /// Where the layout is saved when Sugarglider quits. `None` saves nothing.
+    layout_file: Option<PathBuf>,
+    /// Ends the process with an exit code.
+    exit: Box<dyn FnMut(i32) + Send>,
 }
 
 /// How many times in a row we write the same frame to a window before giving
@@ -524,6 +533,8 @@ impl Reactor {
                     contexts_store::boot_id(),
                     SystemTime::now(),
                 );
+                reactor.layout_file = Some(crate::config::restore_file());
+                reactor.exit = Box::new(|code| std::process::exit(code));
                 reactor.mouse_tx.replace(mouse_tx.clone());
                 reactor.status_tx.replace(status_tx.clone());
                 let space_manager = SpaceManager::new(
@@ -591,6 +602,9 @@ impl Reactor {
             contexts: Contexts::new(),
             contexts_store: ContextsStore::in_memory(),
             boot_id: None,
+            pending_exit: None,
+            layout_file: None,
+            exit: Box::new(|code| info!(code, "Not quitting a reactor that has no exit")),
         }
     }
 
@@ -642,6 +656,7 @@ impl Reactor {
                 _ = visibility_timer.next() => {
                     // Periodically refresh visible windows to detect closed windows.
                     self.update_visible_windows();
+                    self.exit_deadline_tick(Instant::now());
                     visibility_timer.set_next_fire(visibility_refresh_interval);
                 }
             }
@@ -660,6 +675,11 @@ impl Reactor {
     }
 
     fn handle_event(&mut self, event: Event) {
+        self.on_event(event);
+        self.exit_if_windows_are_back();
+    }
+
+    fn on_event(&mut self, event: Event) {
         self.record.on_event(&event);
         self.log_event(&event);
         self.journal.retry_failed_write(Instant::now());
@@ -1392,13 +1412,7 @@ impl Reactor {
             }
             Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)) => {
                 info!("SaveAndExit command received");
-                match self.layout.save(crate::config::restore_file()) {
-                    Ok(()) => std::process::exit(0),
-                    Err(e) => {
-                        error!("Could not save layout: {e}");
-                        std::process::exit(3);
-                    }
-                }
+                self.save_and_exit(Instant::now());
             }
             Event::ConfigChanged(config) => {
                 let contexts_were_enabled = self.contexts_enabled();
