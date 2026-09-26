@@ -330,6 +330,7 @@ mod tests {
             last_used: 0,
             apps: apps.iter().map(|app| app.to_string()).collect(),
             windows,
+            members: vec![],
         }
     }
 

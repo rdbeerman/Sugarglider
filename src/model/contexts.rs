@@ -21,6 +21,11 @@ use crate::sys::window_server::WindowServerId;
 pub struct ContextId(u32);
 
 impl ContextId {
+    /// Reconstructs an id supplied by an external context command.
+    pub fn from_raw(id: u32) -> Self {
+        Self(id)
+    }
+
     pub fn get(self) -> u32 {
         self.0
     }
