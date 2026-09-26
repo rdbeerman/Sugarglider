@@ -565,7 +565,11 @@ fn r25_the_batches_before_the_focusing_raise_dont_end_the_wait() {
     });
     s.reactor.handle_event(Event::RaiseTimeout { sequence_id });
     activate(&mut s, 1, wid(1), Order::GloballyLast);
-    assert_eq!(d, s.reactor.contexts.active(), "the focusing raise hasn't gone out");
+    assert_eq!(
+        d,
+        s.reactor.contexts.active(),
+        "the focusing raise hasn't gone out"
+    );
 
     // A failure of another raise of the sequence still doesn't end the wait
     // once the focusing raise is on its way.
@@ -576,7 +580,11 @@ fn r25_the_batches_before_the_focusing_raise_dont_end_the_wait() {
         quiet: Quiet::Yes,
     });
     activate(&mut s, 1, wid(1), Order::GloballyLast);
-    assert_eq!(d, s.reactor.contexts.active(), "the focusing raise hasn't failed");
+    assert_eq!(
+        d,
+        s.reactor.contexts.active(),
+        "the focusing raise hasn't failed"
+    );
 
     s.reactor.handle_event(Event::RaiseRequestFailed {
         windows: vec![other],
@@ -602,8 +610,10 @@ fn r25_a_raise_with_a_newer_identifier_ends_the_wait() {
     s.apps.simulate_until_quiet(&mut s.reactor);
 
     s.reactor.handle_event(Event::RaiseFocusSent { sequence_id: first + 1 });
-    s.reactor
-        .handle_event(Event::RaiseCompleted { window_id: other, sequence_id: first + 1 });
+    s.reactor.handle_event(Event::RaiseCompleted {
+        window_id: other,
+        sequence_id: first + 1,
+    });
     activate(&mut s, 1, wid(1), Order::GloballyFirst);
 
     assert_eq!(c, s.reactor.contexts.active());
@@ -641,7 +651,11 @@ fn r25_a_second_switch_extends_the_wait_of_the_first() {
     s.reactor.handle_event(Event::RaiseCompleted { window_id: focus, sequence_id });
     s.reactor
         .handle_event(Event::ApplicationMainWindowChanged(1, Some(wid(3)), Quiet::No));
-    assert_eq!(d, s.reactor.contexts.active(), "window 3's echo is still to come");
+    assert_eq!(
+        d,
+        s.reactor.contexts.active(),
+        "window 3's echo is still to come"
+    );
 
     answer(&mut s, first);
     s.apps.simulate_until_quiet(&mut s.reactor);
@@ -765,7 +779,11 @@ fn r25_focus_that_arrived_during_the_wait_applies_only_while_it_still_has_focus(
     s.reactor.handle_event(Event::RaiseFocusSent { sequence_id });
     s.reactor.handle_event(Event::RaiseCompleted { window_id: other, sequence_id });
 
-    assert_eq!(d, s.reactor.contexts.active(), "window 1 no longer has the focus");
+    assert_eq!(
+        d,
+        s.reactor.contexts.active(),
+        "window 1 no longer has the focus"
+    );
     assert!(raise_requests(&mut raises).is_empty());
     assert_ne!(c, s.reactor.contexts.active());
 }

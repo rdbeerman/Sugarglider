@@ -205,7 +205,8 @@ impl EventResponse {
         self.frame_overrides.extend(other.frame_overrides);
         self.raise_windows.extend(other.raise_windows);
         self.size_share_feedback = self.size_share_feedback.or(other.size_share_feedback);
-        self.focused_window_floating = other.focused_window_floating.or(self.focused_window_floating);
+        self.focused_window_floating =
+            other.focused_window_floating.or(self.focused_window_floating);
         match (self.focus_window, other.focus_window) {
             (Some(focus_window), Some(other_focus)) => {
                 self.focus_window = Some(focus_window);
@@ -1399,8 +1400,7 @@ impl LayoutManager {
                     _ => None, // 0 or 2+ siblings: don't auto-pull
                 };
                 // Create a container around the selected node
-                self.tree
-                    .nest_in_container(layout, selection, ContainerKind::from(orientation));
+                self.tree.nest_in_container(layout, selection, ContainerKind::from(orientation));
                 // Move the only sibling into the new container (after the selected node)
                 if let Some(sibling) = only_sibling {
                     self.tree.move_node_after(selection, sibling);

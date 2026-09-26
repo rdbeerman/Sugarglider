@@ -449,9 +449,7 @@ impl Reactor {
         number: u8,
     ) -> Result<(), String> {
         let id = self.resolve_named(reference)?;
-        self.contexts
-            .set_number(id, Some(number))
-            .map_err(|err| err.to_string())?;
+        self.contexts.set_number(id, Some(number)).map_err(|err| err.to_string())?;
         info!(?id, number, "Numbered a context");
         self.save_contexts();
         Ok(())
@@ -488,7 +486,12 @@ impl Reactor {
                 self.added_since_switch.insert(wid);
             }
         }
-        info!(?id, added = added.len(), removed = removed.len(), "Edited a context");
+        info!(
+            ?id,
+            added = added.len(),
+            removed = removed.len(),
+            "Edited a context"
+        );
         self.save_contexts();
         self.park_windows_that_left(&removed);
         Ok(())
