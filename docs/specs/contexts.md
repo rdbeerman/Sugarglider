@@ -1,20 +1,18 @@
 # Contexts
 
-Status: partly implemented behind `settings.experimental.contexts.enable`, which defaults to false. Written 2026-09-25, revised 2026-09-26.
+Status: M2 through M10 are integrated in this working branch behind `settings.experimental.contexts.enable`, which defaults to false. PR #25 remains draft pending physical QA. Written 2026-09-25, revised 2026-09-26.
 
-Code references point at commit `945794a`, the tip of the feature branch when this revision was verified. Each reference names the symbol first; line numbers are hints and will drift.
+Code references name symbols first; line numbers are hints and will drift.
 
-Implemented: M2 to M5c and M7, with the M5b fixes through `945794a`. That is the model, global-scope switching, membership and focus, parking and the journal, `contexts.json`, the IPC, the minimal command line (`list`, `current`, `create`, `switch`, `add`, `everything`), and the menu bar.
+Implemented in this integration: the model, switching and membership, parking and the journal, `contexts.json`, IPC, the full command line and Raycast script, menu bar, switcher, per-screen scope, Preferences scope picker, and the user guide.
 
-Still to build: M6's full command line and the Raycast script, M8's Rust half (the Swift panel is in the tree, but no command opens it and its bridge functions don't exist), M9's per-screen scope, and M10's scope picker and the final user page.
-
-The M1 spike (Q1 to Q4), Q5's target, and the manual QA still need a person. The questions in [What we don't know yet](#what-we-dont-know-yet) have no answers yet, and the checks under Manual QA in [Testing](#testing) haven't run.
+The M1 physical spike (Q1 to Q4), Q5's target, and the manual QA still need a person. The questions in [What we don't know yet](#what-we-dont-know-yet) have no answers yet, and the checks under Manual QA in [Testing](#testing) haven't run.
 
 ## Start here
 
 This section is for whoever picks up the work next.
 
-- Branch: `feat-rooms-context-switching`, PR #25. The implementation so far is there, behind `settings.experimental.contexts.enable`: global-scope switching, membership and focus, parking and the journal, `contexts.json`, the IPC and minimal command line, and the menu bar. M6's full command line, M8's Rust half, M9, and M10 remain. The M1 spike, Q5's target, and the manual QA still need a person.
+- This working branch integrates M2 through M10. PR #25 remains draft pending the M1 physical spike, Q5's target, and manual QA.
 - The design decisions in [Settled decisions](#settled-decisions) came from the product owner. Build on them; don't reopen them.
 - What is built works whatever the answers to the questions in [What we don't know yet](#what-we-dont-know-yet) turn out to be. The spike ([M1](#m1-spike-answer-the-macos-questions)) runs at the end, and anything it contradicts is fixed then.
 - Agent sessions must not start the live window manager (`cargo run`, `sugarglider launch`). See `agents.md`. A person runs the spike and the manual QA checklist. Agents run `cargo test`, `cargo +nightly fmt --check`, and `devtool`.
@@ -113,13 +111,13 @@ And on 2026-09-26:
 
 ### Scope and active context
 
-R8, R9, R11, and R26 apply to `per_screen` scope, which lands in [M9](#m9-per-screen-scope). Until then, only `global` scope exists.
+R8, R9, R11, and R26 apply to `per_screen` scope, implemented in [M9](#m9-per-screen-scope).
 
 - **R7.** In `global` scope, one active context covers all screens. A switch changes every screen. Windows stay on the screen they're on.
 - **R8.** In `per_screen` scope, each screen has its own active context. A switch changes only the focused screen. The members that are on other visible screens move to the focused screen.
 - **R9.** In `per_screen` scope, a shared window can only be on one screen. It goes to the screen that switched most recently. The other screen's layout closes the gap. The window returns when that screen switches again. The screen the window leaves keeps its saved tile position for that return, so the window comes back to its old place.
 - **R10.** A screen's active context applies to whichever Space the screen shows. When the user changes Space, Sugarglider applies the active context to the newly visible Space. It does this in the reactor event that reports the change, before any other event reaches that Space's layout (L2).
-- **R11.** Changing scope from `per_screen` to `global` makes the focused screen's context the global one. Changing from `global` to `per_screen` gives every screen the current global context.
+- **R11.** Changing scope from `per_screen` to `global` makes the focused screen's context the global one. Changing from `global` to `per_screen` gives every screen the current global context. If the config changes to `global` while Sugarglider is stopped, startup waits until it knows the focused screen, then chooses that screen's saved context and clears the saved per-screen map before the next save. Before startup completes, a context command returns an error if the focused screen is still unknown. If startup completes before the first usable screen event, that event applies the chosen context again after reconciliation. When no focused window is known at startup completion, the first screen supplies the context.
 
 ### Switching
 
@@ -350,7 +348,7 @@ set -euo pipefail
 
 ### Preferences
 
-The Preferences window has a "Contexts (experimental)" switch. `write_preferences_to_file` (`src/config.rs`) writes a fixed list of keys, and `settings.experimental.contexts.enable` is one of them. M10 adds the scope picker, which that list must include too.
+The Preferences window has a "Contexts (experimental)" switch and a scope picker. The picker sends `contextsScope` through `PreferencesJson`; `write_preferences_to_file` (`src/config.rs`) writes it as `settings.experimental.contexts.scope`. An older payload without `contextsScope` preserves the configured scope.
 
 ## Design
 
@@ -420,7 +418,7 @@ Pure functions, each with unit tests:
 - `match_windows(windows, &Contexts, pass) -> Vec<Vec<RecordMatch>>` runs R22. `pass` is `MatchPass::Arrival` or `MatchPass::Switch { target }`. `match_window` does the same for one window.
 - `plan_switch(&SwitchInput) -> SwitchPlan` plans a switch (R12 to R15).
   - `SwitchInput` lists each visible screen with its Space, its active context after the switch, and its windows. Each window carries its contexts, when it last took focus, and whether it is pinned, untracked, Sugarglider's own, in the reactor's visible-window set, or already parked.
-  - `SwitchPlan` lists windows to park, windows to put back, and the window to focus. M9 adds the windows that move to another screen.
+  - `SwitchPlan` lists windows to park, windows to put back, windows to move to another screen, and the window to focus.
   - The reactor builds `SwitchInput` from its own state (visible windows, frames, screens, and the parked set) and calls `plan_switch`. When R24 started the switch, the reactor focuses the window the user focused instead of the plan's choice (R12, step 5).
 
 Membership changes are methods on `Contexts`. `windows_appeared` handles new windows (R20, R21), `rejoin_all` handles windows found at launch (R38) and matching during a switch, and `title_changed`, `window_closed`, `app_terminated`, `app_still_running`, `forget_window_server_ids`, and `remove_record` keep the records current (R22, R23).
@@ -527,7 +525,7 @@ Both files live in `data_dir()` (`~/.glide`, `src/config.rs`), next to `layout.r
 ```
 
 - The reactor writes `contexts.json` after every change to contexts or membership, after each switch, when an app that has members quits, and on quit. A title change alone doesn't write the file, because terminals and browsers change titles constantly. The app-quit write keeps the last titles that R22 needs to match relaunched windows.
-- `active` is `{ "global": <key> }`. `<key>` is a context id or one of the strings `"everything"` and `"unsorted"`. A missing or unknown value, or an id that no context has, loads as Everything. M9 adds `{ "per_screen": { "<display id>": <key> } }`. On launch, each screen gets its saved context, and a screen without an entry shows Everything. R32 doesn't change `active`.
+- `active` is `{ "global": <key> }` or `{ "per_screen": { "<display id>": <key> } }`. `<key>` is a context id or one of the strings `"everything"` and `"unsorted"`. A missing or unknown value, or an id that no context has, loads as Everything. In `per_screen` scope, each screen gets its saved context, and a screen without an entry shows Everything. On a cold change to `global`, R11 selects the focused screen's saved context and clears the per-screen map before another switch can save. R32 doesn't change `active`.
 - `boot_id` names the boot that wrote the file: the boot session UUID from `kern.bootsessionuuid`, or the time the Mac booted from `kern.boottime` when that can't be read. Window server ids are valid within one boot, so when the file comes from another boot, the reactor forgets every saved window server id at load (R22). The reactor reads `contexts.json` only while the flag is on.
 - A value that breaks a rule is repaired at load, not rejected: a number outside 1 to 9 or one that another context holds is dropped; a context whose id an earlier context has takes a fresh id and keeps its members; an empty, reserved, or taken name gets a number (R4); and the id and use counters are raised above every value the file holds. Only another version, or a file that isn't this shape, fails to load, and then the file is moved aside like the journal and Sugarglider starts with no contexts.
 - The files contain window titles. The user docs must say so, as Rooms does.
@@ -575,7 +573,7 @@ scope = "global"
 ```
 
 - Declare the struct with `#[derive(PartialConfig!)]` inside `Experimental` (`src/config.rs`). Every field needs a value in `sugarglider.default.toml`; the tests `default_config_is_valid` and `default_settings_match_unspecified_setting_values` check this.
-- `enable` arrives in M5a. `scope` arrives in M9, so the config never has a key that does nothing.
+- `enable` arrived in M5a and `scope` in M9.
 - On a config reload that sets `enable = false`, Sugarglider shows Everything (R33). A reload that changes `scope` applies R11.
 
 ## Implementation traps
@@ -594,7 +592,7 @@ scope = "global"
 
 ## What we don't know yet
 
-These are facts about macOS that the code can't answer. The spike (M1) answers Q1 to Q4 on a real Mac, after the remaining milestones are built, and M5a answers Q5. No milestone waits for the answers. Each question below names the design that works with either answer, and the rule that changes if the spike contradicts it. Replace each question with the finding.
+These are facts about macOS that the code can't answer. The M1 physical spike must answer Q1 to Q4 on a real Mac. Q5 still needs its measured target. Each question below names the design that works with either answer, and the rule that changes if the spike contradicts it. Replace each question with the finding.
 
 - **Q1.** Does macOS keep a window where Sugarglider puts it when only 1 pixel stays on screen? Check all four corners, with one display and with two. Check that the window stays parked when its app is activated, and whether apps move their own parked windows back.
   - Not blocking. `parking_origin` is a pure function, so a different corner order changes only H1. If an app moves a parked window back, R39 parks it again, up to H2's cap of 5 since the last switch or Space change. If an app keeps moving it back past the cap, the fix goes into R39.
@@ -611,7 +609,7 @@ These are facts about macOS that the code can't answer. The spike (M1) answers Q
 
 Each milestone is a set of small commits that build and pass `cargo test`. Run `cargo +nightly fmt` before each commit. The feature stays behind `settings.experimental.contexts.enable` until the last milestone. Commits use `internal:` (or `refactor:`/`test:`) until the feature leaves experimental; then a `feat:` commit adds the release note.
 
-M1 to M5c give a usable feature in global scope with a command line. The menu bar and the switcher follow. `per_screen` scope comes last because it moves windows between displays. Every milestone is built now; a person runs the spike and the manual QA at the end.
+M2 through M10 are integrated in this working branch. A person still needs to run the M1 physical spike and manual QA.
 
 ### M1. Spike: answer the macOS questions
 
@@ -623,7 +621,7 @@ M1 to M5c give a usable feature in global scope with a command line. The menu ba
 
 ### M2. Model
 
-- `src/model/contexts.rs` with the types, `rank`, `match_windows`, and `plan_switch`, plus unit tests. `plan_switch` covers global scope; M9 adds `per_screen` inputs.
+- `src/model/contexts.rs` with the types, `rank`, `match_windows`, and `plan_switch`, plus unit tests for both scopes.
 - No behavior change.
 
 ### M3. Parking and the journal
@@ -683,14 +681,14 @@ M1 to M5c give a usable feature in global scope with a command line. The menu ba
 ### M9. Per-screen scope
 
 - R8, R9, R11, and R26, the `scope` config key, and `per_screen` inputs to `plan_switch`.
-- R8 moves windows to another display, and so to another Space. Layouts are per Space. A window that R8 or R9 moved keeps its saved tile position in the layout of the screen it left; that screen closes the visible gap while the window is away, and the window returns to the saved position. Until the two-screen tests land, the test "switching away and back gives the same frames" covers one screen.
+- R8 moves windows to another display, and so to another Space. Layouts are per Space. A window that R8 or R9 moved keeps its saved tile position in the layout of the screen it left; that screen closes the visible gap while the window is away, and the window returns to the saved position. Two-screen model and reactor tests cover the move and return.
 - Model and reactor tests with two screens.
 
 ### M10. Preferences and docs
 
-- The Preferences scope picker (the experimental contexts switch is already there).
+- The Preferences scope picker and its Rust config round-trip (the experimental contexts switch was already there).
 - A user page in `site/src/content/docs`.
-- Check the Preferences save path first. The research for this spec found that `HotkeyBindingJson.sort_order` is required in Rust while the Swift `HotkeyBinding` has no such field. That may make saving fail whenever hotkeys exist. Nobody has confirmed this at runtime.
+- Rust and Swift tests cover the scope picker and Preferences save path. Live Preferences use remains part of manual QA.
 
 ## Testing
 
@@ -771,7 +769,7 @@ M5c:
 Manual QA (a person, on a real Mac):
 
 - The spike (M1) for Q1 to Q4.
-- Two displays in global scope. After M9, in both scopes.
+- Two displays in both scopes.
 - WhatsApp in two contexts. Chrome with one window in each of two contexts, before and after quitting and relaunching Chrome.
 - Finder windows in and out of a context.
 - ⌘-Tab, a Dock click, and a notification click into another context. Opening a Raycast or 1Password panel from inside a context.

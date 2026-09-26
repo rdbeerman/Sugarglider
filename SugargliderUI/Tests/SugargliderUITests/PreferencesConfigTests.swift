@@ -105,8 +105,8 @@ final class PreferencesConfigTests: XCTestCase {
     XCTAssertEqual(encoded["axSubrole"] as? String, "AXDialog")
   }
 
-  /// The scope picker's value travels as `contextsScope`. Rust doesn't send
-  /// or read the key yet, so a config without it decodes with no scope.
+  /// The scope picker's value travels as `contextsScope`. A config from an
+  /// older version without the key still decodes with no scope.
   func testDecodesAndEncodesTheContextsScope() throws {
     let json = """
       {
