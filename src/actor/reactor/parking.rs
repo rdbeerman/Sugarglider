@@ -1915,4 +1915,32 @@ mod tests {
 
         assert_eq!(vec![entry(1, 2, tiles[1])], s.journal_on_disk());
     }
+
+    #[test]
+    fn h5_a_window_that_shows_up_at_a_parked_windows_corner_is_not_its_tab() {
+        let mut s = Setup::new(2);
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let corner = s.frame(wid(1));
+
+        // A new window of the same app appears at exactly the parked frame.
+        let new = WindowInfo {
+            frame: corner,
+            ..make_window(3)
+        };
+        s.apps.windows.insert(
+            wid(3),
+            WindowState {
+                frame: corner,
+                ..Default::default()
+            },
+        );
+        s.reactor.handle_event(Event::WindowCreated(wid(3), new, MouseState::Up));
+        s.reactor.handle_event(Event::WindowBecameVisible(wid(3)));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        let tiled: Vec<WindowId> = s.tiles().into_iter().map(|(wid, _)| wid).collect();
+        assert_eq!(vec![wid(1), wid(2), wid(3)], tiled);
+        assert_eq!(corner, s.frame(wid(1)));
+    }
 }
