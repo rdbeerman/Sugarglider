@@ -94,13 +94,14 @@ enum SwitcherKey: Equatable, Sendable {
     return digitKeyCodes[keyCode]
   }
 
+  /// The lowercase ASCII letter a key types. A letter outside ASCII, as a
+  /// Cyrillic layout types, counts as the ANSI letter of its key.
+  /// Punctuation, digits, and symbols are no letter, whatever the key.
   private static func letter(keyCode: UInt16, characters: String?) -> Character? {
-    if let character = characters?.lowercased().first, characters?.count == 1,
-      character.isASCII, character.isLetter
-    {
-      return character
-    }
-    return letterKeyCodes[keyCode]
+    guard let characters, characters.count == 1,
+      let character = characters.lowercased().first, character.isLetter
+    else { return nil }
+    return character.isASCII ? character : letterKeyCodes[keyCode]
   }
 }
 

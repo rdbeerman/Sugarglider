@@ -308,14 +308,21 @@ final class SwitcherKeysSpecTests: SwitcherSpecTestCase {
   /// the ANSI E or P key, that punctuation with ⌘ is not ⌘E or ⌘P: Dvorak
   /// types "." on the E key, and Colemak types ";" on the P key.
   func testCommandPunctuationOnTheEOrPKeyIsNotALetterShortcut() {
-    XCTExpectFailure(
-      "bug: SwitcherKey falls back to the ANSI key code for punctuation, "
-        + "so Dvorak ⌘. is ⌘E and Colemak ⌘; is ⌘P"
-    ) {
-      XCTAssertNil(key(14, [.command], "."))
-      XCTAssertNil(key(35, [.command], ";"))
-    }
+    XCTAssertNil(key(14, [.command], "."))
+    XCTAssertNil(key(35, [.command], ";"))
     XCTAssertEqual(key(2, [.command], "e"), .commandE)
     XCTAssertEqual(key(15, [.command], "p"), .commandP)
+  }
+
+  /// Only a letter outside ASCII falls back to the ANSI letter of its key.
+  /// A digit or a symbol on a letter key, or a key without characters, is
+  /// no letter shortcut.
+  func testOnlyLettersOutsideASCIIMapByKeyCode() {
+    XCTAssertEqual(key(14, [.command], "у"), .commandE)
+    XCTAssertEqual(key(35, [.command], "з"), .commandP)
+    XCTAssertNil(key(45, [.command], "0"))
+    XCTAssertNil(key(15, [.command], "§"))
+    XCTAssertNil(key(45, [.command], nil))
+    XCTAssertNil(key(45, [.command], ""))
   }
 }
