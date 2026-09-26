@@ -666,7 +666,8 @@ impl Reactor {
             Event::WindowBecameVisible(wid) => {
                 if self.window_is_tracked(wid)
                     && let Some(window) = self.windows.get(&wid)
-                    && let Some(space) = self.best_space_for_window(&window.frame_monotonic)
+                    && let Some(frame) = self.layout_frame(wid)
+                    && let Some(space) = self.best_space_for_window(&frame)
                     && let Some(info) = self.layout_window_info(wid)
                 {
                     // Check if there's already a visible window from the same app
@@ -1491,10 +1492,10 @@ impl Reactor {
             .filter(|wid| self.window_is_tracked(*wid))
         {
             let Some(window) = self.windows.get(&wid) else { continue };
-            let Some(space) = self.best_space_for_window(&window.frame_monotonic) else {
+            let Some(layout_info) = self.layout_window_info(wid) else {
                 continue;
             };
-            let Some(mut layout_info) = self.layout_window_info(wid) else {
+            let Some(space) = self.best_space_for_window(&layout_info.frame) else {
                 continue;
             };
             // Tabs in the same window group will have the same visual frame.
@@ -1517,8 +1518,6 @@ impl Reactor {
                     }
                 }
                 seen_frames.insert(frame_key);
-            } else if let Some(&before_parking) = self.parked.get(&wid) {
-                layout_info.frame = before_parking;
             }
             app_windows.entry(space).or_default().push((wid, layout_info));
         }
@@ -1560,12 +1559,22 @@ impl Reactor {
         self.screens[self.best_screen_idx_for_window(frame)?].space
     }
 
+    /// The frame that places a window on a screen and a Space, and that the
+    /// layout sees. For a parked window, that is its frame from before it was
+    /// parked, not its corner.
+    fn layout_frame(&self, wid: WindowId) -> Option<CGRect> {
+        match self.parked.get(&wid) {
+            Some(&before_parking) => Some(before_parking),
+            None => Some(self.windows.get(&wid)?.frame_monotonic),
+        }
+    }
+
     /// Gathers the window properties the layout uses to classify a window.
     fn layout_window_info(&self, wid: WindowId) -> Option<LayoutWindowInfo> {
         let window = self.windows.get(&wid)?;
         let app = self.apps.get(&wid.pid);
         Some(LayoutWindowInfo {
-            frame: window.frame_monotonic,
+            frame: self.layout_frame(wid)?,
             bundle_id: app.and_then(|a| a.info.bundle_id.clone()),
             app_name: app.and_then(|a| a.info.localized_name.clone()),
             title: window.title.clone().into(),
@@ -1582,7 +1591,7 @@ impl Reactor {
 
     fn update_active_screen(&mut self) {
         let changed = (|| {
-            let frame = self.windows.get(&self.main_window()?)?.frame_monotonic;
+            let frame = self.layout_frame(self.main_window()?)?;
             let screen = self.best_screen_idx_for_window(&frame)?;
             Some(self.active_screen_idx.replace(screen as u16) != Some(screen as u16))
         })();
@@ -1677,9 +1686,9 @@ impl Reactor {
 
         let mut windows_by_app_and_screen = HashMap::default();
         for &wid in &raise_windows {
-            let Some(window) = self.windows.get(&wid) else { continue };
+            let Some(frame) = self.layout_frame(wid) else { continue };
             windows_by_app_and_screen
-                .entry((wid.pid, self.best_space_for_window(&window.frame_monotonic)))
+                .entry((wid.pid, self.best_space_for_window(&frame)))
                 .or_insert(vec![])
                 .push(wid);
         }
@@ -1749,7 +1758,7 @@ impl Reactor {
 
     fn main_window_space(&self) -> Option<SpaceId> {
         // TODO: Optimize this with a cache or something.
-        self.best_space_for_window(&self.windows.get(&self.main_window()?)?.frame_monotonic)
+        self.best_space_for_window(&self.layout_frame(self.main_window()?)?)
     }
 
     #[instrument(skip(self), fields())]

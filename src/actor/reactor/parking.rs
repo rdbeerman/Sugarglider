@@ -1964,6 +1964,87 @@ mod tests {
         );
     }
 
+    /// Three displays side by side, each with a 25-point menu bar, and app 1
+    /// with window 1 on the middle display and window 2 on the right one.
+    /// Window 1 is the main window.
+    fn three_displays() -> (Reactor, Apps) {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let middle = rect(0., 0., 1000., 1000.);
+        let left = rect(-1000., 0., 1000., 1000.);
+        let right = rect(1000., 0., 1000., 1000.);
+        let visible = |bounds: CGRect| rect(bounds.origin.x, 25., 1000., 975.);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![visible(middle), visible(left), visible(right)],
+            bounds: vec![middle, left, right],
+            spaces: vec![
+                Some(SpaceId::new(1)),
+                Some(SpaceId::new(2)),
+                Some(SpaceId::new(3)),
+            ],
+            scale_factors: vec![1.0; 3],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        let on_middle = WindowInfo {
+            frame: rect(100., 100., 200., 200.),
+            ..make_window(1)
+        };
+        let on_right = WindowInfo {
+            frame: rect(1200., 100., 200., 200.),
+            ..make_window(2)
+        };
+        reactor.handle_events(apps.make_app_with_opts(
+            1,
+            vec![on_middle, on_right],
+            Some(wid(1)),
+            true,
+        ));
+        reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        (reactor, apps)
+    }
+
+    #[test]
+    fn h2_a_window_parked_on_the_middle_of_three_displays_keeps_its_space() {
+        let (mut reactor, mut apps) = three_displays();
+        let middle = rect(0., 25., 1000., 975.);
+        let right = rect(1000., 25., 1000., 975.);
+        let tiles = |reactor: &Reactor| {
+            [(SpaceId::new(1), middle), (SpaceId::new(3), right)].map(|(space, screen)| {
+                reactor.layout.calculate_layout(space, screen, &reactor.config)
+            })
+        };
+        assert_eq!([vec![(wid(1), middle)], vec![(wid(2), right)]], tiles(&reactor));
+
+        reactor.park_windows(&[wid(1)]).unwrap();
+        apps.simulate_until_quiet(&mut reactor);
+        // Every corner of the middle display reaches into a neighbor, and this
+        // one shows more of the right display than of the middle one.
+        let corner = rect(999., 999., 1000., 975.);
+        assert_eq!(corner, apps.windows[&wid(1)].frame);
+        assert_eq!(Some(2), reactor.best_screen_idx_for_window(&corner));
+        reactor.update_visible_windows();
+        apps.simulate_until_quiet(&mut reactor);
+
+        assert_eq!([vec![(wid(1), middle)], vec![(wid(2), right)]], tiles(&reactor));
+        assert_eq!(right, apps.windows[&wid(2)].frame);
+        assert_eq!(Some(wid(1)), reactor.main_window());
+        assert_eq!(Some(SpaceId::new(1)), reactor.main_window_space());
+        reactor.update_active_screen();
+        assert_eq!(Some(0), reactor.active_screen_idx);
+
+        // The layout loses the window, and the window shows again.
+        reactor.send_layout_event(LayoutEvent::WindowRemoved(wid(1)));
+        reactor.handle_event(Event::WindowBecameVisible(wid(1)));
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!([vec![(wid(1), middle)], vec![(wid(2), right)]], tiles(&reactor));
+
+        reactor.unpark_windows(&[wid(1)]);
+        assert_eq!(vec![middle], frame_writes(&apps.requests(), wid(1)));
+    }
+
     #[test]
     fn r31_the_next_event_writes_a_removal_that_could_not_be_written() {
         let mut s = Setup::new(2);
