@@ -1896,4 +1896,23 @@ mod tests {
             frame_writes(&apps.requests(), wid(1))
         );
     }
+
+    #[test]
+    fn r31_the_next_event_writes_a_removal_that_could_not_be_written() {
+        let mut s = Setup::new(2);
+        let tiles = [wid(1), wid(2)].map(|wid| s.frame(wid));
+        s.reactor.park_windows(&[wid(1), wid(2)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let failing = FailingWrites::start(s.dir.path());
+        s.close(wid(1));
+        drop(failing);
+        assert_eq!(
+            vec![entry(1, 1, tiles[0]), entry(1, 2, tiles[1])],
+            s.journal_on_disk()
+        );
+
+        s.reactor.handle_event(Event::MouseUp);
+
+        assert_eq!(vec![entry(1, 2, tiles[1])], s.journal_on_disk());
+    }
 }

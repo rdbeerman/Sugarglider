@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::actor::app::pid_t;
 use crate::collections::HashSet;
@@ -84,6 +84,8 @@ pub struct ParkedJournal {
     entries: Vec<JournalEntry>,
     /// Entries read at startup whose windows have not been put back yet.
     unrestored: HashSet<(pid_t, WindowServerId)>,
+    /// Whether the file is behind `entries` because a write failed.
+    behind: bool,
 }
 
 impl ParkedJournal {
@@ -121,6 +123,7 @@ impl ParkedJournal {
             path: Some(path),
             entries,
             unrestored,
+            behind: false,
         }
     }
 
@@ -130,6 +133,7 @@ impl ParkedJournal {
             path: None,
             entries: vec![],
             unrestored: HashSet::default(),
+            behind: false,
         }
     }
 
@@ -151,6 +155,7 @@ impl ParkedJournal {
         entries.extend(new.iter().cloned());
         self.write(&entries)?;
         self.entries = entries;
+        self.behind = false;
         for entry in &new {
             self.unrestored.remove(&entry.key());
         }
@@ -189,8 +194,25 @@ impl ParkedJournal {
         self.unrestored.remove(&(pid, wsid));
     }
 
+    /// Writes the journal again if the last write failed.
+    pub fn retry_failed_write(&mut self) {
+        if !self.behind {
+            return;
+        }
+        match self.write(&self.entries) {
+            Ok(()) => {
+                info!(path = ?self.path, "Wrote the parked-window journal after a failed write");
+                self.behind = false;
+            }
+            Err(err) => {
+                debug!(path = ?self.path, "Could not write the parked-window journal: {err}")
+            }
+        }
+    }
+
     /// Removes the entries that `remove` selects and writes the journal if any
-    /// were removed. A failed write is logged; the next write retries it.
+    /// were removed. A failed write is logged, and `retry_failed_write` or the
+    /// next change writes it again.
     fn remove_where(&mut self, remove: impl Fn(&JournalEntry) -> bool) -> bool {
         let before = self.entries.len();
         self.entries.retain(|entry| !remove(entry));
@@ -199,8 +221,12 @@ impl ParkedJournal {
         }
         let entries = &self.entries;
         self.unrestored.retain(|key| entries.iter().any(|entry| entry.key() == *key));
-        if let Err(err) = self.write(&self.entries) {
-            error!(path = ?self.path, "Could not write the parked-window journal: {err}");
+        match self.write(&self.entries) {
+            Ok(()) => self.behind = false,
+            Err(err) => {
+                error!(path = ?self.path, "Could not write the parked-window journal: {err}");
+                self.behind = true;
+            }
         }
         true
     }
@@ -574,5 +600,31 @@ mod tests {
             &[entry(2, 20), entry(3, 30)],
             ParkedJournal::open(journal_path(&dir), now()).entries()
         );
+    }
+
+    #[test]
+    fn r31_a_removal_that_could_not_be_written_is_written_on_a_retry() {
+        let dir = TempDir::new().unwrap();
+        let mut journal = ParkedJournal::open(journal_path(&dir), now());
+        journal.record(vec![entry(1, 10), entry(2, 20)]).unwrap();
+        let failing = FailingWrites::start(dir.path());
+        journal.remove_window(1, WindowServerId::new(10));
+        journal.retry_failed_write();
+        drop(failing);
+        assert_eq!(
+            &[entry(1, 10), entry(2, 20)],
+            ParkedJournal::open(journal_path(&dir), now()).entries()
+        );
+
+        journal.retry_failed_write();
+
+        assert_eq!(
+            &[entry(2, 20)],
+            ParkedJournal::open(journal_path(&dir), now()).entries()
+        );
+        // Nothing is left to write.
+        fs::remove_file(journal_path(&dir)).unwrap();
+        journal.retry_failed_write();
+        assert!(file_names(dir.path()).is_empty());
     }
 }
