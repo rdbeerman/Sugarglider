@@ -289,6 +289,7 @@ final class SwitcherChecklistSpecTests: SwitcherSpecTestCase {
     let model = try makeSharedModel()
     model.query = "Evening"
     model.handle(.commandN)
+    model.handle(.enter)
     XCTAssertEqual(model.mode, .create(name: "Evening"))
     XCTAssertEqual(
       model.checklist.map(\.source),

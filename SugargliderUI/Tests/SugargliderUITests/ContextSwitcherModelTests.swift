@@ -514,6 +514,9 @@ final class ContextSwitcherModelTests: XCTestCase {
     let model = try makeModel()
     model.query = "Sugar glider"
     model.handle(.commandN)
+    XCTAssertEqual(model.mode, .naming)
+    XCTAssertEqual(model.nameDraft, "Sugar glider")
+    model.handle(.enter)
     XCTAssertEqual(model.mode, .create(name: "Sugar glider"))
 
     model.handle(.down)
@@ -557,6 +560,8 @@ final class ContextSwitcherModelTests: XCTestCase {
     let model = try makeModel()
     model.query = "cli"
     model.handle(.commandN)
+    model.handle(.enter)
+    XCTAssertEqual(model.mode, .create(name: "cli"))
     model.handle(.escape)
     XCTAssertEqual(model.mode, .list)
     XCTAssertEqual(model.query, "cli")
@@ -568,10 +573,161 @@ final class ContextSwitcherModelTests: XCTestCase {
     let model = try makeModel()
     model.query = "x"
     model.handle(.commandN)
+    model.handle(.enter)
+    XCTAssertEqual(model.mode, .create(name: "x"))
     model.handle(.up)
     XCTAssertEqual(model.checklistHighlight, 0)
     for _ in 0..<10 { model.handle(.down) }
     XCTAssertEqual(model.checklistHighlight, 4)
+  }
+
+  // MARK: Naming a new context
+
+  /// ⌘N fills the name with the trimmed query, and the user can change it
+  /// before choosing the windows.
+  func testCommandNFillsTheNameWithTheQueryToEdit() throws {
+    let model = try makeModel()
+    model.query = "  Deep work "
+    model.handle(.commandN)
+    XCTAssertEqual(model.mode, .naming)
+    XCTAssertEqual(model.nameDraft, "Deep work")
+    XCTAssertNil(model.message)
+
+    model.nameDraft = "Deep work 2"
+    model.handle(.enter)
+    XCTAssertEqual(model.mode, .create(name: "Deep work 2"))
+    model.handle(.enter)
+    XCTAssertEqual(
+      backend.sent,
+      [
+        .create(
+          name: "Deep work 2",
+          windows: [Fixtures.ghostty, Fixtures.chrome, Fixtures.finder, Fixtures.slack])
+      ]
+    )
+  }
+
+  /// R4: ⌘N with the name of a context, in any case or accents, says the
+  /// name is taken, and ↩ waits for another name.
+  func testCommandNWithATakenNameAsksForAnother() throws {
+    backend.ranks["client work"] = [
+      SwitcherRankedEntry(key: .named(Fixtures.clientWork), match: .exact)
+    ]
+    let model = try makeModel()
+    model.query = "client work"
+    XCTAssertEqual(names(model), ["Client work"])
+
+    model.handle(.commandN)
+    XCTAssertEqual(model.mode, .naming)
+    XCTAssertEqual(model.nameDraft, "client work")
+    XCTAssertEqual(model.message, "A context named “Client work” already exists.")
+    model.handle(.enter)
+    XCTAssertEqual(model.mode, .naming)
+
+    model.nameDraft = "Clïent Wörk"
+    XCTAssertNil(model.message)
+    model.handle(.enter)
+    XCTAssertEqual(model.message, "A context named “Client work” already exists.")
+    XCTAssertEqual(model.mode, .naming)
+
+    model.nameDraft = "Client work 2"
+    model.handle(.enter)
+    XCTAssertEqual(model.mode, .create(name: "Client work 2"))
+    XCTAssertEqual(backend.sent, [])
+  }
+
+  /// R4: "Everything" and "Unsorted" are reserved in any case or accents.
+  func testReservedNamesAreRefusedInAnyCaseOrAccents() throws {
+    let model = try makeModel()
+    for name in ["everything", "  EVERYTHING ", "Évérything"] {
+      XCTAssertEqual(model.newNameProblem(name), "“Everything” is a reserved name.", name)
+    }
+    for name in ["unsorted", "Ünsorted", "UNSORTED"] {
+      XCTAssertEqual(model.newNameProblem(name), "“Unsorted” is a reserved name.", name)
+    }
+    XCTAssertEqual(model.newNameProblem(" \t"), "A context name can't be empty.")
+    XCTAssertNil(model.newNameProblem("Everything else"))
+    XCTAssertNil(model.newNameProblem("Unsorted mail"))
+  }
+
+  /// The "New context" row appears only for a name that can be used, also
+  /// when ranking is unavailable and no rank entry says `exact`.
+  func testTheNewContextRowNeedsANameThatCanBeUsed() throws {
+    backend.rankError = SwitcherBridgeError(message: "missing")
+    let model = try makeModel()
+    for query in ["CLIENT WORK", "sugarglïder", "Unsorted", "everything"] {
+      model.query = query
+      XCTAssertFalse(model.rows.contains { $0 == .newContext(query) }, query)
+      XCTAssertEqual(model.rows.count, 4, query)
+    }
+    model.query = "Clients"
+    XCTAssertEqual(model.rows.last, .newContext("Clients"))
+  }
+
+  /// When Rust rejects a create, for example because the CLI made a
+  /// context with that name since the panel opened, the naming view comes
+  /// back with the name and Rust's message. The checked windows stay as
+  /// the user left them.
+  func testARejectedCreateReturnsToNamingAndKeepsTheChecklist() throws {
+    backend.runError = SwitcherBridgeError(message: "A context named \"Deep work\" already exists")
+    let model = try makeModel()
+    model.query = "Deep work"
+    XCTAssertEqual(model.rows, [.newContext("Deep work")])
+    model.handle(.enter)
+    XCTAssertEqual(model.mode, .create(name: "Deep work"))
+    model.toggleItem(at: 3)
+    model.handle(.enter)
+
+    XCTAssertEqual(model.mode, .naming)
+    XCTAssertEqual(model.nameDraft, "Deep work")
+    XCTAssertEqual(model.message, "A context named \"Deep work\" already exists")
+    XCTAssertEqual(closed, 0)
+
+    model.nameDraft = "Deep work 2"
+    XCTAssertNil(model.message)
+    model.handle(.enter)
+    XCTAssertEqual(model.mode, .create(name: "Deep work 2"))
+    XCTAssertEqual(model.checklist.map(\.checked), [true, true, true, false, true])
+
+    backend.runError = nil
+    model.handle(.enter)
+    XCTAssertEqual(
+      backend.sent.last,
+      .create(name: "Deep work 2", windows: [Fixtures.ghostty, Fixtures.chrome, Fixtures.slack])
+    )
+    XCTAssertEqual(closed, 1)
+  }
+
+  /// Esc from the naming view drops the checklist of a rejected create.
+  func testEscapeAfterARejectedCreateForgetsItsChecklist() throws {
+    backend.runError = SwitcherBridgeError(message: "Contexts are turned off")
+    let model = try makeModel()
+    model.query = "Deep work"
+    model.handle(.enter)
+    model.toggleItem(at: 0)
+    model.handle(.enter)
+    XCTAssertEqual(model.mode, .naming)
+
+    model.handle(.escape)
+    XCTAssertEqual(model.mode, .list)
+    model.handle(.enter)
+    XCTAssertEqual(model.mode, .create(name: "Deep work"))
+    XCTAssertTrue(model.checklist.allSatisfy(\.checked))
+  }
+
+  /// Names compare lowercased and without the accents of Latin letters, as
+  /// Rust's `fold` compares them. Other scripts keep their letters, so the
+  /// panel never refuses a name that Rust takes.
+  func testFoldComparesNamesAsRustDoes() {
+    XCTAssertEqual(ContextSwitcherModel.fold("Clïent Wörk"), "client work")
+    XCTAssertEqual(ContextSwitcherModel.fold("Straße"), "strasse")
+    XCTAssertEqual(ContextSwitcherModel.fold("Æther Łódź"), "aether lodz")
+    XCTAssertEqual(ContextSwitcherModel.fold("İstanbul"), "istanbul")
+    XCTAssertEqual(ContextSwitcherModel.fold("Cafe\u{0301}"), "cafe")
+    XCTAssertEqual(ContextSwitcherModel.fold("Việt"), "viet")
+    XCTAssertEqual(ContextSwitcherModel.fold("2×3"), "2×3")
+    XCTAssertEqual(ContextSwitcherModel.fold("Ёлка"), "ёлка")
+    XCTAssertNotEqual(ContextSwitcherModel.fold("Мой"), ContextSwitcherModel.fold("Мои"))
   }
 
   // MARK: Edit

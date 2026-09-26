@@ -37,7 +37,7 @@ Swift to Rust, implemented by the Rust half:
 - invalid JSON, or a command it doesn't know;
 - the feature is off;
 - a context id that no longer exists;
-- a `create` or `rename` name that is empty, reserved, or taken (R4). The rank result leaves Unsorted out when it has no windows, so typing "unsorted" offers a "New context" row, and only Rust can reject that name;
+- a `create` or `rename` name that is empty, reserved, or taken (R4). The panel checks a new name against the reserved names and the payload before it sends `create`, but the payload can be out of date, and the panel checks a new name for `rename` only for being empty;
 - a `set_number` number outside 1 to 9.
 
 The reactor logs failures that come later, for example a failed journal write (R30).
@@ -142,7 +142,7 @@ For the empty query, every entry, most recently used first. Unsorted is listed o
 How the panel uses it:
 
 - It calls rank for every query, the empty one included, and shows the entries in this order. It skips ids that the show payload doesn't have.
-- It shows the "New context “<text>”" row, last, when the trimmed query isn't empty and no entry has `match` equal to `exact`.
+- It shows the "New context “<text>”" row, last, when no entry has `match` equal to `exact` and the trimmed query can name a new context: it isn't empty, it isn't "Everything" or "Unsorted", and it isn't the name of a context in the payload. The panel compares names lowercased and without the accents of Latin letters, as `model::contexts::fold` does. Where its comparison differs from `fold`, it folds less, so it never refuses a name that Rust accepts. So "unsorted" offers no "New context" row, even when the rank result leaves Unsorted out.
 - The first-time state ("Type a name to create your first context") shows when the payload has no named contexts and Everything is active. Then the list shows no entries, only the "New context" row once the user types.
 - When `sugarglider_rank_contexts` is missing or returns NULL, the panel shows an inline error and lists the payload's entries unfiltered, in payload order (named contexts, Unsorted when it has windows, Everything).
 
@@ -197,7 +197,7 @@ Pins or unpins the target window, as `toggle_window_pinned` does (R3). Sent by �
               "windows": [{ "pid": 640, "idx": 8812 }, { "pid": 812, "idx": 9123 }] } }
 ```
 
-Creates a context with this name (R4) and the lowest free number (R5), whose members are exactly these windows, and switches to it, as `sugarglider context create` does. `windows` can be empty. Sent from the create view, which ↩ on the "New context" row or ⌘N opens.
+Creates a context with this name (R4) and the lowest free number (R5), whose members are exactly these windows, and switches to it, as `sugarglider context create` does. `windows` can be empty. Sent from the create view, which ↩ on the "New context" row opens. ⌘N first opens a naming view that holds the trimmed query, where the user can change the name. The panel checks the name as it does for the "New context" row before it lists the windows, and says why when the name can't be used. When Rust rejects `create`, the panel goes back to the naming view with the name and Rust's message, and keeps the windows the user checked.
 
 `windows` never holds a pinned window. A pinned window is a member of every context already (R3), so the create view shows it checked and fixed and leaves it out. Rust ignores a pinned window in `windows` and gives it no record.
 

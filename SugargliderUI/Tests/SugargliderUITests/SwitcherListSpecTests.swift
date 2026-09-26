@@ -117,10 +117,10 @@ final class SwitcherListSpecTests: SwitcherSpecTestCase {
     XCTAssertEqual(model.rows, [.entry(unsorted)])
   }
 
-  /// The contract: without unsorted windows the rank result leaves Unsorted
-  /// out, so "unsorted" offers a "New context" row and only Rust rejects the
-  /// name (R4). The panel shows Rust's message and stays open.
-  func testUnsortedWithoutWindowsOffersANewContextRowThatRustRejects() throws {
+  /// R4: without unsorted windows the rank result leaves Unsorted out, but
+  /// the panel knows the reserved names, so "unsorted" offers no "New
+  /// context" row, and ⌘N says why.
+  func testUnsortedWithoutWindowsOffersNoNewContextRow() throws {
     var payload = try Fixtures.payload()
     payload.unsorted.windows = 0
     backend.ranks[""] = SpecPayload.ranked([
@@ -128,24 +128,17 @@ final class SwitcherListSpecTests: SwitcherSpecTestCase {
       (.everything, .emptyQuery),
     ])
     backend.ranks["unsorted"] = []
-    backend.runError = SwitcherBridgeError(message: #""Unsorted" is a reserved name"#)
     let model = try makeModel(payload)
     model.query = "unsorted"
-    XCTAssertEqual(model.rows, [.newContext("unsorted")])
+    XCTAssertEqual(model.rows, [])
 
     model.handle(.enter)
-    XCTAssertEqual(model.mode, .create(name: "unsorted"))
+    model.handle(.commandN)
+    XCTAssertEqual(model.mode, .naming)
+    XCTAssertEqual(model.message, "“Unsorted” is a reserved name.")
     model.handle(.enter)
-    XCTAssertEqual(
-      backend.sent,
-      [
-        .create(
-          name: "unsorted",
-          windows: [Fixtures.ghostty, Fixtures.chrome, Fixtures.finder, Fixtures.slack]
-        )
-      ]
-    )
-    XCTAssertEqual(model.message, #""Unsorted" is a reserved name"#)
+    XCTAssertEqual(model.mode, .naming)
+    XCTAssertEqual(backend.sent, [])
     XCTAssertEqual(closed, 0)
   }
 

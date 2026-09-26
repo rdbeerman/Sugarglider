@@ -152,8 +152,10 @@ import Foundation
 /// ```
 ///
 /// The panel shows the entries in this order and skips ids that the show
-/// payload doesn't have. It shows the "New context" row when the trimmed
-/// query isn't empty and no entry has `match` equal to `exact`.
+/// payload doesn't have. It shows the "New context" row when no entry has
+/// `match` equal to `exact` and the trimmed query can name a new context:
+/// it isn't empty, reserved, or the name of a context in the payload
+/// (`ContextSwitcherModel.newNameProblem`).
 ///
 /// Commands
 /// --------
@@ -196,7 +198,9 @@ import Foundation
 /// ```
 /// Creates a context with this name (R4) and the lowest free number (R5),
 /// whose members are exactly these windows, and switches to it, as
-/// `sugarglider context create` does. `windows` can be empty.
+/// `sugarglider context create` does. `windows` can be empty. ⌘N asks for
+/// the name first, filled with the query. When Rust rejects `create`, the
+/// panel asks for the name again and keeps the checked windows.
 ///
 /// A pinned window is a member of every context already (R3). The create
 /// and edit views show it checked and fixed, and `create.windows`,

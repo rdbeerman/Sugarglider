@@ -220,6 +220,9 @@ final class ContextSwitcherModel: ObservableObject {
   @Published private(set) var message: String?
   /// Set while ranking is unavailable.
   @Published private(set) var rankError: String?
+  /// The checklist of a create that Rust rejected, kept while the user
+  /// fixes the name.
+  private var rejectedChecklist: [SwitcherChecklistItem]?
 
   /// True until the first context exists: the list stays empty and invites
   /// the user to type a name.
@@ -266,7 +269,7 @@ final class ContextSwitcherModel: ObservableObject {
     }
     var rows = entries.map(SwitcherRow.entry)
     let name = trimmed(query)
-    if !name.isEmpty && !hasExactMatch {
+    if !hasExactMatch && newNameProblem(name) == nil {
       rows.append(.newContext(name))
     }
     self.rows = rows
@@ -452,7 +455,11 @@ final class ContextSwitcherModel: ObservableObject {
     case .entry(let entry):
       run(.switchTo(entry.key))
     case .newContext(let name):
-      startCreate(name: name)
+      if let problem = newNameProblem(name) {
+        startNaming(name, message: problem)
+      } else {
+        startCreate(name: name)
+      }
     case nil:
       break
     }
@@ -498,28 +505,35 @@ final class ContextSwitcherModel: ObservableObject {
     return nil
   }
 
+  /// Opens the naming view with the query as the name. A name that can't be
+  /// used says why at once.
   private func newContext() {
     let name = trimmed(query)
-    if name.isEmpty {
-      nameDraft = ""
-      mode = .naming
-      message = nil
-    } else {
-      startCreate(name: name)
-    }
+    startNaming(name, message: name.isEmpty ? nil : newNameProblem(name))
   }
 
+  private func startNaming(_ name: String, message: String?) {
+    nameDraft = name
+    mode = .naming
+    self.message = message
+  }
+
+  /// Opens the create view. After Rust rejected a create, it shows the
+  /// checklist the user had.
   private func startCreate(name: String) {
-    checklist = payload.windows.map { window in
-      SwitcherChecklistItem(
-        source: .window(window.id),
-        title: window.title,
-        app: window.app,
-        checked: true,
-        initiallyChecked: true,
-        pinned: window.pinned
-      )
-    }
+    checklist =
+      rejectedChecklist
+      ?? payload.windows.map { window in
+        SwitcherChecklistItem(
+          source: .window(window.id),
+          title: window.title,
+          app: window.app,
+          checked: true,
+          initiallyChecked: true,
+          pinned: window.pinned
+        )
+      }
+    rejectedChecklist = nil
     checklistHighlight = 0
     mode = .create(name: name)
     message = nil
@@ -563,12 +577,16 @@ final class ContextSwitcherModel: ObservableObject {
   private func confirmName() {
     let name = trimmed(nameDraft)
     guard !name.isEmpty else {
-      message = "A context name can't be empty."
+      message = Self.emptyNameMessage
       return
     }
     switch mode {
     case .naming:
-      startCreate(name: name)
+      if let problem = newNameProblem(name) {
+        message = problem
+      } else {
+        startCreate(name: name)
+      }
     case .rename(let id):
       if name == context(id)?.name {
         showList()
@@ -587,7 +605,10 @@ final class ContextSwitcherModel: ObservableObject {
         guard item.checked, !item.pinned, case .window(let id) = item.source else { return nil }
         return id
       }
-      run(.create(name: name, windows: windows))
+      if !run(.create(name: name, windows: windows)) {
+        rejectedChecklist = checklist
+        startNaming(name, message: message)
+      }
     case .edit(let id):
       var add: [SwitcherWindowId] = []
       var remove: [SwitcherWindowId] = []
@@ -617,16 +638,80 @@ final class ContextSwitcherModel: ObservableObject {
   private func showList() {
     mode = .list
     message = nil
+    rejectedChecklist = nil
   }
 
-  /// Sends a command, and closes the panel when Rust accepts it.
-  private func run(_ command: SwitcherCommand) {
+  /// Sends a command, and closes the panel when Rust accepts it. Returns
+  /// false, with Rust's message shown, when Rust rejects it.
+  @discardableResult
+  private func run(_ command: SwitcherCommand) -> Bool {
     do {
       try backend.run(command)
       onClose()
+      return true
     } catch {
       message = Self.describe(error)
+      return false
     }
+  }
+
+  // MARK: Names
+
+  private static let emptyNameMessage = "A context name can't be empty."
+
+  /// Why a new context can't have this name, or nil when it can: the name
+  /// is empty, reserved, or another context's name, compared as `fold`
+  /// compares them (R4). Rust checks the name again when it creates the
+  /// context.
+  func newNameProblem(_ name: String) -> String? {
+    let name = trimmed(name)
+    if name.isEmpty {
+      return Self.emptyNameMessage
+    }
+    let folded = Self.fold(name)
+    if let reserved = [Self.everythingName, Self.unsortedName].first(where: {
+      Self.fold($0) == folded
+    }) {
+      return "“\(reserved)” is a reserved name."
+    }
+    if let taken = payload.contexts.first(where: { Self.fold($0.name) == folded }) {
+      return "A context named “\(taken.name)” already exists."
+    }
+    return nil
+  }
+
+  /// Lowercases text and removes the accents of Latin letters, as Rust's
+  /// `model::contexts::fold` does. Where the two differ, this one folds
+  /// less, so the panel never refuses a name that Rust takes.
+  static func fold(_ text: String) -> String {
+    var folded = ""
+    for scalar in text.unicodeScalars {
+      switch scalar.value {
+      case 0x0300...0x036F:
+        continue
+      case 0x00C0...0x024F, 0x1E00...0x1EFF:
+        folded += foldLatin(scalar)
+      default:
+        folded += String(scalar).lowercased()
+      }
+    }
+    return folded
+  }
+
+  /// Latin letters that don't decompose into an ASCII letter and a mark.
+  private static let latinLetters: [String: String] = [
+    "æ": "ae", "ð": "d", "đ": "d", "ħ": "h", "ı": "i", "ĳ": "ij", "ĸ": "k", "ŀ": "l", "ł": "l",
+    "ŉ": "n", "ŋ": "n", "ø": "o", "œ": "oe", "ß": "ss", "ſ": "s", "ŧ": "t", "þ": "th",
+  ]
+
+  private static func foldLatin(_ scalar: Unicode.Scalar) -> String {
+    let lower = String(scalar).lowercased()
+    if let base = lower.decomposedStringWithCanonicalMapping.unicodeScalars.first,
+      base.isASCII, base.properties.isAlphabetic
+    {
+      return String(base)
+    }
+    return latinLetters[lower] ?? lower
   }
 
   private func trimmed(_ text: String) -> String {
