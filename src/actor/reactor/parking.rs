@@ -223,7 +223,7 @@ impl Reactor {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Instant, SystemTime};
 
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -236,6 +236,7 @@ mod tests {
     use crate::actor::layout::LayoutManager;
     use crate::actor::parked_journal::{JournalEntry, ParkedJournal};
     use crate::sys::app::WindowInfo;
+    use crate::sys::geometry::CGRectExt;
     use crate::sys::screen::{CoordinateConverter, SpaceId};
     use crate::sys::window_server::WindowServerId;
 
@@ -261,11 +262,16 @@ mod tests {
         reactor: Reactor,
         apps: Apps,
         dir: TempDir,
+        screen: CGRect,
     }
 
     impl Setup {
         fn new(windows: usize) -> Setup {
-            let mut s = Setup::launching(vec![]);
+            Setup::new_on(screen(), windows)
+        }
+
+        fn new_on(screen: CGRect, windows: usize) -> Setup {
+            let mut s = Setup::launching_on(screen, vec![]);
             s.reactor.handle_events(s.apps.make_app(1, make_windows(windows)));
             s.reactor.handle_event(Event::StartupComplete);
             s.apps.simulate_until_quiet(&mut s.reactor);
@@ -275,16 +281,33 @@ mod tests {
         /// A reactor on one screen that no app has reached yet, starting with
         /// the journal that an earlier run left with `entries`.
         fn launching(entries: Vec<JournalEntry>) -> Setup {
+            Setup::launching_on(screen(), entries)
+        }
+
+        fn launching_on(screen: CGRect, entries: Vec<JournalEntry>) -> Setup {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("parked.json");
             if !entries.is_empty() {
-                ParkedJournal::open(path.clone(), SystemTime::now()).record(entries).unwrap();
+                ParkedJournal::open(path, SystemTime::now()).record(entries).unwrap();
             }
+            Setup::start(dir, screen)
+        }
+
+        /// A reactor on one screen that no app has reached yet, starting with
+        /// `contents` in the journal file.
+        fn launching_with_file(contents: &[u8]) -> Setup {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("parked.json"), contents).unwrap();
+            Setup::start(dir, screen())
+        }
+
+        fn start(dir: TempDir, screen: CGRect) -> Setup {
             let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
-            reactor.journal = ParkedJournal::open(path, SystemTime::now());
+            reactor.journal =
+                ParkedJournal::open(dir.path().join("parked.json"), SystemTime::now());
             reactor.handle_event(Event::ScreenParametersChanged {
-                frames: vec![screen()],
-                bounds: vec![screen()],
+                frames: vec![screen],
+                bounds: vec![screen],
                 spaces: vec![Some(space())],
                 scale_factors: vec![1.0],
                 converter: CoordinateConverter::default(),
@@ -294,6 +317,7 @@ mod tests {
                 reactor,
                 apps: Apps::new(),
                 dir,
+                screen,
             }
         }
 
@@ -312,7 +336,7 @@ mod tests {
 
         fn tiles(&self) -> Vec<(WindowId, CGRect)> {
             let mut tiles =
-                self.reactor.layout.calculate_layout(space(), screen(), &self.reactor.config);
+                self.reactor.layout.calculate_layout(space(), self.screen, &self.reactor.config);
             tiles.sort_by_key(|(wid, _)| *wid);
             tiles
         }
@@ -323,6 +347,47 @@ mod tests {
             self.reactor.update_visible_windows();
             self.apps.simulate_until_quiet(&mut self.reactor);
         }
+
+        /// Closes the window. Its app forgets it, and the reactor learns that
+        /// it was destroyed.
+        fn close(&mut self, wid: WindowId) {
+            self.apps.windows.remove(&wid);
+            self.reactor.handle_event(Event::WindowDestroyed(wid));
+        }
+
+        fn handle_requests(&mut self, requests: Vec<Request>) {
+            for event in self.apps.simulate_events_for_requests(requests) {
+                self.reactor.handle_event(event);
+            }
+        }
+
+        fn parked_windows(&self) -> Vec<WindowId> {
+            let mut parked: Vec<WindowId> = self.reactor.parked.keys().copied().collect();
+            parked.sort();
+            parked
+        }
+    }
+
+    /// A screen on which three windows side by side get tiles of one size.
+    fn wide_screen() -> CGRect {
+        rect(0., 0., 1200., 1000.)
+    }
+
+    /// The pid, window server id, and frame of each entry.
+    fn summary(entries: Vec<JournalEntry>) -> Vec<(i32, u32, CGRect)> {
+        entries
+            .iter()
+            .map(|entry| (entry.pid, entry.window_server_id.as_u32(), entry.frame.into()))
+            .collect()
+    }
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
     }
 
     fn frame_writes(requests: &[Request], wid: WindowId) -> Vec<CGRect> {
@@ -714,5 +779,533 @@ mod tests {
         let writes = frame_writes(&s.apps.requests(), WindowId::new(1, 1));
         assert!(!writes.contains(&elsewhere), "{writes:?}");
         assert!(s.journal_on_disk().is_empty());
+    }
+
+    #[test]
+    fn h1_r35_each_window_keeps_one_point_in_a_corner_of_its_own_display() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        // Two displays side by side. Both have a 25-point menu bar.
+        let main_visible = rect(0., 25., 1000., 975.);
+        let main_bounds = rect(0., 0., 1000., 1000.);
+        let right_visible = rect(1000., 25., 1000., 975.);
+        let right_bounds = rect(1000., 0., 1000., 1000.);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![main_visible, right_visible],
+            bounds: vec![main_bounds, right_bounds],
+            spaces: vec![Some(space()), Some(SpaceId::new(2))],
+            scale_factors: vec![1.0, 1.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        let on_right = WindowInfo {
+            frame: rect(1200., 100., 50., 50.),
+            ..make_window(2)
+        };
+        reactor.handle_events(apps.make_app(1, vec![make_window(1), on_right]));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!(main_visible, apps.windows[&wid(1)].frame);
+        assert_eq!(right_visible, apps.windows[&wid(2)].frame);
+
+        reactor.park_windows(&[wid(1), wid(2)]).unwrap();
+
+        // The bottom right corner of the main display would reach into the
+        // display on its right.
+        let parked_main = rect(-999., 999., 1000., 975.);
+        let parked_right = rect(1999., 999., 1000., 975.);
+        let requests = apps.requests();
+        assert_eq!(vec![parked_main], frame_writes(&requests, wid(1)));
+        assert_eq!(vec![parked_right], frame_writes(&requests, wid(2)));
+        for (parked, own, other) in [
+            (parked_main, main_visible, right_bounds),
+            (parked_right, right_visible, main_bounds),
+        ] {
+            assert_eq!(1.0, parked.intersection(&own).area(), "{parked:?}");
+            assert_eq!(0.0, parked.intersection(&other).area(), "{parked:?}");
+        }
+    }
+
+    #[test]
+    fn r30_parking_no_window_writes_no_journal() {
+        let mut s = Setup::new(2);
+
+        s.reactor.park_windows(&[]).unwrap();
+        s.reactor.park_windows(&[WindowId::new(1, 9), WindowId::new(7, 1)]).unwrap();
+
+        assert!(s.apps.requests().is_empty());
+        assert!(file_names(s.dir.path()).is_empty());
+    }
+
+    #[test]
+    fn r30_parking_a_parked_window_again_writes_nothing_and_keeps_its_entry() {
+        let mut s = Setup::new(2);
+        let tile = s.frame(wid(1));
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let on_disk = fs::read(s.journal_path()).unwrap();
+        let txid = s.reactor.windows[&wid(1)].last_sent_txid;
+
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(txid, s.reactor.windows[&wid(1)].last_sent_txid);
+        assert_eq!(on_disk, fs::read(s.journal_path()).unwrap());
+        assert_eq!(vec![entry(1, 1, tile)], s.journal_on_disk());
+    }
+
+    #[test]
+    #[ignore = "bug: a window listed twice in one batch gets two park writes and two entries"]
+    fn r30_a_window_listed_twice_in_one_batch_is_parked_once() {
+        let mut s = Setup::new(2);
+        let tile = s.frame(wid(1));
+
+        s.reactor.park_windows(&[wid(1), wid(1)]).unwrap();
+
+        let parked = rect(999., 999., tile.size.width, tile.size.height);
+        assert_eq!(vec![parked], frame_writes(&s.apps.requests(), wid(1)));
+        assert_eq!(vec![entry(1, 1, tile)], s.journal_on_disk());
+    }
+
+    #[test]
+    fn r30_a_batch_journals_and_parks_only_the_windows_it_can_park() {
+        let mut s = Setup::launching(vec![]);
+        let without_window_server_id = WindowInfo { sys_id: None, ..make_window(2) };
+        let on_no_screen = WindowInfo {
+            frame: rect(5000., 5000., 50., 50.),
+            ..make_window(3)
+        };
+        s.reactor.handle_events(
+            s.apps.make_app(1, vec![make_window(1), without_window_server_id, on_no_screen]),
+        );
+        s.reactor.handle_event(Event::StartupComplete);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+
+        s.reactor.park_windows(&[wid(1), wid(2), wid(3)]).unwrap();
+
+        let requests = s.apps.requests();
+        assert_eq!(
+            vec![rect(999., 999., 1000., 1000.)],
+            frame_writes(&requests, wid(1))
+        );
+        assert!(frame_writes(&requests, wid(2)).is_empty());
+        assert!(frame_writes(&requests, wid(3)).is_empty());
+        assert_eq!(vec![entry(1, 1, screen())], s.journal_on_disk());
+        assert_eq!(vec![wid(1)], s.parked_windows());
+    }
+
+    #[test]
+    fn r30_a_journal_that_cannot_replace_its_file_parks_none_of_the_batch() {
+        let mut s = Setup::new_on(wide_screen(), 3);
+        let tiles = [1, 2, 3].map(|idx| s.frame(wid(idx)));
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let state = |s: &Setup| {
+            [wid(2), wid(3)].map(|wid| {
+                let window = &s.reactor.windows[&wid];
+                (window.last_sent_txid, window.frame_monotonic)
+            })
+        };
+        let before = state(&s);
+        // A directory now stands where the journal file was.
+        fs::remove_file(s.journal_path()).unwrap();
+        fs::create_dir(s.journal_path()).unwrap();
+        fs::write(s.journal_path().join("in-the-way"), "").unwrap();
+
+        let result = s.reactor.park_windows(&[wid(2), wid(3)]);
+
+        assert!(result.is_err());
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(before, state(&s));
+        assert_eq!(vec![wid(1)], s.parked_windows());
+        assert_eq!(&[entry(1, 1, tiles[0])], s.reactor.journal.entries());
+        assert_eq!(
+            vec!["parked.json"],
+            file_names(s.dir.path()),
+            "no temporary file stays"
+        );
+        fs::remove_dir_all(s.journal_path()).unwrap();
+        s.reactor.park_windows(&[wid(2)]).unwrap();
+        assert_eq!(
+            vec![entry(1, 1, tiles[0]), entry(1, 2, tiles[1])],
+            s.journal_on_disk()
+        );
+    }
+
+    #[test]
+    fn h4_a_frame_read_from_before_the_park_is_ignored() {
+        let mut s = Setup::new(2);
+        let tile = s.frame(wid(1));
+        let tiles = s.tiles();
+        let before_park = s.reactor.windows[&wid(1)].last_sent_txid;
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        let park = s.apps.requests();
+
+        // The app reports a move it made before it got the park write.
+        s.reactor.handle_event(Event::WindowFrameChanged(
+            wid(1),
+            rect(20., 20., 500., 1000.),
+            before_park,
+            Requested(false),
+            None,
+        ));
+
+        let parked = rect(999., 999., tile.size.width, tile.size.height);
+        assert_eq!(parked, s.reactor.windows[&wid(1)].frame_monotonic);
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(tiles, s.tiles());
+        s.handle_requests(park);
+        s.reactor.unpark_windows(&[wid(1)]);
+        assert_eq!(vec![tile], frame_writes(&s.apps.requests(), wid(1)));
+    }
+
+    #[test]
+    fn h5_three_windows_of_one_size_when_one_is_parked_and_another_closes() {
+        let mut s = Setup::new_on(wide_screen(), 3);
+        assert_eq!(
+            vec![
+                (wid(1), rect(0., 0., 400., 1000.)),
+                (wid(2), rect(400., 0., 400., 1000.)),
+                (wid(3), rect(800., 0., 400., 1000.)),
+            ],
+            s.tiles()
+        );
+        s.reactor.park_windows(&[wid(2)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s.refresh_visible_windows();
+        let parked = rect(1199., 999., 400., 1000.);
+        assert_eq!(parked, s.frame(wid(2)));
+        assert_eq!(3, s.tiles().len(), "the parked window keeps its tile");
+
+        s.close(wid(3));
+
+        let left = rect(0., 0., 600., 1000.);
+        let right = rect(600., 0., 600., 1000.);
+        let requests = s.apps.requests();
+        assert_eq!(vec![left], frame_writes(&requests, wid(1)));
+        assert!(
+            frame_writes(&requests, wid(2)).is_empty(),
+            "the parked window stays in its corner"
+        );
+        s.handle_requests(requests);
+        s.refresh_visible_windows();
+        assert_eq!(vec![(wid(1), left), (wid(2), right)], s.tiles());
+        assert_eq!(left, s.frame(wid(1)));
+        assert_eq!(parked, s.frame(wid(2)));
+        assert_eq!(vec![wid(2)], s.parked_windows());
+        assert_eq!(
+            vec![entry(1, 2, rect(400., 0., 400., 1000.))],
+            s.journal_on_disk()
+        );
+    }
+
+    #[test]
+    fn h5_three_windows_of_one_size_when_the_parked_one_closes() {
+        let mut s = Setup::new_on(wide_screen(), 3);
+        s.reactor.park_windows(&[wid(2)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        s.close(wid(2));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s.refresh_visible_windows();
+
+        let left = rect(0., 0., 600., 1000.);
+        let right = rect(600., 0., 600., 1000.);
+        assert_eq!(vec![(wid(1), left), (wid(3), right)], s.tiles());
+        assert_eq!([left, right], [wid(1), wid(3)].map(|wid| s.frame(wid)));
+        assert!(s.reactor.parked.is_empty());
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    #[test]
+    #[ignore = "bug: unparking writes the pre-park frame instead of the current tile"]
+    fn h3_an_unparked_window_ends_at_its_current_tile() {
+        let mut s = Setup::new_on(wide_screen(), 3);
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        // While the window is parked, another window closes and its tile
+        // grows.
+        s.close(wid(3));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        s.reactor.unpark_windows(&[wid(1)]);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        let left = rect(0., 0., 600., 1000.);
+        let right = rect(600., 0., 600., 1000.);
+        assert_eq!(vec![(wid(1), left), (wid(2), right)], s.tiles());
+        assert_eq!([left, right], [wid(1), wid(2)].map(|wid| s.frame(wid)));
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    #[test]
+    fn r31_the_tolerance_is_16_points_for_each_edge_and_size() {
+        let mut s = Setup::new(2);
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s.reactor.unpark_windows(&[wid(1)]);
+        assert!(
+            s.reactor.parked.is_empty(),
+            "the unpark write clears the parked state"
+        );
+        let Some(Request::SetWindowFrame(_, target, txid)) =
+            s.apps.requests().into_iter().find(|request| {
+                matches!(request, Request::SetWindowFrame(request_wid, ..) if *request_wid == wid(1))
+            })
+        else {
+            panic!("no unpark write");
+        };
+        let echo = |dx: f64, dy: f64, dw: f64, dh: f64| {
+            Event::WindowFrameChanged(
+                wid(1),
+                rect(
+                    target.origin.x + dx,
+                    target.origin.y + dy,
+                    target.size.width + dw,
+                    target.size.height + dh,
+                ),
+                txid,
+                Requested(true),
+                None,
+            )
+        };
+
+        for off in [
+            echo(0., 17., 0., 0.),
+            echo(-17., 0., 0., 0.),
+            echo(0., 0., -17., 0.),
+            echo(0., 0., 0., -17.),
+        ] {
+            s.reactor.handle_event(off);
+            assert_eq!(1, s.journal_on_disk().len());
+        }
+        s.reactor.handle_event(echo(-16., 16., -16., -16.));
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    #[test]
+    fn r31_an_unpark_echo_that_arrives_after_the_window_is_parked_again_keeps_the_entry() {
+        let mut s = Setup::new(2);
+        let tile = s.frame(wid(1));
+        let parked = rect(999., 999., tile.size.width, tile.size.height);
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        s.reactor.unpark_windows(&[wid(1)]);
+        let unpark = s.apps.requests();
+        assert_eq!(vec![tile], frame_writes(&unpark, wid(1)));
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        let park = s.apps.requests();
+        assert_eq!(vec![parked], frame_writes(&park, wid(1)));
+
+        // The app answers the unpark write only after the second park.
+        s.handle_requests(unpark);
+        assert_eq!(vec![wid(1)], s.parked_windows());
+        assert_eq!(vec![entry(1, 1, tile)], s.journal_on_disk());
+        s.handle_requests(park);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(parked, s.frame(wid(1)));
+        assert_eq!(vec![entry(1, 1, tile)], s.journal_on_disk());
+    }
+
+    #[test]
+    fn r31_only_the_echo_of_the_latest_write_confirms_the_window_is_back() {
+        let mut s = Setup::new_on(wide_screen(), 3);
+        let tile = s.frame(wid(1));
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        s.reactor.unpark_windows(&[wid(1)]);
+        let unpark = s.apps.requests();
+        assert_eq!(vec![tile], frame_writes(&unpark, wid(1)));
+        // Before the app answers, another window closes and the layout writes
+        // a wider tile.
+        s.close(wid(3));
+        let wider = rect(0., 0., 600., 1000.);
+        let relayout = s.apps.requests();
+        assert_eq!(vec![wider], frame_writes(&relayout, wid(1)));
+
+        s.handle_requests(unpark);
+        assert_eq!(
+            vec![entry(1, 1, tile)],
+            s.journal_on_disk(),
+            "the echo of the unpark write is stale"
+        );
+        s.handle_requests(relayout);
+        assert!(s.journal_on_disk().is_empty());
+        assert_eq!(wider, s.frame(wid(1)));
+    }
+
+    #[test]
+    fn r31_the_entry_of_a_window_put_back_after_a_restart_goes_when_it_is_destroyed() {
+        let mut s = Setup::launching(vec![entry(1, 11, screen()), entry(2, 21, screen())]);
+        let wid = WindowId::new(1, 1);
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![window_at(11, rect(999., 999., 1000., 1000.))]));
+        assert_eq!(vec![screen()], frame_writes(&s.apps.requests(), wid));
+
+        // The window closes before it reports the frame.
+        s.close(wid);
+
+        assert_eq!(vec![(2, 21, screen())], summary(s.journal_on_disk()));
+    }
+
+    #[test]
+    fn r31_an_app_that_ends_takes_only_its_own_entries() {
+        let mut s = Setup::launching_on(wide_screen(), vec![]);
+        s.reactor.handle_events(s.apps.make_app(
+            1,
+            vec![
+                window_at(11, rect(100., 100., 50., 50.)),
+                window_at(12, rect(300., 100., 50., 50.)),
+            ],
+        ));
+        s.reactor
+            .handle_events(s.apps.make_app(2, vec![window_at(21, rect(500., 100., 50., 50.))]));
+        s.reactor.handle_event(Event::StartupComplete);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let other_app = WindowId::new(2, 1);
+        let all = [WindowId::new(1, 1), WindowId::new(1, 2), other_app];
+        let tiles = all.map(|wid| s.frame(wid));
+        s.reactor.park_windows(&all).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        s.reactor.handle_event(Event::ApplicationTerminated(1));
+        _ = s.apps.requests();
+        assert_eq!(3, s.journal_on_disk().len(), "the app thread hasn't ended yet");
+        s.reactor.handle_event(Event::ApplicationThreadTerminated(1));
+
+        assert_eq!(vec![(2, 21, tiles[2])], summary(s.journal_on_disk()));
+        assert_eq!(vec![other_app], s.parked_windows());
+    }
+
+    #[test]
+    fn r34_entries_of_a_pid_another_app_has_now_are_dropped_and_its_window_is_tiled() {
+        let journal_frame = rect(100., 100., 300., 300.);
+        let mut entries = vec![entry(1, 11, journal_frame), entry(1, 12, journal_frame)];
+        for reused in &mut entries {
+            reused.bundle_id = Some("com.example.other".into());
+        }
+        entries.push(entry(2, 21, journal_frame));
+        let mut s = Setup::launching(entries);
+
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![window_at(11, rect(999., 999., 1000., 1000.))]));
+
+        assert_eq!(
+            vec![screen()],
+            frame_writes(&s.apps.requests(), WindowId::new(1, 1))
+        );
+        assert_eq!(vec![(2, 21, journal_frame)], summary(s.journal_on_disk()));
+    }
+
+    #[test]
+    fn r34_a_window_is_put_back_once_however_often_its_app_reports_it() {
+        let corner = rect(999., 999., 1000., 1000.);
+        let mut s = Setup::launching(vec![entry(1, 11, screen())]);
+        let wid = WindowId::new(1, 1);
+        let rediscover = |s: &mut Setup| {
+            for _ in 0..3 {
+                s.reactor.handle_event(Event::WindowsDiscovered {
+                    pid: 1,
+                    new: vec![],
+                    known_visible: vec![wid],
+                });
+            }
+        };
+
+        s.reactor.handle_events(s.apps.make_app(1, vec![window_at(11, corner)]));
+        let restore = s.apps.requests();
+        assert_eq!(vec![screen()], frame_writes(&restore, wid));
+        rediscover(&mut s);
+        s.reactor.handle_event(Event::StartupComplete);
+        rediscover(&mut s);
+        assert!(frame_writes(&s.apps.requests(), wid).is_empty());
+        s.handle_requests(restore);
+        assert!(s.journal_on_disk().is_empty());
+
+        // Parked again in this session, the window stays parked.
+        s.reactor.park_windows(&[wid]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        rediscover(&mut s);
+        assert!(frame_writes(&s.apps.requests(), wid).is_empty());
+        assert_eq!(corner, s.frame(wid));
+        assert_eq!(vec![wid], s.parked_windows());
+        assert_eq!(vec![(1, 11, screen())], summary(s.journal_on_disk()));
+    }
+
+    #[test]
+    #[ignore = "bug: StartupComplete drops the entries of a running app that registers late"]
+    fn r34_an_app_whose_thread_registers_after_startup_complete_keeps_its_entries() {
+        let elsewhere = rect(100., 100., 300., 300.);
+        let mut s = Setup::launching(vec![entry(1, 11, screen()), entry(2, 21, elsewhere)]);
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![window_at(11, rect(999., 999., 1000., 1000.))]));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        // App 2 is running, but its app thread reaches the reactor only after
+        // startup is complete.
+        s.reactor.handle_event(Event::StartupComplete);
+        assert_eq!(vec![(2, 21, elsewhere)], summary(s.journal_on_disk()));
+        s.reactor
+            .handle_events(s.apps.make_app(2, vec![window_at(21, rect(999., 999., 300., 300.))]));
+        assert_eq!(
+            Some(&elsewhere),
+            frame_writes(&s.apps.requests(), WindowId::new(2, 1)).first()
+        );
+    }
+
+    #[test]
+    fn r34_an_unreadable_journal_puts_nothing_back_and_a_new_one_starts() {
+        let contents: &[u8] = br#"{ "version": 2, "entries": [ { "pid": 1, "bundle_id": "com.testapp1", "window_server_id": 11, "title": "Window1", "frame": { "x": 100, "y": 100, "w": 300, "h": 300 } } ] }"#;
+        let mut s = Setup::launching_with_file(contents);
+        let names = file_names(s.dir.path());
+        assert_eq!(1, names.len(), "{names:?}");
+        assert!(
+            names[0].starts_with("parked.unreadable-") && names[0].ends_with(".json"),
+            "{names:?}"
+        );
+        assert_eq!(contents, fs::read(s.dir.path().join(&names[0])).unwrap());
+        let wid = WindowId::new(1, 1);
+
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![window_at(11, rect(999., 999., 300., 300.))]));
+        s.reactor.handle_event(Event::StartupComplete);
+
+        let requests = s.apps.requests();
+        assert_eq!(vec![screen()], frame_writes(&requests, wid));
+        s.handle_requests(requests);
+        s.reactor.park_windows(&[wid]).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(s.journal_path()).unwrap()).unwrap();
+        assert_eq!(serde_json::json!(1), written["version"]);
+        assert_eq!(vec![(1, 11, screen())], summary(s.journal_on_disk()));
+        assert_eq!(
+            vec!["parked.json".to_string(), names[0].clone()],
+            file_names(s.dir.path())
+        );
+    }
+
+    #[test]
+    fn without_parking_no_journal_file_is_ever_created() {
+        let mut s = Setup::launching(vec![]);
+        s.reactor.handle_events(s.apps.make_app(1, make_windows(3)));
+        s.reactor
+            .handle_events(s.apps.make_app(2, vec![window_at(21, rect(700., 100., 50., 50.))]));
+        s.reactor.handle_event(Event::StartupComplete);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        s.close(wid(3));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        s.refresh_visible_windows();
+        s.reactor.handle_event(Event::ApplicationTerminated(2));
+        _ = s.apps.requests();
+        s.reactor.handle_event(Event::ApplicationThreadTerminated(2));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert!(file_names(s.dir.path()).is_empty());
+        assert!(s.reactor.parked.is_empty());
+        assert!(s.reactor.journal.entries().is_empty());
     }
 }
