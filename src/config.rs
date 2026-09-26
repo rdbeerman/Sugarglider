@@ -24,6 +24,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::actor::wm_controller::WmCommand;
 use crate::model::LayoutKind;
+use crate::ui::preferences_json::command_json;
 
 pub fn data_dir() -> PathBuf {
     dirs::home_dir().unwrap().join(".glide")
@@ -572,8 +573,6 @@ fn write_preferences_to_path(
     use annotate_snippets::Renderer;
     use toml_edit::{DocumentMut, value};
 
-    use crate::ui::preferences_json::command_json;
-
     let existing = match fs::read_to_string(path) {
         Ok(existing) => existing,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -587,7 +586,7 @@ fn write_preferences_to_path(
     };
     // toml_edit reads TOML 1.0 and the config reader TOML 1.1, so a file can
     // pass one and fail the other.
-    Config::parse(&existing)
+    let current_config = Config::parse(&existing)
         .map_err(|e| has_error(format_toml_error(e, &existing, path, Renderer::plain())))?;
     let mut doc = existing
         .parse::<DocumentMut>()
@@ -661,14 +660,10 @@ fn write_preferences_to_path(
 
     // Update [keys] section
     if !prefs.hotkeys.is_empty() {
-        let mut keys_table = toml_edit::Table::new();
-        for (hotkey, cmd) in prefs.bindings() {
-            keys_table[&hotkey.to_string()] = json_to_toml_value(&command_json(&cmd));
-        }
-
-        if !keys_table.is_empty() {
-            doc["keys"] = toml_edit::Item::Table(keys_table);
-        }
+        let file_keys = keys_in_file(&existing)?;
+        let default_keys = current_config.settings.default_keys;
+        let entries = keys_entries(&prefs.bindings(), default_keys, &file_keys);
+        set_keys_table(&mut doc, &file_keys, entries);
     }
 
     // Ensure parent directory exists
@@ -682,6 +677,84 @@ fn write_preferences_to_path(
     tmp.persist(path)?;
 
     Ok(())
+}
+
+/// The entries under `[keys]` in a config file, by the key as the file
+/// spells it, each with its value as JSON.
+fn keys_in_file(file: &str) -> anyhow::Result<FxHashMap<String, serde_json::Value>> {
+    let keys = toml::from_str::<ConfigPartial>(file)?.keys.unwrap_or_default();
+    let keys = keys.into_iter().map(|(key, entry)| Ok((key, serde_json::to_value(entry)?)));
+    keys.collect()
+}
+
+/// The `[keys]` entries that bind `bindings`, as JSON. With `default_keys`,
+/// each default key that isn't bound is disabled. A key that `file_keys`
+/// disables stays disabled unless it is bound.
+fn keys_entries(
+    bindings: &[(Hotkey, WmCommand)],
+    default_keys: bool,
+    file_keys: &FxHashMap<String, serde_json::Value>,
+) -> Vec<(Hotkey, serde_json::Value)> {
+    let disable = serde_json::to_value(Disabled::Disable).unwrap();
+    let is_bound = |hotkey: &Hotkey| bindings.iter().any(|(bound, _)| bound == hotkey);
+
+    let mut entries: Vec<(Hotkey, serde_json::Value)> = Vec::new();
+    for (hotkey, cmd) in bindings {
+        // A key bound twice keeps the last binding, as in a TOML table.
+        entries.retain(|(entry, _)| entry != hotkey);
+        entries.push((*hotkey, command_json(cmd)));
+    }
+    let disabled_in_file = file_keys
+        .iter()
+        .filter(|(_, value)| **value == disable)
+        .filter_map(|(key, _)| Hotkey::from_str(key).ok());
+    let defaults = if default_keys {
+        Config::default().keys
+    } else {
+        Vec::new()
+    };
+    for hotkey in disabled_in_file.chain(defaults.iter().map(|(hotkey, _)| *hotkey)) {
+        if !is_bound(&hotkey) && !entries.iter().any(|(entry, _)| *entry == hotkey) {
+            entries.push((hotkey, disable.clone()));
+        }
+    }
+    entries
+}
+
+/// Makes the `[keys]` table hold exactly `entries`. An entry that the table
+/// already holds keeps its spelling and comments.
+fn set_keys_table(
+    doc: &mut toml_edit::DocumentMut,
+    file_keys: &FxHashMap<String, serde_json::Value>,
+    mut entries: Vec<(Hotkey, serde_json::Value)>,
+) {
+    if !doc.contains_key("keys") && entries.is_empty() {
+        return;
+    }
+    let keys = doc.entry("keys").or_insert(toml_edit::table());
+    let Some(table) = keys.as_table_like_mut() else {
+        return;
+    };
+    let spellings: Vec<String> = table.iter().map(|(key, _)| key.to_owned()).collect();
+    for key in spellings {
+        let hotkey = Hotkey::from_str(&key).ok();
+        let Some(i) = entries.iter().position(|(entry, _)| Some(*entry) == hotkey) else {
+            table.remove(&key);
+            continue;
+        };
+        let (_, value) = entries.remove(i);
+        if file_keys.get(&key) != Some(&value) {
+            let item = table.get_mut(&key).unwrap();
+            let mut new_item = json_to_toml_value(&value);
+            if let (Some(old), Some(new)) = (item.as_value(), new_item.as_value_mut()) {
+                *new.decor_mut() = old.decor().clone();
+            }
+            *item = new_item;
+        }
+    }
+    for (hotkey, value) in entries {
+        table.insert(&hotkey.to_string(), json_to_toml_value(&value));
+    }
 }
 
 /// Convert a JSON value to a TOML value.
@@ -1522,6 +1595,52 @@ mod tests {
         write_preferences_to_path(&prefs, &path).unwrap();
         let saved = Config::load(Some(&path)).unwrap();
         assert_eq!(sorted_bindings(&expected), sorted_bindings(&saved));
+    }
+
+    /// With `default_keys = true`, the "disable" entries and their comments
+    /// stay when Preferences saves, and a default binding moved to another
+    /// key doesn't come back on its old key.
+    #[test]
+    fn preferences_keep_disabled_keys_with_default_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        let disabled = [
+            "# No tabs.",
+            "\"Alt + T\" = \"disable\" # Alt + S still stacks.",
+            "\"Alt + W\" = \"disable\"",
+        ];
+        let file = format!(
+            "[settings]\ndefault_keys = true\n\n[keys]\n{}\n",
+            disabled.join("\n")
+        );
+        std::fs::write(&path, file).unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        let alt_t = Hotkey::from_str("Alt + T").unwrap();
+        let alt_s = Hotkey::from_str("Alt + S").unwrap();
+        assert!(!config.keys.iter().any(|(hotkey, _)| *hotkey == alt_t));
+
+        let mut prefs = preferences_for(&config);
+        prefs.animate = !prefs.animate;
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(sorted_bindings(&config), sorted_bindings(&saved), "{written}");
+        for line in disabled {
+            assert!(written.contains(line), "{written}");
+        }
+
+        rebind(&mut prefs, "⌥S", "⌥G");
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let saved = Config::load(Some(&path)).unwrap();
+        let running = prefs.apply_to_config(&config);
+        assert_eq!(sorted_bindings(&running), sorted_bindings(&saved), "{written}");
+        assert!(!saved.keys.iter().any(|(hotkey, _)| [alt_s, alt_t].contains(hotkey)));
+        for line in disabled {
+            assert!(written.contains(line), "{written}");
+        }
     }
 
     fn leaf_keys(prefix: &str, table: &toml::Table, keys: &mut Vec<String>) {
