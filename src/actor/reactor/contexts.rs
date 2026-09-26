@@ -87,14 +87,21 @@ impl Reactor {
         self.shown_with(space, self.contexts.active())
     }
 
-    /// Whether the window may have a tile in the layout the Space shows.
-    /// Under Everything every window may; under a context only its members
-    /// may.
-    pub(super) fn may_tile(&self, space: SpaceId, wid: WindowId) -> bool {
+    /// Whether the window is one the Space shows (R13). Under Everything
+    /// every window is; under a context only its members are.
+    pub(super) fn shows_on(&self, space: SpaceId, wid: WindowId) -> bool {
         match self.shown_context(space) {
             ContextKey::Everything => true,
             key => self.contexts.is_member(key, wid),
         }
+    }
+
+    /// Whether the window may reach the layout the Space shows (H2): be
+    /// added to it, change Space in it, or take focus in it from the mouse.
+    /// A parked window may not, whatever its geometry says. Under a context
+    /// only the context's members may (L4).
+    pub(super) fn reaches_layout(&self, space: SpaceId, wid: WindowId) -> bool {
+        !self.parked.contains_key(&wid) && self.shows_on(space, wid)
     }
 
     /// The visible screens and the contexts they show when `active` is the
@@ -4256,6 +4263,75 @@ mod tests {
         assert_eq!(right(), s.frame(wid(2)));
         assert_eq!(vec![wid(3)], s.parked());
         assert_eq!(vec![entry(3, rect(1400., 100., 50., 50.))], s.journal_on_disk());
+    }
+
+    /// H2, L4. A parked window that becomes visible again, as the window
+    /// server can report, gets no tile in the layout the Space shows.
+    #[test]
+    fn h2_a_parked_window_that_becomes_visible_gets_no_tile() {
+        let mut s = Setup::new(3);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        s.switch(c);
+        assert_eq!(vec![wid(3)], s.parked());
+        let in_c = s.tiles();
+
+        s.reactor.handle_event(Event::WindowBecameVisible(wid(3)));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(in_c, s.tiles());
+        assert_eq!(in_c, s.frames(&[wid(1), wid(2)]));
+        assert_eq!(vec![wid(3)], s.parked());
+        s.switch(ContextKey::Everything);
+        s.switch(c);
+        assert_eq!(in_c, s.tiles());
+    }
+
+    /// H2, L4, L10. Under a context, a window that isn't a member and isn't
+    /// parked, here because the journal couldn't be written, gets no tile on
+    /// the display its app moves it to, and the mouse over it takes no
+    /// focus.
+    #[test]
+    fn h2_a_non_member_moved_to_another_display_gets_no_tile_there() {
+        let mut s = two_displays_two_apps();
+        let space2 = SpaceId::new(2);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        s.reactor.contexts.switch_to(c).unwrap();
+        let failing = FailingWrites::start(s.dir.path());
+        let all = four_windows();
+        let event = displays(
+            &s,
+            vec![screen(), right()],
+            vec![Some(space()), Some(space2)],
+            &all,
+        );
+        s.reactor.handle_event(event);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        drop(failing);
+        assert!(s.parked().is_empty());
+        assert_eq!(vec![(wid(1), screen())], s.tiles_on(space(), screen()));
+        assert_eq!(vec![(wid(2), right())], s.tiles_on(space2, right()));
+        let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
+        s.reactor.raise_manager_tx = raise_manager_tx;
+
+        // App 2 moves its window 1 onto the right display.
+        let moved = WindowId::new(2, 1);
+        let frame = rect(1500., 100., 600., 1000.);
+        s.apps.windows.get_mut(&moved).unwrap().frame = frame;
+        let txid = s.reactor.windows[&moved].last_sent_txid;
+        s.reactor.handle_event(Event::WindowFrameChanged(
+            moved,
+            frame,
+            txid,
+            Requested(false),
+            None,
+        ));
+        s.reactor.handle_event(Event::MouseMovedOverWindow(WindowServerId::new(21), None));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(vec![(wid(1), screen())], s.tiles_on(space(), screen()));
+        assert_eq!(vec![(wid(2), right())], s.tiles_on(space2, right()));
+        assert_eq!(frame, s.frame(moved));
+        assert!(raise_manager_rx.try_recv().is_err());
     }
 
     /// R32, R31. Showing Everything puts the windows back, and a quit comes

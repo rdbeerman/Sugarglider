@@ -783,6 +783,7 @@ impl Reactor {
                     && let Some(window) = self.windows.get(&wid)
                     && let Some(frame) = self.layout_frame(wid)
                     && let Some(space) = self.best_space_for_window(&frame)
+                    && self.reaches_layout(space, wid)
                     && let Some(info) = self.layout_window_info(wid)
                 {
                     // Check if there's already a visible window from the same app
@@ -790,17 +791,16 @@ impl Reactor {
                     // add - let the existing window represent this position.
                     // Parked windows share a corner without being tabs.
                     let frame_key = Self::frame_key(&window.frame_monotonic);
-                    let dominated_by_existing = !self.parked.contains_key(&wid)
-                        && self.visible_windows.iter().any(|wsid| {
-                            self.window_ids.get(wsid).is_some_and(|other_wid| {
-                                *other_wid != wid
-                                    && other_wid.pid == wid.pid
-                                    && !self.parked.contains_key(other_wid)
-                                    && self.windows.get(other_wid).is_some_and(|other_window| {
-                                        Self::frame_key(&other_window.frame_monotonic) == frame_key
-                                    })
-                            })
-                        });
+                    let dominated_by_existing = self.visible_windows.iter().any(|wsid| {
+                        self.window_ids.get(wsid).is_some_and(|other_wid| {
+                            *other_wid != wid
+                                && other_wid.pid == wid.pid
+                                && !self.parked.contains_key(other_wid)
+                                && self.windows.get(other_wid).is_some_and(|other_window| {
+                                    Self::frame_key(&other_window.frame_monotonic) == frame_key
+                                })
+                        })
+                    });
                     if !dominated_by_existing {
                         self.send_layout_event(LayoutEvent::WindowAdded(space, wid, info));
                     }
@@ -854,7 +854,7 @@ impl Reactor {
                     // over, even if we never saw the MouseUp event.
                     self.resizing_window = None;
                 }
-                if !requested.0 && !self.own_frame_reaches_layout(wid) {
+                if !requested.0 && self.parked.contains_key(&wid) {
                     debug!(
                         ?wid,
                         ?new_frame,
@@ -1010,9 +1010,13 @@ impl Reactor {
                     && old != new
                     && let Some(info) = self.layout_window_info(wid)
                 {
+                    // The window leaves the old Space's layouts whether or not
+                    // the new Space's layout may take it (L10).
+                    let added =
+                        self.screens[new].space.filter(|&space| self.reaches_layout(space, wid));
                     self.send_layout_event(LayoutEvent::WindowSpaceChanged {
                         wid,
-                        added: self.screens[new].space,
+                        added,
                         removed: self.screens[old].space,
                         info,
                         contexts_exist: self.contexts_exist(),
@@ -1306,14 +1310,14 @@ impl Reactor {
             }
             Event::MouseMovedOverWindow(wsid, key_focus_pid) => {
                 let Some(&wid) = self.window_ids.get(&wsid) else { return };
-                if !self.own_frame_reaches_layout(wid) {
-                    return;
-                }
                 let Some(window) = self.windows.get(&wid) else { return };
                 let Some(to_space) = self.best_space_for_window(&window.frame_monotonic) else {
                     // The space is disabled.
                     return;
                 };
+                if !self.reaches_layout(to_space, wid) {
+                    return;
+                }
                 let current_main = match (self.main_window_space(), self.main_window()) {
                     (Some(space), Some(id)) => Some((space, id)),
                     _ => None,
@@ -1620,12 +1624,16 @@ impl Reactor {
             let Some(space) = self.best_space_for_window(&layout_info.frame) else {
                 continue;
             };
-            if !self.may_tile(space, wid) {
+            // A parked window stays in the list of a layout it belongs to, at
+            // its frame from before parking, so that parking never removes
+            // its node (L5).
+            let parked = self.parked.contains_key(&wid);
+            if !(self.reaches_layout(space, wid) || parked && self.shows_on(space, wid)) {
                 continue;
             }
             // Tabs in the same window group will have the same visual frame.
             // Parked windows share a corner without being tabs.
-            if self.own_frame_reaches_layout(wid) {
+            if !parked {
                 let frame_key = Self::frame_key(&window.frame_monotonic);
                 // If we've already seen a window with this frame, skip this one
                 // unless it's the main window (active tab).
@@ -1637,7 +1645,7 @@ impl Reactor {
                     // and add this one instead.
                     if let Some(windows) = app_windows.get_mut(&space) {
                         windows.retain(|(other, info)| {
-                            !self.own_frame_reaches_layout(*other)
+                            self.parked.contains_key(other)
                                 || Self::frame_key(&info.frame) != frame_key
                         });
                     }
@@ -1735,14 +1743,6 @@ impl Reactor {
         // For now we track all windows in the reactor and let the LayoutManager
         // decide what to keep.
         true
-    }
-
-    /// Whether the frame a window reports, and the mouse moving over it, reach
-    /// the layout and `frame_monotonic`. For a parked window they don't: its
-    /// known frame stays the parking corner, whatever its app reports, and the
-    /// layout sees it with the frame it had before it was parked.
-    fn own_frame_reaches_layout(&self, wid: WindowId) -> bool {
-        !self.parked.contains_key(&wid)
     }
 
     /// Returns the frame key (rounded to integers) for a window frame.

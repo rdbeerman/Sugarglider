@@ -2220,9 +2220,14 @@ mod tests {
         reactor.update_active_screen();
         assert_eq!(Some(0), reactor.active_screen_idx);
 
-        // The layout loses the window, and the window shows again.
+        // The layout loses the window, and the window shows again. A parked
+        // window is never added to a layout, but the window list takes it back
+        // to the Space it had before parking.
         reactor.send_layout_event(LayoutEvent::WindowRemoved(wid(1)));
         reactor.handle_event(Event::WindowBecameVisible(wid(1)));
+        apps.simulate_until_quiet(&mut reactor);
+        assert_eq!([vec![], vec![(wid(2), right)]], tiles(&reactor));
+        reactor.update_visible_windows();
         apps.simulate_until_quiet(&mut reactor);
         assert_eq!([vec![(wid(1), middle)], vec![(wid(2), right)]], tiles(&reactor));
 
