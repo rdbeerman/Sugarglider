@@ -213,10 +213,9 @@ impl Reactor {
             window.parked = parked;
             window.own = wid.pid == own_pid;
             window.untracked = self.layout.is_untracked(&info);
-            // Minimized windows, windows of hidden apps, windows on Spaces
-            // nobody sees, and windows on Spaces Sugarglider doesn't manage
-            // count as unseen, and the plan never parks them.
-            window.unseen_space = !visible;
+            // Windows on Spaces Sugarglider doesn't manage count as
+            // invisible too, and the plan never parks them.
+            window.invisible = !visible;
             input.screens[slot].windows.push(window);
         }
         input

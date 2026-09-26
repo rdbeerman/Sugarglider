@@ -1143,8 +1143,8 @@ pub struct SwitchScreen {
     /// The screen's active context after the switch.
     pub active: ContextKey,
     /// The windows on the screen's visible Space, and the windows that are
-    /// only on its other Spaces, with `unseen_space` set. Every parked
-    /// window must be listed, so that showing Everything puts each one back.
+    /// only on its other Spaces, with `invisible` set. Every parked window
+    /// must be listed, so that showing Everything puts each one back.
     pub windows: Vec<SwitchWindow>,
 }
 
@@ -1155,13 +1155,12 @@ pub struct SwitchWindow {
     /// The named contexts that hold the window.
     pub contexts: Vec<ContextId>,
     pub pinned: bool,
-    pub minimized: bool,
     /// The layout manager doesn't track the window.
     pub untracked: bool,
-    /// The user hid the window's app.
-    pub app_hidden: bool,
-    /// The window is only on Spaces nobody can see.
-    pub unseen_space: bool,
+    /// The window isn't in the reactor's set of visible windows: it is
+    /// minimized, the user hid its app, or it is only on Spaces nobody can
+    /// see.
+    pub invisible: bool,
     pub parked: bool,
     /// The window belongs to Sugarglider.
     pub own: bool,
@@ -1181,7 +1180,7 @@ impl SwitchWindow {
 
     /// Whether the user can see and use the window, and Sugarglider may move it.
     fn in_play(&self) -> bool {
-        !(self.own || self.untracked || self.minimized || self.app_hidden || self.unseen_space)
+        !(self.own || self.untracked || self.invisible)
     }
 }
 
@@ -1210,8 +1209,8 @@ pub struct SwitchPlan {
 /// Everything that is every parked window in the input, which is how
 /// showing Everything, quitting, and turning Sugarglider off restore windows
 /// (R27, R32, R33). The others are parked, except Sugarglider's own windows,
-/// untracked and minimized windows, windows of hidden apps, and windows on
-/// Spaces nobody can see. Windows that are parked already stay parked. The
+/// untracked windows, and windows that aren't in the reactor's set of visible
+/// windows. Windows that are parked already stay parked. The
 /// focus goes to the most recently focused window that shows and that the
 /// user can see.
 pub fn plan_switch(input: &SwitchInput) -> SwitchPlan {
@@ -1243,10 +1242,8 @@ impl Contexts {
             wid,
             contexts: self.contexts_of(wid),
             pinned: self.is_pinned(wid),
-            minimized: false,
             untracked: false,
-            app_hidden: false,
-            unseen_space: false,
+            invisible: false,
             parked: false,
             own: false,
             last_focus: self.last_focus(wid),
@@ -2189,10 +2186,8 @@ mod tests {
             wid,
             contexts: contexts.to_vec(),
             pinned: false,
-            minimized: false,
             untracked: false,
-            app_hidden: false,
-            unseen_space: false,
+            invisible: false,
             parked: false,
             own: false,
             last_focus: None,
@@ -2287,18 +2282,8 @@ mod tests {
             },
             SwitchWindow {
                 last_focus: Some(4),
-                minimized: true,
+                invisible: true,
                 ..member_of(wid(1, 4), &[A])
-            },
-            SwitchWindow {
-                last_focus: Some(5),
-                app_hidden: true,
-                ..member_of(wid(1, 5), &[A])
-            },
-            SwitchWindow {
-                last_focus: Some(6),
-                unseen_space: true,
-                ..member_of(wid(1, 6), &[A])
             },
         ];
         let plan = plan_switch(&one_screen(ContextKey::Named(A), windows));
@@ -2338,7 +2323,7 @@ mod tests {
     }
 
     #[test]
-    fn r14_never_parks_own_untracked_minimized_hidden_or_unseen_windows() {
+    fn r14_never_parks_own_untracked_or_invisible_windows() {
         let windows = vec![
             SwitchWindow {
                 own: true,
@@ -2349,21 +2334,13 @@ mod tests {
                 ..member_of(wid(1, 2), &[])
             },
             SwitchWindow {
-                minimized: true,
+                invisible: true,
                 ..member_of(wid(1, 3), &[])
             },
-            SwitchWindow {
-                app_hidden: true,
-                ..member_of(wid(1, 4), &[])
-            },
-            SwitchWindow {
-                unseen_space: true,
-                ..member_of(wid(1, 5), &[])
-            },
-            member_of(wid(1, 6), &[]),
+            member_of(wid(1, 4), &[]),
         ];
         let plan = plan_switch(&one_screen(ContextKey::Named(A), windows));
-        assert_eq!(plan.park, vec![wid(1, 6)]);
+        assert_eq!(plan.park, vec![wid(1, 4)]);
     }
 
     #[test]
@@ -2431,7 +2408,7 @@ mod tests {
             },
             SwitchWindow {
                 parked: true,
-                minimized: true,
+                invisible: true,
                 ..member_of(wid(1, 4), &[])
             },
             SwitchWindow {
@@ -2939,7 +2916,7 @@ mod tests {
         let plan = plan_switch(&one_screen(
             ContextKey::Named(A),
             vec![SwitchWindow {
-                unseen_space: true,
+                invisible: true,
                 ..stray.clone()
             }],
         ));
@@ -3087,16 +3064,8 @@ mod tests {
                 ..member_of(wid(1, 2), &[A])
             },
             SwitchWindow {
-                minimized: true,
+                invisible: true,
                 ..member_of(wid(1, 3), &[A])
-            },
-            SwitchWindow {
-                app_hidden: true,
-                ..member_of(wid(1, 4), &[A])
-            },
-            SwitchWindow {
-                unseen_space: true,
-                ..member_of(wid(1, 5), &[A])
             },
         ];
         for active in [ContextKey::Unsorted, ContextKey::Named(B)] {
@@ -4003,7 +3972,7 @@ mod tests {
                         },
                         SwitchWindow {
                             parked: true,
-                            unseen_space: true,
+                            invisible: true,
                             last_focus: Some(9),
                             ..member_of(wid(1, 2), &[B])
                         },
@@ -4014,12 +3983,12 @@ mod tests {
                     windows: vec![
                         SwitchWindow {
                             parked: true,
-                            unseen_space: true,
+                            invisible: true,
                             ..member_of(wid(2, 1), &[])
                         },
                         SwitchWindow {
                             parked: true,
-                            minimized: true,
+                            invisible: true,
                             ..member_of(wid(2, 2), &[A])
                         },
                         SwitchWindow {
@@ -4065,19 +4034,19 @@ mod tests {
         assert_eq!(cx.focus_target(music.wid), named(b));
     }
 
-    /// R27: Everything puts back every parked window, including ones on
-    /// Spaces nobody sees, windows of hidden apps, and pinned ones.
+    /// R27: Everything puts back every parked window, including ones that
+    /// aren't in the visible-window set and pinned ones.
     #[test]
     fn r27_everything_puts_back_parked_windows_in_any_state() {
         let windows = vec![
             SwitchWindow {
                 parked: true,
-                unseen_space: true,
+                invisible: true,
                 ..member_of(wid(1, 1), &[A])
             },
             SwitchWindow {
                 parked: true,
-                app_hidden: true,
+                invisible: true,
                 ..member_of(wid(1, 2), &[])
             },
             SwitchWindow {
