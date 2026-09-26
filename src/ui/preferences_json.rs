@@ -567,9 +567,9 @@ fn describe_context_command(cmd: &ContextCommand) -> (String, String, String, u3
         ContextCommand::RemoveRecord { context, record } => {
             let (context, id, order) = describe_context_ref(context);
             (
-                format!("Forget member record {record} of {context}"),
+                format!("Forget member record {} of {context}", record.record),
                 category,
-                format!("remove_record_{id}"),
+                format!("remove_record_{id}_{}", record.record),
                 180 + order,
             )
         }
@@ -806,6 +806,7 @@ fn group_mode_name(orientation: &Orientation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::reactor::RecordRef;
 
     #[test]
     fn test_preferences_json_roundtrip() {
@@ -938,7 +939,11 @@ mod tests {
                 "Ctrl + Alt + KeyF",
                 ContextCommand::RemoveRecord {
                     context: ContextRef::Id(id),
-                    record: 0,
+                    record: RecordRef {
+                        record: 0,
+                        app: "Mail".into(),
+                        title: "Inbox".into(),
+                    },
                 },
             ),
         ];
@@ -963,7 +968,7 @@ mod tests {
                 "delete_context_3",
                 "move_window_to_context_name_Comms",
                 "previous_context",
-                "remove_record_id_7",
+                "remove_record_id_7_0",
                 "remove_window_from_context",
                 "set_context_number_name_Comms",
                 "show_everything",

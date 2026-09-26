@@ -10,9 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use sugarglider::actor::contexts_snapshot::{ContextsSnapshot, MemberSummary, RequestId, Scope};
-use sugarglider::actor::reactor::{ContextCommand, ContextRef};
+use sugarglider::actor::reactor::{ContextCommand, ContextRef, RecordRef};
 use sugarglider::actor::server::{ContextRequest, Request, Response};
-use sugarglider::model::contexts::ContextKey;
+use sugarglider::model::contexts::{ContextError, ContextKey};
 use sugarglider::sys::message_port::SendError;
 
 /// What the command says when the server replies with nothing, which is how
@@ -140,6 +140,7 @@ fn execute<T: Transport>(
 ) -> Result<String, String> {
     let id = new_request_id();
     let run = |command| ContextRequest::Run(id, command);
+    let mut transport = connect().ok_or("Sugarglider isn't running.")?;
     let request = match command {
         CmdContext::List(_) => ContextRequest::List,
         CmdContext::Current(_) => ContextRequest::Current,
@@ -160,12 +161,10 @@ fn execute<T: Transport>(
             number: check_number(*number)?,
         }),
         CmdContext::Pin => run(ContextCommand::ToggleWindowPinned),
-        CmdContext::Forget { query, record } => run(ContextCommand::RemoveRecord {
-            context: parse_query(query)?,
-            record: *record,
-        }),
+        CmdContext::Forget { query, record } => {
+            run(forget_command(&mut transport, query, *record)?)
+        }
     };
-    let mut transport = connect().ok_or("Sugarglider isn't running.")?;
     match (send(&mut transport, request)?, command) {
         (
             Response::Contexts(snapshot),
@@ -193,6 +192,43 @@ fn execute<T: Transport>(
         (Response::Error(reason), _) => Err(reason),
         (response, _) => Err(unexpected(&response)),
     }
+}
+
+/// The command that removes the record at `record` of the context that
+/// `query` names. It reads the snapshot first, so the command carries the
+/// record's app and title, which the reactor checks: a list that shifted
+/// since the user read it can't remove another record. A record whose
+/// window is open is refused here.
+fn forget_command(
+    transport: &mut impl Transport,
+    query: &Query,
+    record: usize,
+) -> Result<ContextCommand, String> {
+    let snapshot = match send(transport, ContextRequest::List)? {
+        Response::Contexts(snapshot) => snapshot,
+        Response::Error(reason) => return Err(reason),
+        response => return Err(unexpected(&response)),
+    };
+    let reference = parse_query(query)?;
+    let key = snapshot.resolve(reference.query()).map_err(|err| err.to_string())?;
+    let ContextKey::Named(id) = key else {
+        return Err("Only a named context has member records".to_string());
+    };
+    let member = snapshot
+        .get(id)
+        .and_then(|context| context.members.get(record))
+        .ok_or_else(|| ContextError::NoSuchRecord.to_string())?;
+    if member.window.is_some() {
+        return Err("The member's window is open; remove the window instead".to_string());
+    }
+    Ok(ContextCommand::RemoveRecord {
+        context: ContextRef::Id(id),
+        record: RecordRef {
+            record,
+            app: member.app.clone(),
+            title: member.title.clone(),
+        },
+    })
 }
 
 /// A request id that another run of the command is unlikely to pick: the
@@ -473,11 +509,13 @@ mod tests {
         }
     }
 
-    /// A server that answers every request with the same bytes, except
-    /// that it answers each ask for a command's result with the next of
-    /// `results`, and then with the last one again.
+    /// A server that answers every request with the same bytes, except a
+    /// `List`, which it answers with `list_reply` when it has one, and each
+    /// ask for a command's result, which it answers with the next of
+    /// `results` and then with the last one again.
     struct Server {
         reply: Vec<u8>,
+        list_reply: Option<Vec<u8>>,
         results: Vec<Response>,
         requests: Vec<ContextRequest>,
         pauses: Vec<Duration>,
@@ -490,9 +528,13 @@ mod tests {
                 other => panic!("{other:?}"),
             };
             let is_result = matches!(request, ContextRequest::Result(_));
+            let is_list = matches!(request, ContextRequest::List);
             self.requests.push(request);
             if !is_result {
-                return Ok(self.reply.clone());
+                return Ok(match (is_list, &self.list_reply) {
+                    (true, Some(reply)) => reply.clone(),
+                    _ => self.reply.clone(),
+                });
             }
             let asked = self.requests.iter().filter(|r| matches!(r, ContextRequest::Result(_)));
             let result = &self.results[(asked.count() - 1).min(self.results.len() - 1)];
@@ -542,14 +584,22 @@ mod tests {
     /// `reply`, and with `results` to each ask for a command's result, or
     /// with no server when `reply` is `None`.
     fn run_against(args: &[&str], reply: Option<Vec<u8>>, results: Vec<Response>) -> Ran {
-        let command = parse(args).unwrap();
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let mut server = reply.map(|reply| Server {
+        let server = reply.map(|reply| Server {
             reply,
+            list_reply: None,
             results,
             requests: Vec::new(),
             pauses: Vec::new(),
         });
+        run_server(args, server)
+    }
+
+    /// Runs the command against `server`, or with no server when it is
+    /// `None`, and collects what it printed and asked.
+    fn run_server(args: &[&str], server: Option<Server>) -> Ran {
+        let command = parse(args).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut server = server;
         let status = run(&command, || server.as_mut(), &mut out, &mut err);
         let (requests, pauses) =
             server.map(|server| (server.requests, server.pauses)).unwrap_or_default();
@@ -560,6 +610,25 @@ mod tests {
             requests,
             pauses,
         }
+    }
+
+    /// Runs `sugarglider context forget <args>` against a server that
+    /// answers `List` with the spec's snapshot, takes the command with
+    /// `Success`, and answers the asks for its result with `results`.
+    fn run_forget(args: &[&str], results: Vec<Response>) -> Ran {
+        let reply = ron::ser::to_string(&Response::Success).unwrap().into_bytes();
+        let list_reply =
+            ron::ser::to_string(&Response::Contexts(snapshot())).unwrap().into_bytes();
+        run_server(
+            args,
+            Some(Server {
+                reply,
+                list_reply: Some(list_reply),
+                results,
+                requests: Vec::new(),
+                pauses: Vec::new(),
+            }),
+        )
     }
 
     /// Runs `sugarglider context <args>` against a server that replies with
@@ -856,13 +925,6 @@ mod tests {
                 },
             ),
             (&["pin"], ContextCommand::ToggleWindowPinned),
-            (
-                &["forget", "Comms", "1"],
-                ContextCommand::RemoveRecord {
-                    context: ContextRef::Name("Comms".into()),
-                    record: 1,
-                },
-            ),
         ] {
             let ran = run_with(args, Response::Success);
             assert_eq!((0, "", ""), (ran.status, &*ran.out, &*ran.err), "{args:?}");
@@ -886,8 +948,10 @@ mod tests {
         }
     }
 
-    /// M6. `list --json` prints the index of each member record, and that
-    /// index is what `context forget` takes.
+    /// M6. `list --json` prints the index of each member record, and
+    /// `context forget` sends that index with the record's app and title,
+    /// read from the snapshot, so the reactor can check that it still names
+    /// the same record.
     #[test]
     fn a_forget_index_is_the_record_index_of_list_json() {
         let printed = printed_json(&["list", "--json"], snapshot());
@@ -898,13 +962,67 @@ mod tests {
         );
         assert_eq!(json!(null), printed["contexts"][0]["members"][2]["window"]);
 
-        let ran = run_with(&["forget", "Comms", "2"], Response::Success);
+        let ran = run_forget(&["forget", "Comms", "2"], vec![Response::Success]);
+        assert_eq!((0, "", ""), (ran.status, &*ran.out, &*ran.err));
+        assert_eq!(Some(&ContextRequest::List), ran.requests.first());
         assert_eq!(
             vec![ContextCommand::RemoveRecord {
-                context: ContextRef::Name("Comms".into()),
-                record: 2,
+                context: ContextRef::Id(id(1)),
+                record: RecordRef {
+                    record: 2,
+                    app: "Mail".into(),
+                    title: "Inbox".into(),
+                },
             }],
             ran.commands()
+        );
+    }
+
+    /// M6. `forget` checks the index against the snapshot before it sends:
+    /// a record whose window is open, an index off the end, a built-in,
+    /// and a name that matches nothing fail without sending a command.
+    #[test]
+    fn forget_checks_the_record_against_the_snapshot_first() {
+        for (args, reason) in [
+            (
+                &["forget", "Comms", "0"][..],
+                "The member's window is open; remove the window instead",
+            ),
+            (&["forget", "Comms", "9"], "No such member record"),
+            (
+                &["forget", "Unsorted", "0"],
+                "Only a named context has member records",
+            ),
+            (
+                &["forget", "nothing", "0"],
+                "No context matches \"nothing\"",
+            ),
+        ] {
+            let ran = run_forget(args, vec![Response::Success]);
+            assert_eq!(
+                (1, "", format!("{reason}\n")),
+                (ran.status, &*ran.out, ran.err),
+                "{args:?}"
+            );
+            assert_eq!(vec![ContextRequest::List], ran.requests, "{args:?}");
+        }
+    }
+
+    /// M6. The reactor checks the record again, so a list that changed
+    /// between the snapshot and the command fails instead of removing
+    /// another record. Its reason goes to stderr with status 1.
+    #[test]
+    fn forget_prints_the_reactors_reason_when_the_record_changed() {
+        let reason = "The member record changed since it was listed; list the contexts again";
+        let ran = run_forget(
+            &["forget", "Comms", "2"],
+            vec![Response::Pending, Response::Error(reason.into())],
+        );
+
+        assert_eq!(2, ran.asks());
+        assert_eq!(
+            (1, "", format!("{reason}\n")),
+            (ran.status, &*ran.out, ran.err)
         );
     }
 
@@ -921,7 +1039,6 @@ mod tests {
             &["delete", "Unsorted"],
             &["number", "Comms", "3"],
             &["pin"],
-            &["forget", "Comms", "0"],
         ] {
             let ran = run_with_results(args, vec![Response::Error(reason.into())]);
             assert_eq!(
@@ -1267,6 +1384,7 @@ mod tests {
             (&["list", "--json"], Response::Pong("x".into()), "Pong(\"x\")"),
             (&["create", "X"], Response::Pong("x".into()), "Pong(\"x\")"),
             (&["everything"], Response::Pong("x".into()), "Pong(\"x\")"),
+            (&["forget", "Comms", "2"], Response::Pong("x".into()), "Pong(\"x\")"),
         ] {
             let ran = run_with(args, reply);
             assert_eq!(

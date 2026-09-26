@@ -11,6 +11,9 @@ use crate::actor::contexts_snapshot::{CommandResult, RequestId};
 use crate::actor::reactor::RecordRef;
 use crate::actor::server::{ContextRequest, Response, answer_context_request};
 use crate::model::contexts::Contexts;
+use crate::sys::app::WindowInfo;
+
+use super::membership::{focus_quietly, open_window};
 
 /// Sends a context command from the command line with request id
 /// `request`, and lets the apps answer.
@@ -69,6 +72,16 @@ fn saved(s: &Setup) -> Contexts {
 /// A context id that no context of the test gets from `create`.
 fn context_id(id: u32) -> ContextId {
     serde_json::from_value(serde_json::json!(id)).unwrap()
+}
+
+/// Names a member record by its index, app, and title, as a client does
+/// after it reads the snapshot.
+fn record_ref(record: usize, app: &str, title: &str) -> RecordRef {
+    RecordRef {
+        record,
+        app: app.into(),
+        title: title.into(),
+    }
 }
 
 /// R4. `rename_context` trims the name and refuses an empty, reserved, or
@@ -265,11 +278,6 @@ fn an_edit_removes_a_record_only_while_it_still_matches() {
     s.apps.simulate_until_quiet(&mut s.reactor);
     assert_eq!(vec![wid(1)], open_members(&s, c));
 
-    let record = |record: usize, app: &str, title: &str| RecordRef {
-        record,
-        app: app.into(),
-        title: title.into(),
-    };
     request(
         &mut s,
         1,
@@ -278,10 +286,10 @@ fn an_edit_removes_a_record_only_while_it_still_matches() {
             add: vec![],
             remove: vec![],
             remove_records: vec![
-                record(9, "TestApp1", "Window2"),
-                record(1, "TestApp1", "Another title"),
-                record(1, "TestApp1", "Window2"),
-                record(0, "TestApp1", "Window1"),
+                record_ref(9, "TestApp1", "Window2"),
+                record_ref(1, "TestApp1", "Another title"),
+                record_ref(1, "TestApp1", "Window2"),
+                record_ref(0, "TestApp1", "Window1"),
             ],
         },
     );
@@ -343,7 +351,7 @@ fn remove_record_removes_the_record_at_the_index() {
         1,
         ContextCommand::RemoveRecord {
             context: ContextRef::Name("C".into()),
-            record: 1,
+            record: record_ref(1, "TestApp1", "Window2"),
         },
     );
     request(
@@ -351,7 +359,7 @@ fn remove_record_removes_the_record_at_the_index() {
         2,
         ContextCommand::RemoveRecord {
             context: ContextRef::Id(c),
-            record: 0,
+            record: record_ref(0, "TestApp1", "Window1"),
         },
     );
     request(
@@ -359,7 +367,7 @@ fn remove_record_removes_the_record_at_the_index() {
         3,
         ContextCommand::RemoveRecord {
             context: ContextRef::Id(c),
-            record: 5,
+            record: record_ref(5, "TestApp1", "Window9"),
         },
     );
     request(
@@ -367,7 +375,7 @@ fn remove_record_removes_the_record_at_the_index() {
         4,
         ContextCommand::RemoveRecord {
             context: ContextRef::Name("Unsorted".into()),
-            record: 0,
+            record: record_ref(0, "TestApp1", "Window1"),
         },
     );
     request(
@@ -375,7 +383,7 @@ fn remove_record_removes_the_record_at_the_index() {
         5,
         ContextCommand::RemoveRecord {
             context: ContextRef::Name("nothing".into()),
-            record: 0,
+            record: record_ref(0, "TestApp1", "Window1"),
         },
     );
 
@@ -384,7 +392,7 @@ fn remove_record_removes_the_record_at_the_index() {
             ran(1),
             failed(2, "The member's window is open; remove the window instead"),
             failed(3, "No such member record"),
-            failed(4, "Only a named context can be edited"),
+            failed(4, "Only a named context has member records"),
             failed(5, "No context matches \"nothing\""),
         ],
         results(&s)
@@ -393,6 +401,116 @@ fn remove_record_removes_the_record_at_the_index() {
     assert_eq!(1, members.len());
     assert_eq!(Some(wid(1)), members[0].window());
     assert_eq!(1, saved(&s).get(c).unwrap().members.len());
+}
+
+/// R23. A record goes only while the index still names the same app and
+/// title. Here the record before the named one goes first, so the index
+/// names another closed record: the command fails instead of removing it.
+#[test]
+fn remove_record_does_not_remove_a_record_that_shifted() {
+    let mut s = Setup::new(3);
+    let c = id_of(s.create("C", &[wid(1), wid(2)]));
+    s.switch(ContextKey::Named(c));
+    // Both member windows close, so both records are pending. Answer the
+    // frame writes that each close causes before the next one.
+    for idx in [1, 2] {
+        s.apps.windows.remove(&wid(idx));
+        s.reactor.handle_event(Event::WindowDestroyed(wid(idx)));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+    }
+
+    // The client read record 0 as Window1. After Window1 goes, the index
+    // names the record of Window2, but the client's item still says
+    // Window1.
+    request(
+        &mut s,
+        1,
+        ContextCommand::RemoveRecord {
+            context: ContextRef::Id(c),
+            record: record_ref(0, "TestApp1", "Window1"),
+        },
+    );
+    request(
+        &mut s,
+        2,
+        ContextCommand::RemoveRecord {
+            context: ContextRef::Id(c),
+            record: record_ref(0, "TestApp1", "Window1"),
+        },
+    );
+
+    assert_eq!(
+        vec![
+            ran(1),
+            failed(
+                2,
+                "The member record changed since it was listed; list the contexts again"
+            ),
+        ],
+        results(&s)
+    );
+    let members = &s.reactor.contexts.get(c).unwrap().members;
+    assert_eq!(1, members.len());
+    assert_eq!("Window2", members[0].title);
+}
+
+/// R36. An edit that names any tab of a native group applies to the whole
+/// group: the group joins or leaves the context together.
+#[test]
+fn an_edit_acts_on_a_whole_native_tab_group() {
+    let mut s = Setup::new(2);
+    // Window 3 joins window 2's native tab group while Everything shows, so
+    // both keep the group's tile.
+    focus_quietly(&mut s, wid(2));
+    let tab = WindowInfo {
+        frame: s.frame(wid(2)),
+        ..make_window(3)
+    };
+    open_window(&mut s, wid(3), tab, &[wid(1), wid(2)]);
+    assert_eq!(vec![wid(2), wid(3)], s.reactor.tabs_of(wid(2)));
+    let c = ContextKey::Named(id_of(s.create("C", &[wid(1)])));
+
+    // Naming the tab, not the group's main tab, adds the whole group.
+    request(
+        &mut s,
+        1,
+        ContextCommand::EditContextMembers {
+            context: ContextRef::Id(id_of(c)),
+            add: vec![wid(3)],
+            remove: vec![],
+            remove_records: vec![],
+        },
+    );
+    assert!(s.reactor.contexts.is_member(c, wid(2)));
+    assert!(s.reactor.contexts.is_member(c, wid(3)));
+
+    // Naming the main tab removes the whole group.
+    request(
+        &mut s,
+        2,
+        ContextCommand::EditContextMembers {
+            context: ContextRef::Id(id_of(c)),
+            add: vec![],
+            remove: vec![wid(2)],
+            remove_records: vec![],
+        },
+    );
+    assert!(!s.reactor.contexts.is_member(c, wid(2)));
+    assert!(!s.reactor.contexts.is_member(c, wid(3)));
+
+    // And back.
+    request(
+        &mut s,
+        3,
+        ContextCommand::EditContextMembers {
+            context: ContextRef::Id(id_of(c)),
+            add: vec![wid(3)],
+            remove: vec![],
+            remove_records: vec![],
+        },
+    );
+    assert!(s.reactor.contexts.is_member(c, wid(2)));
+    assert!(s.reactor.contexts.is_member(c, wid(3)));
 }
 
 /// The new commands survive the RON round trip that recordings use, each
@@ -422,7 +540,11 @@ fn the_management_commands_survive_a_ron_round_trip() {
         },
         ContextCommand::RemoveRecord {
             context: ContextRef::Number(1),
-            record: 0,
+            record: RecordRef {
+                record: 0,
+                app: "Mail".into(),
+                title: "Inbox".into(),
+            },
         },
     ];
     for command in commands {

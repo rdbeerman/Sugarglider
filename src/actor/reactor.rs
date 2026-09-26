@@ -322,10 +322,12 @@ pub enum ContextCommand {
         #[serde(default)]
         remove_records: Vec<RecordRef>,
     },
-    /// Removes the member record at `record`, whose window is gone (R23).
+    /// Removes the member record that `record` names, whose window is gone
+    /// (R23). The record's app and title must still match, so a list that
+    /// shifted since the client read it can't remove another record.
     RemoveRecord {
         context: ContextRef,
-        record: usize,
+        record: RecordRef,
     },
 }
 

@@ -938,7 +938,7 @@ mod tests {
     /// and `{ id = 7 }` by id.
     #[test]
     fn context_commands_parse() {
-        use crate::actor::reactor::{ContextCommand, ContextRef};
+        use crate::actor::reactor::{ContextCommand, ContextRef, RecordRef};
 
         let config = Config::parse(
             r#"
@@ -955,7 +955,7 @@ mod tests {
             "Ctrl + Alt + KeyP" = "toggle_window_pinned"
             "Ctrl + Alt + KeyD" = { delete_context = 3 }
             "Ctrl + Alt + KeyU" = { set_context_number = { context = "Comms", number = 2 } }
-            "Ctrl + Alt + KeyF" = { remove_record = { context = { id = 7 }, record = 0 } }
+            "Ctrl + Alt + KeyF" = { remove_record = { context = { id = 7 }, record = { record = 0, app = "Mail", title = "Inbox" } } }
             "#,
         )
         .unwrap();
@@ -1016,7 +1016,11 @@ mod tests {
         assert_eq!(
             ContextCommand::RemoveRecord {
                 context: ContextRef::Id(id),
-                record: 0,
+                record: RecordRef {
+                    record: 0,
+                    app: "Mail".into(),
+                    title: "Inbox".into(),
+                },
             },
             command("Ctrl + Alt + KeyF")
         );

@@ -506,14 +506,16 @@ impl Reactor {
             ContextCommand::ToggleWindowPinned => self.toggle_window_pinned(self.main_window()),
             ContextCommand::CreateContext(name) => self.create_context(&name),
             ContextCommand::RenameContext { context, name } => {
-                let id = self.resolve_named_context(&context, "renamed")?;
+                let id =
+                    self.resolve_named_context(&context, "Only a named context can be renamed")?;
                 self.contexts.rename(id, &name).map_err(|err| err.to_string())?;
                 info!(?id, name, "Renamed a context");
                 self.save_contexts();
                 Ok(())
             }
             ContextCommand::SetContextNumber { context, number } => {
-                let id = self.resolve_named_context(&context, "numbered")?;
+                let id =
+                    self.resolve_named_context(&context, "Only a named context can be numbered")?;
                 self.contexts
                     .set_number(id, Some(number))
                     .map_err(|err| err.to_string())?;
@@ -522,7 +524,8 @@ impl Reactor {
                 Ok(())
             }
             ContextCommand::DeleteContext(context) => {
-                let id = self.resolve_named_context(&context, "deleted")?;
+                let id =
+                    self.resolve_named_context(&context, "Only a named context can be deleted")?;
                 self.delete_context(id).map_err(|err| err.to_string())?;
                 info!(?id, "Deleted a context");
                 Ok(())
@@ -533,48 +536,61 @@ impl Reactor {
                 remove,
                 remove_records,
             } => {
-                let id = self.resolve_named_context(&context, "edited")?;
+                let id =
+                    self.resolve_named_context(&context, "Only a named context can be edited")?;
                 self.edit_context_members(id, &add, &remove, &remove_records)
             }
             ContextCommand::RemoveRecord { context, record } => {
-                let id = self.resolve_named_context(&context, "edited")?;
-                self.remove_record(id, record)
+                let id = self.resolve_named_context(
+                    &context,
+                    "Only a named context has member records",
+                )?;
+                self.remove_record(id, &record)
             }
         }
     }
 
-    /// The named context that a command names. Everything and Unsorted
-    /// can't be renamed, numbered, edited, or deleted.
+    /// The named context that a command that changes contexts names, or
+    /// `cannot` when the command names Everything or Unsorted.
     fn resolve_named_context(
         &self,
         reference: &ContextRef,
-        action: &str,
+        cannot: &str,
     ) -> Result<ContextId, String> {
         match self.resolve(reference).map_err(|err| err.to_string())? {
             ContextKey::Named(id) => Ok(id),
-            ContextKey::Everything | ContextKey::Unsorted => {
-                Err(format!("Only a named context can be {action}"))
-            }
+            ContextKey::Everything | ContextKey::Unsorted => Err(cannot.to_string()),
         }
     }
 
-    /// Removes the member record at `record`, whose window is gone. A
-    /// record whose window is open is left alone: `remove_window_from_context`
-    /// is how a window leaves a context.
-    fn remove_record(&mut self, id: ContextId, record: usize) -> Result<(), String> {
-        let open = self
+    /// Removes the member record that `item` names, whose window is gone. A
+    /// record whose window is open is left alone:
+    /// `remove_window_from_context` is how a window leaves a context. The
+    /// record must still have the app and title the client read: the list
+    /// can shift between the client's `context list` and this command, and
+    /// an index alone would then remove another record.
+    fn remove_record(&mut self, id: ContextId, item: &RecordRef) -> Result<(), String> {
+        let Some(record) = self
             .contexts
             .get(id)
-            .and_then(|context| context.members.get(record))
-            .is_some_and(|member| member.window().is_some());
-        if open {
+            .and_then(|context| context.members.get(item.record))
+        else {
+            return Err(ContextError::NoSuchRecord.to_string());
+        };
+        if app_name(record) != item.app || record.title != item.title {
+            return Err(
+                "The member record changed since it was listed; list the contexts again"
+                    .to_string(),
+            );
+        }
+        if record.window().is_some() {
             return Err("The member's window is open; remove the window instead".to_string());
         }
         let removed = self
             .contexts
-            .remove_record(Slot::Context(id), record)
+            .remove_record(Slot::Context(id), item.record)
             .map_err(|err| err.to_string())?;
-        info!(?id, record, ?removed, "Removed a member record");
+        info!(?id, record = item.record, ?removed, "Removed a member record");
         self.save_contexts();
         Ok(())
     }

@@ -12,7 +12,7 @@ use crate::actor::reactor::testing::WindowState;
 /// App `wid.pid` opens a window, which reaches the reactor as a new window
 /// does: `WindowCreated`, then the window server's list, which names the
 /// windows in `listed` and the new one, then `WindowBecameVisible`.
-fn open_window(s: &mut Setup, wid: WindowId, info: WindowInfo, listed: &[WindowId]) {
+pub(super) fn open_window(s: &mut Setup, wid: WindowId, info: WindowInfo, listed: &[WindowId]) {
     s.apps.windows.insert(
         wid,
         WindowState {
@@ -704,7 +704,7 @@ fn r36_a_new_tab_joins_the_contexts_of_its_groups_main_tab() {
 /// Gives the window the focus, as the switch's own raise does, so that
 /// the reactor's main window is the window and no focus from outside
 /// counts.
-fn focus_quietly(s: &mut Setup, wid: WindowId) {
+pub(super) fn focus_quietly(s: &mut Setup, wid: WindowId) {
     s.reactor.handle_event(Event::ApplicationGloballyActivated(wid.pid));
     s.reactor.handle_event(Event::ApplicationActivated(wid.pid, Quiet::Yes));
     s.reactor.handle_event(Event::ApplicationMainWindowChanged(
