@@ -257,7 +257,6 @@ impl ScreenId {
         self.0
     }
 
-    #[cfg(test)]
     pub fn new(id: u32) -> ScreenId {
         ScreenId(id)
     }

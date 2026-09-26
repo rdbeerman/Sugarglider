@@ -606,6 +606,15 @@ impl Reactor {
         if switches && self.screens.iter().all(|screen| screen.space.is_none()) {
             return Err(NO_MANAGED_SPACE.to_string());
         }
+        if !self.startup_complete
+            && self.scope() == Scope::Global
+            && self.contexts.has_screen_actives()
+        {
+            self.update_active_screen();
+            if self.active_screen_idx.is_none() {
+                return Err("Contexts are waiting for the focused screen at startup".to_string());
+            }
+        }
         self.reconcile_cold_scope();
         let result = match command {
             ContextCommand::OpenContextSwitcher => self.open_context_switcher(),

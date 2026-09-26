@@ -200,6 +200,14 @@ fn a_cold_change_to_global_uses_the_focused_screen_and_persists_switches() {
             vec![screen(), right()],
             vec![Some(space()), Some(right_space())],
         ));
+        if focused == 1 {
+            let error = restarted
+                .reactor
+                .run_context_command(ContextCommand::ToggleWindowPinned)
+                .unwrap_err();
+            assert_eq!("Contexts are waiting for the focused screen at startup", error);
+            assert!(restarted.reactor.contexts.has_screen_actives());
+        }
         let pid = 3;
         let focused_window = WindowId::new(pid, 1);
         let x = if focused == 0 { 100. } else { 1400. };
@@ -218,6 +226,17 @@ fn a_cold_change_to_global_uses_the_focused_screen_and_persists_switches() {
             Quiet::Yes,
         ));
         assert_eq!(Some(focused_window), restarted.reactor.main_window());
+        if focused == 1 {
+            restarted.reactor.handle_event(Event::Command(Command::Context(
+                ContextCommand::RenameContext {
+                    context: ContextRef::Id(id_of(a)),
+                    name: "Renamed A".into(),
+                },
+            )));
+            assert!(restarted.reactor.contexts.by_name("Renamed A").is_some());
+            assert_eq!(b, restarted.reactor.contexts.active());
+            assert!(!restarted.reactor.contexts.has_screen_actives());
+        }
         restarted.reactor.handle_event(Event::StartupComplete);
         restarted.apps.simulate_until_quiet(&mut restarted.reactor);
 
