@@ -583,7 +583,11 @@ impl Reactor {
                 reactor.record_launch_state();
                 reactor.layout_file = Some(crate::config::restore_file());
                 reactor.exit = Box::new(|code| std::process::exit(code));
-                reactor.publish_contexts = Box::new(crate::actor::contexts_snapshot::publish);
+                let contexts_status_tx = status_tx.clone();
+                reactor.publish_contexts = Box::new(move |snapshot| {
+                    crate::actor::contexts_snapshot::publish(snapshot.clone());
+                    contexts_status_tx.send(status::Event::ContextsChanged(snapshot));
+                });
                 reactor.publish_contexts_snapshot();
                 reactor.mouse_tx.replace(mouse_tx.clone());
                 reactor.status_tx.replace(status_tx.clone());
