@@ -187,10 +187,14 @@ final class ContextSwitcherModel: ObservableObject {
   /// Called when the panel should close.
   var onClose: () -> Void = {}
 
-  /// The search text.
+  /// The search text. Changing it cancels a delete confirmation.
   @Published var query = "" {
     didSet {
-      if query != oldValue { refreshRows() }
+      guard query != oldValue else { return }
+      if case .confirmDelete = mode {
+        mode = .list
+      }
+      refreshRows()
     }
   }
   /// The name typed in the naming and rename modes.

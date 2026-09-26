@@ -410,6 +410,15 @@ final class ContextSwitcherModelTests: XCTestCase {
     XCTAssertEqual(closed, 0)
   }
 
+  func testTypingCancelsTheDeleteConfirmation() throws {
+    let model = try makeModel()
+    model.handle(.commandDelete)
+    model.query = "cli"
+    XCTAssertEqual(model.mode, .list)
+    model.handle(.enter)
+    XCTAssertEqual(backend.sent, [.switchTo(.named(Fixtures.clientWork))])
+  }
+
   func testRenameSendsTheTrimmedName() throws {
     let model = try makeModel()
     model.handle(.commandR)
