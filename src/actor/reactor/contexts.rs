@@ -142,8 +142,15 @@ impl Reactor {
     /// Shows each visible Space's context in the layout, and applies the
     /// active context again when contexts are in use. Returns the layout's
     /// response to the exposure for the caller to handle.
+    ///
+    /// The window server's list of visible windows must name at least one
+    /// window the reactor knows, if it knows any. Otherwise the list is taken
+    /// to be incomplete, as it is right after the login window, and the
+    /// Spaces only show their contexts, so that no window loses its tile.
     pub(super) fn show_visible_spaces(&mut self) -> Option<EventResponse> {
-        if self.contexts_in_use() {
+        let lists_known_windows = self.window_ids.is_empty()
+            || self.visible_windows.iter().any(|wsid| self.window_ids.contains_key(wsid));
+        if self.contexts_in_use() && lists_known_windows {
             return self.apply(Apply::Again).ok().and_then(|(_, response)| response);
         }
         let spaces = self.shown_spaces(self.contexts.active());
@@ -1904,5 +1911,66 @@ mod tests {
         assert_eq!(vec![(wid(2), shorter)], s.tiles_on(space(), shorter));
         assert_eq!(shorter, s.frame(wid(2)));
         assert_eq!(floating, s.frame(wid(1)));
+    }
+
+    /// R10, L5. A window server list that names no window the reactor knows,
+    /// as right after the login window, takes no window out of the layout.
+    #[test]
+    fn a_space_change_with_an_incomplete_window_list_keeps_the_contexts_layout() {
+        let mut s = Setup::new(3);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        s.switch(c);
+        s.move_window(wid(1), Direction::Up);
+        let arranged = vec![
+            (wid(1), rect(0., 0., 1200., 500.)),
+            (wid(2), rect(0., 500., 1200., 500.)),
+        ];
+        assert_eq!(arranged, s.tiles());
+
+        s.reactor.handle_event(screens(vec![CGRect::ZERO], vec![None]));
+        s.reactor.handle_event(screens(vec![screen()], vec![Some(space())]));
+        assert_eq!(arranged, s.tiles());
+        s.reactor.handle_event(Event::SpaceChanged(vec![None], Default::default()));
+        s.reactor
+            .handle_event(Event::SpaceChanged(vec![Some(space())], Default::default()));
+        assert_eq!(arranged, s.tiles());
+        let unmanaged = WindowServerInfo {
+            id: WindowServerId::new(999),
+            pid: 2,
+            layer: 0,
+            frame: rect(0., 0., 100., 100.),
+        };
+        s.reactor.handle_event(Event::SpaceChanged(
+            vec![Some(space())],
+            WindowsOnScreen::new(vec![unmanaged]),
+        ));
+        assert_eq!(arranged, s.tiles());
+
+        // The full list arrives while the accessibility API still reports no
+        // windows.
+        s.reactor.handle_event(Event::WindowsOnScreenUpdated {
+            pid: None,
+            on_screen: on_screen(&s, &[wid(1), wid(2), wid(3)]),
+        });
+        for request in s.apps.requests() {
+            match request {
+                Request::GetVisibleWindows => s.reactor.handle_event(Event::WindowsDiscovered {
+                    pid: 1,
+                    new: vec![],
+                    known_visible: vec![],
+                }),
+                request => {
+                    for event in s.apps.simulate_events_for_requests(vec![request]) {
+                        s.reactor.handle_event(event);
+                    }
+                }
+            }
+        }
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(arranged, s.tiles());
+        assert_eq!(arranged, s.frames(&[wid(1), wid(2)]));
+        assert_eq!(vec![wid(3)], s.parked());
+        assert_eq!(corner(CGSize::new(400., 1000.)), s.frame(wid(3)));
     }
 }

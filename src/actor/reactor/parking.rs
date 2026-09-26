@@ -142,8 +142,12 @@ impl Reactor {
     /// it on the displays as they are now. A frame from before parking that
     /// is on no screen now moves onto a screen, and the window's journal
     /// entry changes before the window moves. If that write fails, those
-    /// windows stay where they are.
+    /// windows stay where they are. While no screen shows a managed Space, as
+    /// at the login window, nothing moves.
     pub(super) fn repark_moved_windows(&mut self) {
+        if self.screens.iter().all(|screen| screen.space.is_none()) {
+            return;
+        }
         let mut wids: Vec<WindowId> = self.parked.keys().copied().collect();
         wids.sort();
         let mut entries = vec![];
