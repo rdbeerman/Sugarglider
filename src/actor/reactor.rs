@@ -1015,6 +1015,7 @@ impl Reactor {
                         added: self.screens[new].space,
                         removed: self.screens[old].space,
                         info,
+                        contexts_exist: self.contexts_exist(),
                     });
                 }
                 if old_frame.size != new_frame.size {

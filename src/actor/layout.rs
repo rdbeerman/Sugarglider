@@ -125,6 +125,10 @@ pub enum LayoutEvent {
         added: Option<SpaceId>,
         removed: Option<SpaceId>,
         info: LayoutWindowInfo,
+        /// Whether contexts exist. If so, the window leaves every layout of
+        /// the Space it left. Otherwise it leaves only the layout the Space
+        /// shows.
+        contexts_exist: bool,
     },
     WindowFocused(Vec<SpaceId>, WindowId),
     WindowResized {
@@ -1022,7 +1026,13 @@ impl LayoutManager {
                     self.floating_restore_frames.insert(wid, FloatingRestoreFrame { frame });
                 }
             }
-            LayoutEvent::WindowSpaceChanged { wid, added, removed, info } => {
+            LayoutEvent::WindowSpaceChanged {
+                wid,
+                added,
+                removed,
+                info,
+                contexts_exist,
+            } => {
                 if self.floating_windows.contains(&wid) {
                     // Floating windows live outside the tree, tracked per space
                     // in active_floating_windows.
@@ -1062,7 +1072,7 @@ impl LayoutManager {
                         }
                     }
                     if let Some(removed) = removed {
-                        self.remove_window_from_space(removed, wid);
+                        self.remove_window_from_space(removed, wid, contexts_exist);
                     }
                 }
             }
@@ -1732,11 +1742,12 @@ impl LayoutManager {
         }
     }
 
-    /// Removes a window that left the Space from the Space's layouts. With
-    /// contexts on, those are the layouts of every context on the Space, for
-    /// every screen size. Otherwise only the layout the Space shows loses it.
-    fn remove_window_from_space(&mut self, space: SpaceId, wid: WindowId) {
-        if !self.config.settings.experimental.contexts.enable {
+    /// Removes a window that left the Space from the Space's layouts. While
+    /// contexts exist, those are the layouts of every context on the Space,
+    /// for every screen size. Otherwise only the layout the Space shows
+    /// loses it.
+    fn remove_window_from_space(&mut self, space: SpaceId, wid: WindowId, contexts_exist: bool) {
+        if !contexts_exist {
             self.tree.remove_window_from(self.layout(space), wid);
             return;
         }
@@ -3862,6 +3873,7 @@ mod tests {
             added: Some(space2),
             removed: Some(space1),
             info: win_info(),
+            contexts_exist: false,
         });
 
         // It must remain floating, tracked under space2 and not space1. It must
@@ -3901,6 +3913,7 @@ mod tests {
                 is_standard: false,
                 ..win_info()
             },
+            contexts_exist: false,
         });
 
         assert_eq!(
@@ -3939,6 +3952,7 @@ mod tests {
             added: Some(space2),
             removed: Some(space1),
             info: win_info(),
+            contexts_exist: false,
         });
 
         // In a scroll layout windows live inside column containers, never as a
@@ -5501,6 +5515,7 @@ mod tests {
             added: Some(space2),
             removed: Some(space1),
             info: win_info(),
+            contexts_exist: true,
         });
 
         for key in keys {
@@ -5537,6 +5552,7 @@ mod tests {
             added: Some(space2),
             removed: Some(space1),
             info: win_info(),
+            contexts_exist: false,
         });
 
         assert_eq!(

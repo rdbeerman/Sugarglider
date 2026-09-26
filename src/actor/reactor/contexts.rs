@@ -46,6 +46,11 @@ impl Reactor {
         self.config.settings.experimental.contexts.enable
     }
 
+    /// Whether contexts are on and at least one context exists.
+    pub(super) fn contexts_exist(&self) -> bool {
+        self.contexts_enabled() && !self.contexts.contexts().is_empty()
+    }
+
     /// Whether applying contexts can change anything. Without contexts and
     /// parked windows, Spaces are shown exactly as without the feature.
     pub(super) fn contexts_in_use(&self) -> bool {
@@ -4037,6 +4042,38 @@ mod tests {
             .collect();
         assert_eq!(vec!["contexts.json"], names);
         assert_eq!(file, fs::read(dir.path().join("contexts.json")).unwrap());
+    }
+
+    /// R28, L10. With contexts on and no context yet, the scenario sends
+    /// exactly the requests it sends with contexts off. The window dragged
+    /// to the other display leaves only the layout that Space 1 shows, so
+    /// Space 1's layout for the shorter size keeps its place, as it does
+    /// without contexts.
+    #[test]
+    fn r28_with_contexts_on_and_no_context_the_requests_are_those_with_contexts_off() {
+        let mut plain = Reactor::new_for_test(LayoutManager::new_for_test());
+        let (expected, ..) = run_drag_and_login_scenario(&mut plain, config(false), |_| {});
+        let keeps_place = format!("SetWindowFrame({:?}, {:?}", wid(2), rect(0., 400., 1000., 400.));
+        assert!(expected.iter().any(|request| request.starts_with(&keeps_place)));
+
+        let dir = TempDir::new().unwrap();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        reactor.journal = ParkedJournal::open(dir.path().join("parked.json"), SystemTime::now());
+        reactor.open_contexts(
+            ContextsStore::new(dir.path().join("contexts.json")),
+            Some("boot".into()),
+            SystemTime::now(),
+        );
+        let (trace, after_drag, at_end) =
+            run_drag_and_login_scenario(&mut reactor, config(true), |_| {});
+
+        assert_eq!(expected, trace);
+        let screen1 = rect(0., 0., 1000., 1000.);
+        let screen2 = rect(1000., 0., 1000., 1000.);
+        assert_eq!(vec![screen2, screen1], after_drag);
+        assert_eq!(vec![screen2, screen1], at_end);
+        assert!(reactor.contexts.contexts().is_empty());
+        assert!(reactor.parked.is_empty());
     }
 
     /// R32, H3. Quitting puts a parked floating window back at the frame it
