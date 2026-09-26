@@ -15,9 +15,9 @@ use crate::sys::window_server::WindowServerId;
 
 impl Reactor {
     /// Decides the membership of windows that the reactor sees for the first
-    /// time. The reactor's windows are the windows it has seen, so a
-    /// window that comes back from being minimized, from a hidden app, or
-    /// from another Space is not new.
+    /// time. The reactor's windows are the windows it has seen, so a window
+    /// that comes back from being minimized, from a hidden app, or from
+    /// another Space is not new.
     ///
     /// Windows found before `StartupComplete` were open before Sugarglider
     /// started. They rejoin the contexts whose records they match, or stay
@@ -60,11 +60,11 @@ impl Reactor {
         }
     }
 
-    /// A new tab of a native tab group that the reactor knows
-    /// joins the contexts of the group's main tab. The other windows are
-    /// matched together against the member records, and each window that
-    /// matches nothing joins the context its screen shows. Returns whether
-    /// any window joined or rejoined a context.
+    /// A new tab of a native tab group that the reactor knows joins the
+    /// contexts of the group's main tab. The other windows are matched
+    /// together against the member records, and each window that matches
+    /// nothing joins the context its screen shows. Returns whether any
+    /// window joined or rejoined a context.
     fn windows_appeared(&mut self, windows: &[WindowDesc]) -> bool {
         let new: Vec<WindowId> = windows.iter().map(|window| window.wid).collect();
         let mut changed = false;
@@ -132,7 +132,11 @@ impl Reactor {
     /// is one of the group's tabs other than `wid`.
     fn main_tab(&self, wid: WindowId) -> Option<WindowId> {
         let main = self.main_window_tracker.app_main_window(wid.pid)?;
-        (main != wid && self.tabs_of(wid).contains(&main)).then_some(main)
+        if main == wid || self.parked.contains_key(&wid) || self.parked.contains_key(&main) {
+            return None;
+        }
+        let key = |wid| Some(Self::frame_key(&self.windows.get(&wid)?.frame_monotonic));
+        (key(wid)? == key(main)?).then_some(main)
     }
 
     /// A new tab joins the contexts of its group's main tab, and is
