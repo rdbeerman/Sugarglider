@@ -34,10 +34,10 @@ fn is_back(reported: CGRect, target: CGRect) -> bool {
 }
 
 /// Whether the bundle id in a journal entry and the bundle id of the app that
-/// has the entry's pid now name the same app. A missing bundle id on either
-/// side matches nothing.
+/// has the entry's pid now name the same app. Two missing bundle ids match; a
+/// missing bundle id on one side only doesn't.
 fn same_app(journal: &Option<String>, running: &Option<String>) -> bool {
-    matches!((journal, running), (Some(journal), Some(running)) if journal == running)
+    journal == running
 }
 
 /// A window whose journal entry is written, with the frame it has before it
@@ -1465,10 +1465,10 @@ mod tests {
     }
 
     #[test]
-    fn r34_a_missing_bundle_id_on_either_side_is_another_app() {
+    fn r34_a_missing_bundle_id_on_one_side_is_another_app() {
         let journal_frame = rect(100., 100., 300., 300.);
         let corner = rect(999., 999., 1000., 1000.);
-        for (journal_has_id, app_has_id) in [(false, true), (true, false), (false, false)] {
+        for (journal_has_id, app_has_id) in [(false, true), (true, false)] {
             let mut journal_entry = entry(1, 11, journal_frame);
             if !journal_has_id {
                 journal_entry.bundle_id = None;
@@ -1495,6 +1495,33 @@ mod tests {
                 "{case:?}"
             );
         }
+    }
+
+    #[test]
+    fn r34_an_app_without_a_bundle_id_gets_its_windows_back() {
+        let journal_frame = rect(100., 100., 300., 300.);
+        let mut journal_entry = entry(1, 11, journal_frame);
+        journal_entry.bundle_id = None;
+        let mut s = Setup::launching(vec![journal_entry.clone(), entry(2, 21, journal_frame)]);
+        s.set_processes(|pid| match pid {
+            1 => Process::Running { bundle_id: None },
+            _ => test_app_process(pid),
+        });
+        s.reactor.handle_event(Event::StartupComplete);
+        assert_eq!(
+            vec![(1, 11, journal_frame), (2, 21, journal_frame)],
+            summary(s.journal_on_disk())
+        );
+        let launch = s.apps.make_app(1, vec![window_at(11, rect(999., 999., 300., 300.))]);
+
+        s.reactor.handle_events(without_bundle_id(launch));
+
+        let wid = WindowId::new(1, 1);
+        let requests = s.apps.requests();
+        assert_eq!(Some(&journal_frame), frame_writes(&requests, wid).first());
+        s.handle_requests(requests);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![(2, 21, journal_frame)], summary(s.journal_on_disk()));
     }
 
     #[test]
