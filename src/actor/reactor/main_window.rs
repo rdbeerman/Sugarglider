@@ -18,10 +18,29 @@ struct AppState {
     main_window: Option<WindowId>,
 }
 
+/// How a window came to take focus.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum FocusSource {
+    /// The user activated the app: ⌘-Tab, the Dock, a launch, or a
+    /// notification click.
+    Activation,
+    /// A window of the frontmost app became its main window: ⌘`, or a click
+    /// on another window.
+    MainWindowChange,
+}
+
+/// A window that took focus, and what kind of edge made it the main window.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RaisedWindow {
+    pub(super) wid: WindowId,
+    pub(super) source: FocusSource,
+}
+
 impl MainWindowTracker {
-    /// Returns Some(wid) if a WindowFocused layout event should be produced.
+    /// Returns the raised window if a WindowFocused layout event should be
+    /// produced.
     #[must_use]
-    pub fn handle_event(&mut self, event: &Event) -> Option<WindowId> {
+    pub fn handle_event(&mut self, event: &Event) -> Option<RaisedWindow> {
         // There are two kinds of edges that can transition from one main window
         // state to another. One is an app main window change and the other
         // is a frontmost app change. Either can be labelled with quiet;
@@ -29,7 +48,7 @@ impl MainWindowTracker {
         // recent frontmost update of that app applies (even if the actual
         // event was a global frontmost change). If the main window changes on
         // a non-quiet edge we will produce a layout event.
-        let (event_pid, quiet_edge) = match event {
+        let (event_pid, quiet_edge, source) = match event {
             &Event::ApplicationLaunched {
                 pid, is_frontmost, main_window, ..
             } => {
@@ -41,7 +60,7 @@ impl MainWindowTracker {
                         main_window,
                     },
                 );
-                (pid, Quiet::No)
+                (pid, Quiet::No, FocusSource::Activation)
             }
             &Event::ApplicationThreadTerminated(pid) => {
                 self.apps.remove(&pid);
@@ -51,7 +70,7 @@ impl MainWindowTracker {
                 let app = self.apps.get_mut(&pid)?;
                 app.is_frontmost = true;
                 app.frontmost_is_quiet = quiet;
-                (pid, quiet)
+                (pid, quiet, FocusSource::Activation)
             }
             &Event::ApplicationDeactivated(pid) => {
                 let app = self.apps.get_mut(&pid)?;
@@ -63,7 +82,7 @@ impl MainWindowTracker {
                 // this and the ApplicationActivated event.
                 self.global_frontmost = Some(pid);
                 let Some(app) = self.apps.get(&pid) else { return None };
-                (pid, app.frontmost_is_quiet)
+                (pid, app.frontmost_is_quiet, FocusSource::Activation)
             }
             &Event::ApplicationGloballyDeactivated(pid) => {
                 if self.global_frontmost == Some(pid) {
@@ -74,7 +93,7 @@ impl MainWindowTracker {
             &Event::ApplicationMainWindowChanged(pid, wid, quiet) => {
                 let app = self.apps.get_mut(&pid)?;
                 app.main_window = wid;
-                (pid, quiet)
+                (pid, quiet, FocusSource::MainWindowChange)
             }
             Event::ApplicationTerminated(..)
             | Event::StartupComplete
@@ -103,7 +122,7 @@ impl MainWindowTracker {
         };
         if Some(event_pid) == self.global_frontmost && quiet_edge == Quiet::No {
             if let Some(wid) = self.main_window() {
-                return Some(wid);
+                return Some(RaisedWindow { wid, source });
             }
         }
         None

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use super::Reactor;
+use super::main_window::FocusSource;
 use crate::actor::app::{Quiet, Request, WindowId, pid_t};
 use crate::actor::layout::{EventResponse, LayoutEvent};
 use crate::collections::HashSet;
@@ -60,7 +61,7 @@ impl Reactor {
     /// Handles a window that took focus in a way that counts as the user's.
     /// While a switch is in progress it is ignored. A window the reactor hasn't
     /// seen yet waits until the reactor first sees it.
-    pub(super) fn focus_changed(&mut self, wid: WindowId) {
+    pub(super) fn focus_changed(&mut self, wid: WindowId, source: FocusSource) {
         if !self.contexts_enabled() {
             return;
         }
@@ -70,11 +71,11 @@ impl Reactor {
         }
         if !self.windows.contains_key(&wid) || self.pending_first_seen.contains(&wid) {
             debug!(?wid, "Focus on a window not seen yet waits for it");
-            self.focus_waiting = Some(wid);
+            self.focus_waiting = Some((wid, source));
             return;
         }
         self.focus_waiting = None;
-        if self.focus_from_outside(wid) == FocusOutcome::Stays {
+        if self.focus_from_outside(wid, source) == FocusOutcome::Stays {
             self.contexts.window_focused(wid);
         }
     }
@@ -82,25 +83,27 @@ impl Reactor {
     /// Applies focus that waited for windows the reactor sees for the first
     /// time, now that their membership is decided.
     pub(super) fn focus_windows_seen(&mut self, wids: &[WindowId]) {
-        let Some(waiting) = self.focus_waiting else { return };
+        let Some((waiting, source)) = self.focus_waiting else { return };
         if !wids.contains(&waiting) {
             return;
         }
         self.focus_waiting = None;
         if self.main_window() == Some(waiting) {
-            self.focus_changed(waiting);
+            self.focus_changed(waiting, source);
         }
     }
 
     /// When the user focuses a window that isn't a member of its screen's
     /// active context, switches to the most recently used context that holds
-    /// it, or to Unsorted. When the window is parked and its app has a visible
-    /// member of the active context, raises that member instead, and switches
-    /// only when the app has no member there.
+    /// it, or to Unsorted. When the user activates an app and the focused
+    /// window is parked, and the app has a visible member of the active
+    /// context, raises that member instead, and switches only when the app
+    /// has no member there. A window focus change inside the frontmost app,
+    /// such as ⌘`, is not an activation, so it switches.
     ///
     /// Windows Sugarglider doesn't track, its own windows, a screen that shows
     /// Everything, and focus before startup completes change nothing.
-    fn focus_from_outside(&mut self, wid: WindowId) -> FocusOutcome {
+    fn focus_from_outside(&mut self, wid: WindowId, source: FocusSource) -> FocusOutcome {
         if !self.contexts_in_use() || self.pending_exit.is_some() || !self.startup_complete {
             return FocusOutcome::Stays;
         }
@@ -118,7 +121,7 @@ impl Reactor {
         if self.shows_under(shown, wid) {
             return FocusOutcome::Stays;
         }
-        if self.parked.contains_key(&wid) {
+        if self.parked.contains_key(&wid) && source == FocusSource::Activation {
             if let Some(member) = self.visible_member_of_app(wid.pid, shown) {
                 info!(?wid, ?member, "Raising the app's member of the active context");
                 self.handle_layout_response(EventResponse {

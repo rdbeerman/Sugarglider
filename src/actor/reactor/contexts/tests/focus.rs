@@ -406,6 +406,33 @@ fn r40_activating_an_app_whose_main_window_is_parked_raises_its_member() {
     }
 }
 
+/// R24, R40, R36. App 1 is frontmost on window 1, which is in C. The user
+/// presses ⌘` and window 2, parked because it is only in D, becomes the main
+/// window. A window focus change inside the frontmost app is no app
+/// activation, so R40 doesn't raise window 1 again: R24 applies and
+/// Sugarglider switches to D, which shows window 2.
+#[test]
+fn r24_a_main_window_change_inside_the_frontmost_app_switches_to_its_context() {
+    let (mut s, _c, d) = one_app_in_two_contexts();
+    s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
+    s.reactor.handle_event(Event::ApplicationActivated(1, Quiet::Yes));
+    s.reactor
+        .handle_event(Event::ApplicationMainWindowChanged(1, Some(wid(1)), Quiet::Yes));
+    assert_eq!(Some(wid(1)), s.reactor.main_window());
+    let mut raises = capture_raises(&mut s);
+
+    s.reactor
+        .handle_event(Event::ApplicationMainWindowChanged(1, Some(wid(2)), Quiet::No));
+
+    assert_eq!(d, s.reactor.contexts.active());
+    let focused: Vec<Option<WindowId>> =
+        raise_requests(&mut raises).into_iter().map(|(_, focus)| focus).collect();
+    assert_eq!(vec![Some(wid(2))], focused);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    assert_eq!(vec![(wid(2), screen())], s.tiles());
+    assert_eq!(vec![wid(1)], s.parked());
+}
+
 /// R40. With several visible members, the most recently focused one is
 /// raised.
 #[test]

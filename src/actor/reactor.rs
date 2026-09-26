@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{mem, thread};
 
 use animation::{Animation, AnimationManager, Message as AnimationMessage};
-use main_window::MainWindowTracker;
+use main_window::{FocusSource, MainWindowTracker, RaisedWindow};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use parking::{Parked, ProcessLookup};
 use quit::PendingExit;
@@ -437,8 +437,8 @@ pub struct Reactor {
     /// What the last switch waits for before focus from outside counts
     /// again.
     switch_guard: focus::SwitchGuard,
-    /// A window that took focus before the reactor saw it.
-    focus_waiting: Option<WindowId>,
+    /// A window that took focus before the reactor saw it, and how.
+    focus_waiting: Option<(WindowId, FocusSource)>,
     /// Windows added to a context since the last switch. They count as
     /// members of the active context until the next switch.
     added_since_switch: HashSet<WindowId>,
@@ -1612,12 +1612,12 @@ impl Reactor {
                 }
             }
         }
-        if let Some(raised_window) = raised_window {
+        if let Some(RaisedWindow { wid: raised_window, source }) = raised_window {
             let spaces = self.screens.iter().flat_map(|screen| screen.space).collect();
             self.send_layout_event(LayoutEvent::WindowFocused(spaces, raised_window));
             self.update_active_screen();
             if !ends_finder_wait {
-                self.focus_changed(raised_window);
+                self.focus_changed(raised_window, source);
             }
         }
         if !self.in_drag {
