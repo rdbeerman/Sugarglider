@@ -523,7 +523,8 @@ fn r23_a_window_list_between_the_closes_of_a_quit_keeps_the_first_windows_record
             records(&s, d),
             "{listed}"
         );
-        let saved: Vec<String> = vec!["Window1".to_string(), "Doc A".to_string(), "Doc B".to_string()];
+        let saved: Vec<String> =
+            vec!["Window1".to_string(), "Doc A".to_string(), "Doc B".to_string()];
         assert_eq!(saved, saved_members(&s, c), "{listed}");
     }
 }
