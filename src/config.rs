@@ -1931,6 +1931,77 @@ mod tests {
         }
     }
 
+    /// A `[keys]` entry whose command changes keeps its spellings and
+    /// comments: the writer copies the entry's decor onto the new value.
+    #[test]
+    fn preferences_keep_the_comment_of_a_binding_whose_command_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "[settings]\ndefault_keys = false\n\n[keys]\n\
+             # Terminal\n\
+             \"Alt + Q\" = { exec = \"open -a Terminal\" } # was debug\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+
+        let mut prefs = preferences_for(&config);
+        prefs
+            .hotkeys
+            .iter_mut()
+            .find(|hotkey| hotkey.key == "⌥Q")
+            .expect("Alt + Q is shown")
+            .command = r#"{"exec":"open -a Safari"}"#.to_string();
+
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# Terminal"), "{written}");
+        assert!(written.contains("# was debug"), "{written}");
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            command_json(&WmCommand::Wm(WmCmd::Exec(ExecCmd::String(
+                "open -a Safari".to_string()
+            )))),
+            command_json(&saved.keys[0].1),
+            "{written}"
+        );
+    }
+
+    /// A context command survives the Preferences JSON, the file it writes,
+    /// and a fresh load.
+    #[test]
+    fn context_bindings_survive_json_toml_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "[settings]\ndefault_keys = false\n\n[keys]\n\
+             \"Ctrl + Alt + Digit7\" = { switch_context = 7 }\n\
+             \"Ctrl + Alt + KeyC\" = { switch_context = \"Comms\" }\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+
+        let mut prefs = preferences_for(&config);
+        rebind(&mut prefs, "⌃⌥7", "⌃⌥8");
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            sorted_bindings(&prefs.apply_to_config(&config).keys),
+            sorted_bindings(&saved.keys)
+        );
+        let commands: Vec<String> = saved
+            .keys
+            .iter()
+            .map(|(_, cmd)| command_json(cmd).to_string())
+            .collect();
+        assert!(commands.contains(&r#"{"switch_context":7}"#.to_string()));
+        assert!(commands.contains(&r#"{"switch_context":"Comms"}"#.to_string()));
+    }
+
     fn leaf_keys(prefix: &str, table: &toml::Table, keys: &mut Vec<String>) {
         for (key, value) in table {
             let path = format!("{prefix}.{key}");

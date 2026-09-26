@@ -81,6 +81,30 @@ final class PreferencesConfigTests: XCTestCase {
     XCTAssertFalse(PreferencesConfig().contextsEnable)
   }
 
+  /// A window rule's conditions decode and encode under the names Rust
+  /// writes, so the window carries them back in a save.
+  func testDecodesAndEncodesWindowRuleConditions() throws {
+    let json = """
+      {
+        "appName": "Finder", "behavior": "float",
+        "titleRegex": "Picture-in-Picture", "titleSubstring": "Prefs",
+        "axRole": "AXWindow", "axSubrole": "AXDialog"
+      }
+      """
+    let rule = try JSONDecoder().decode(WindowRuleJson.self, from: Data(json.utf8))
+
+    XCTAssertEqual(rule.titleRegex, "Picture-in-Picture")
+    XCTAssertEqual(rule.titleSubstring, "Prefs")
+    XCTAssertEqual(rule.axRole, "AXWindow")
+    XCTAssertEqual(rule.axSubrole, "AXDialog")
+
+    let encoded = try Self.jsonObject(JSONEncoder().encode(rule))
+    XCTAssertEqual(encoded["titleRegex"] as? String, "Picture-in-Picture")
+    XCTAssertEqual(encoded["titleSubstring"] as? String, "Prefs")
+    XCTAssertEqual(encoded["axRole"] as? String, "AXWindow")
+    XCTAssertEqual(encoded["axSubrole"] as? String, "AXDialog")
+  }
+
   /// Each decoded binding is its own row, even when two are alike.
   func testDecodedBindingsHaveTheirOwnIdentity() throws {
     let binding = """
