@@ -50,10 +50,23 @@ final class ContextSwitcherPanel: NSPanel {
   }
 
   private func handleKey(_ event: NSEvent) -> Bool {
-    guard event.type == .keyDown, isKeyWindow, let keyHandler,
-      let key = SwitcherKey(event: event)
-    else { return false }
+    guard event.type == .keyDown, isKeyWindow else { return false }
+    return handleKeyDown(event)
+  }
+
+  /// Gives a key-down event to `keyHandler`. While the text field composes
+  /// text, every key belongs to the input method, so ↩ commits the
+  /// composition instead of acting on the list.
+  func handleKeyDown(_ event: NSEvent) -> Bool {
+    guard !isComposingText, let keyHandler, let key = SwitcherKey(event: event) else {
+      return false
+    }
     return keyHandler(key)
+  }
+
+  /// Whether the focused text field holds marked text from an input method.
+  var isComposingText: Bool {
+    (firstResponder as? NSTextInputClient)?.hasMarkedText() == true
   }
 
   /// A frame of `size` centered in `visibleFrame`.
