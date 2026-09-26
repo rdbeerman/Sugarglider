@@ -60,20 +60,31 @@ impl Reactor {
         }
     }
 
-    /// R20, R21. Matches windows that appeared after startup together
-    /// against the member records, and has each window that matches nothing
-    /// join the context its screen shows. Returns whether any window joined
-    /// or rejoined a context.
+    /// R20, R21, R36. A new tab of a native tab group that the reactor knows
+    /// joins the contexts of the group's main tab. The other windows are
+    /// matched together against the member records, and each window that
+    /// matches nothing joins the context its screen shows. Returns whether
+    /// any window joined or rejoined a context.
     fn windows_appeared(&mut self, windows: &[WindowDesc]) -> bool {
+        let new: Vec<WindowId> = windows.iter().map(|window| window.wid).collect();
+        let mut changed = false;
         let mut by_context: Vec<(ContextKey, Vec<WindowDesc>)> = vec![];
         for window in windows {
+            let main_tab =
+                self.main_tab(window.wid).filter(|&main| !new.contains(&main)).or_else(|| {
+                    let tabs = self.tabs_of(window.wid);
+                    tabs.into_iter().find(|tab| !new.contains(tab))
+                });
+            if let Some(main_tab) = main_tab {
+                changed |= self.join_tab_group(window, main_tab);
+                continue;
+            }
             let key = self.arrival_context(window.wid);
             match by_context.iter_mut().find(|(other, _)| *other == key) {
                 Some((_, group)) => group.push(window.clone()),
                 None => by_context.push((key, vec![window.clone()])),
             }
         }
-        let mut changed = false;
         for (key, group) in by_context {
             let arrivals = self.contexts.windows_appeared(&group, key);
             for (window, arrival) in group.iter().zip(arrivals) {
@@ -82,6 +93,54 @@ impl Reactor {
             }
         }
         changed
+    }
+
+    /// The windows of the app that share the window's frame, the window
+    /// first. Native tabs of one group are separate windows with one frame.
+    /// Parked windows share a corner without being tabs.
+    pub(super) fn tabs_of(&self, wid: WindowId) -> Vec<WindowId> {
+        let Some(window) = self.windows.get(&wid) else {
+            return vec![];
+        };
+        if self.parked.contains_key(&wid) {
+            return vec![wid];
+        }
+        let key = Self::frame_key(&window.frame_monotonic);
+        let mut tabs: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|&(&other, other_window)| {
+                other != wid
+                    && other.pid == wid.pid
+                    && !self.parked.contains_key(&other)
+                    && Self::frame_key(&other_window.frame_monotonic) == key
+            })
+            .map(|(&other, _)| other)
+            .collect();
+        tabs.sort();
+        tabs.insert(0, wid);
+        tabs
+    }
+
+    /// The main tab of the window's tab group: the app's main window when it
+    /// is one of the group's tabs other than `wid`.
+    fn main_tab(&self, wid: WindowId) -> Option<WindowId> {
+        let main = self.main_window_tracker.app_main_window(wid.pid)?;
+        (main != wid && self.tabs_of(wid).contains(&main)).then_some(main)
+    }
+
+    /// R36. A new tab joins the contexts of its group's main tab, and is
+    /// pinned when the main tab is. Returns whether it joined anything.
+    fn join_tab_group(&mut self, tab: &WindowDesc, main_tab: WindowId) -> bool {
+        let mut joined = false;
+        for id in self.contexts.contexts_of(main_tab) {
+            joined |= self.contexts.add_window(id, tab).unwrap_or(false);
+        }
+        if self.contexts.is_pinned(main_tab) {
+            joined |= self.contexts.pin(tab);
+        }
+        debug!(wid = ?tab.wid, ?main_tab, joined, "A new tab joined its group's contexts");
+        joined
     }
 
     /// The context a new window joins when it matches no record: the one

@@ -107,6 +107,12 @@ impl MainWindowTracker {
         None
     }
 
+    /// The main window that the app last reported, whether or not it is
+    /// active.
+    pub fn app_main_window(&self, pid: pid_t) -> Option<WindowId> {
+        self.apps.get(&pid)?.main_window
+    }
+
     /// The main window of the active app, if any.
     pub fn main_window(&self) -> Option<WindowId> {
         // Because apps self-report this event from their respective

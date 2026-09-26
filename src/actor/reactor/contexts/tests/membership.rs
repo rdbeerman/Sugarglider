@@ -596,3 +596,42 @@ fn r39_a_parked_window_that_its_app_moves_back_is_parked_again_at_once() {
     assert_eq!(journal, s.journal_on_disk());
     assert_eq!(vec![(wid(1), screen())], s.tiles());
 }
+
+/// R36. A new native tab shares the frame of its group. It joins the
+/// contexts of the group's main tab, here C and D, and not only the active
+/// context, and it is pinned when the main tab is. It takes no tile of its
+/// own.
+#[test]
+fn r36_a_new_tab_joins_the_contexts_of_its_groups_main_tab() {
+    for pinned in [false, true] {
+        let mut s = Setup::new(2);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        let d = s.create("D", &[wid(1)]);
+        if pinned {
+            s.reactor.contexts.pin(&s.desc(wid(1)));
+        }
+        s.switch(c);
+        let tiles = s.tiles();
+        s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        s.reactor.handle_event(Event::ApplicationActivated(1, Quiet::Yes));
+        s.reactor
+            .handle_event(Event::ApplicationMainWindowChanged(1, Some(wid(1)), Quiet::Yes));
+
+        let tab = WindowInfo {
+            frame: s.frame(wid(1)),
+            ..make_window(3)
+        };
+        open_window(&mut s, wid(3), tab, &[wid(1), wid(2)]);
+
+        assert_eq!(
+            vec![id_of(c), id_of(d)],
+            s.reactor.contexts.contexts_of(wid(3)),
+            "pinned: {pinned}"
+        );
+        assert_eq!(pinned, s.reactor.contexts.is_pinned(wid(3)));
+        assert_eq!(tiles, s.tiles());
+        assert!(s.parked().is_empty());
+        s.switch(d);
+        assert_eq!(vec![wid(2)], s.parked());
+    }
+}
