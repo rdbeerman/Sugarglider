@@ -2250,4 +2250,1455 @@ mod tests {
         assert_eq!(restored.pinned()[0].link, RecordLink::Empty);
         assert!(restored.contexts_of(open.wid).is_empty());
     }
+
+    fn context_names(cx: &Contexts) -> Vec<&str> {
+        cx.contexts().iter().map(|c| c.name.as_str()).collect()
+    }
+
+    fn records(cx: &Contexts, id: ContextId) -> Vec<(&str, RecordLink)> {
+        cx.get(id).unwrap().members.iter().map(|m| (m.title.as_str(), m.link)).collect()
+    }
+
+    fn exact_title(slot: Slot, index: usize) -> RecordMatch {
+        RecordMatch {
+            slot,
+            index,
+            step: MatchStep::ExactTitle,
+        }
+    }
+
+    /// R1: a context holds one window of an app, not the app's other windows.
+    #[test]
+    fn r1_a_context_holds_windows_not_apps() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let docs = window(1, 1, "Chrome", "Docs");
+        let mail = window(1, 2, "Chrome", "Mail");
+        assert!(cx.add_window(a, &docs).unwrap());
+        assert_eq!(
+            cx.get(a).unwrap().members,
+            vec![MemberRecord {
+                bundle_id: Some("com.example.Chrome".into()),
+                app_name: Some("Chrome".into()),
+                title: "Docs".into(),
+                window_server_id: Some(WindowServerId(1001)),
+                link: RecordLink::Live(docs.wid),
+            }]
+        );
+        assert_eq!(cx.contexts_of(mail.wid), vec![]);
+        assert!(cx.is_unsorted(mail.wid));
+        cx.switch_to(named(a)).unwrap();
+        let plan = plan_switch(&one_screen(
+            cx.active(),
+            vec![cx.switch_window(docs.wid), cx.switch_window(mail.wid)],
+        ));
+        assert_eq!(plan.park, vec![mail.wid]);
+    }
+
+    /// R3: a pinned window shows in a context created after it was pinned,
+    /// and focusing it there never switches.
+    #[test]
+    fn r3_a_context_created_after_pinning_shows_the_pinned_windows() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let music = window(1, 1, "Music", "Music");
+        let timer = window(2, 1, "Timer", "Timer");
+        let mail = window(3, 1, "Mail", "Inbox");
+        cx.add_window(a, &mail).unwrap();
+        cx.pin(&music);
+        cx.pin(&timer);
+        let later = cx.create("Later").unwrap();
+        cx.switch_to(named(later)).unwrap();
+        let plan = plan_switch(&one_screen(
+            cx.active(),
+            vec![
+                cx.switch_window(music.wid),
+                SwitchWindow {
+                    parked: true,
+                    ..cx.switch_window(timer.wid)
+                },
+                cx.switch_window(mail.wid),
+            ],
+        ));
+        assert_eq!(plan.park, vec![mail.wid]);
+        assert_eq!(plan.unpark, vec![timer.wid]);
+        assert_eq!(cx.focus_target(music.wid), named(later));
+        assert_eq!(cx.contexts_of(music.wid), vec![]);
+        assert!(!cx.is_unsorted(music.wid));
+    }
+
+    /// R3: a pinned window that rejoins after its app relaunched is a member
+    /// of contexts created after the relaunch.
+    #[test]
+    fn r3_a_rejoined_pinned_window_is_in_contexts_created_later() {
+        let mut cx = Contexts::new();
+        cx.pin(&window(1, 1, "Music", "Music"));
+        cx.app_terminated(1);
+        let relaunched = window(2, 1, "Music", "Music");
+        assert_eq!(
+            cx.window_appeared(&relaunched, ContextKey::Everything),
+            Arrival::Rejoined(vec![exact_title(Slot::Pinned, 0)])
+        );
+        let later = cx.create("Later").unwrap();
+        assert!(cx.is_member(named(later), relaunched.wid));
+        assert!(cx.is_member(ContextKey::Unsorted, relaunched.wid));
+        assert!(!cx.is_unsorted(relaunched.wid));
+    }
+
+    /// R4: the reserved names are refused in any case and with surrounding
+    /// spaces, for new contexts and for renames.
+    #[test]
+    fn r4_reserved_names_are_refused_in_any_case() {
+        let mut cx = Contexts::new();
+        for (name, reported) in [
+            ("EVERYTHING", "EVERYTHING"),
+            (" everything ", "everything"),
+            ("uNsOrTeD", "uNsOrTeD"),
+        ] {
+            assert_eq!(cx.create(name), Err(ContextError::ReservedName(reported.into())));
+        }
+        let a = cx.create("A").unwrap();
+        assert_eq!(
+            cx.rename(a, "Everything"),
+            Err(ContextError::ReservedName("Everything".into()))
+        );
+        assert_eq!(context_names(&cx), vec!["A"]);
+    }
+
+    /// R4: names are unique ignoring case, accented letters included, and a
+    /// deleted context's name is free again.
+    #[test]
+    fn r4_case_variants_are_refused_until_the_name_is_free() {
+        let mut cx = Contexts::new();
+        assert_eq!(cx.create(""), Err(ContextError::EmptyName));
+        let cafe = cx.create("  Café  ").unwrap();
+        assert_eq!(cx.get(cafe).unwrap().name, "Café");
+        for variant in ["café", "CAFÉ", " cAfÉ "] {
+            assert_eq!(cx.create(variant), Err(ContextError::NameTaken("Café".into())));
+        }
+        let other = cx.create("Other").unwrap();
+        assert_eq!(
+            cx.rename(other, "CAFÉ"),
+            Err(ContextError::NameTaken("Café".into()))
+        );
+        assert_eq!(cx.rename(other, " "), Err(ContextError::EmptyName));
+        assert_eq!(
+            cx.rename(ContextId(99), "Fresh"),
+            Err(ContextError::NoSuchContext)
+        );
+        assert_eq!(context_names(&cx), vec!["Café", "Other"]);
+        cx.delete(cafe).unwrap();
+        let again = cx.create("CAFÉ").unwrap();
+        assert_eq!(context_names(&cx), vec!["Other", "CAFÉ"]);
+        assert_ne!(again, cafe);
+    }
+
+    /// R4 holds for a loaded `contexts.json`: no loaded name is empty,
+    /// reserved, or a case variant of another. Refusing the file is also
+    /// acceptable.
+    #[test]
+    #[ignore = "bug: contexts.json loads empty, reserved, and case-duplicate names"]
+    fn r4_loaded_names_are_unique_and_not_reserved() {
+        let doc = serde_json::json!({
+            "version": 1,
+            "next_id": 6,
+            "use_seq": 0,
+            "contexts": [
+                { "id": 1, "name": "Comms" },
+                { "id": 2, "name": "comms" },
+                { "id": 3, "name": "Everything" },
+                { "id": 4, "name": " unsorted " },
+                { "id": 5, "name": " " }
+            ]
+        });
+        let Ok(cx) = serde_json::from_value::<Contexts>(doc) else {
+            return;
+        };
+        let mut seen: Vec<String> = Vec::new();
+        for context in cx.contexts() {
+            let name = context.name.trim().to_lowercase();
+            assert!(!name.is_empty(), "empty name {:?}", context.name);
+            assert!(
+                name != "everything" && name != "unsorted",
+                "reserved name {:?}",
+                context.name
+            );
+            assert!(!seen.contains(&name), "repeated name {:?}", context.name);
+            seen.push(name);
+        }
+    }
+
+    /// R5: a new context takes the lowest number that renumbering left
+    /// free, and a stolen number leaves its old owner without one.
+    #[test]
+    fn r5_new_contexts_take_numbers_freed_by_renumbering() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        cx.set_number(a, Some(5)).unwrap();
+        cx.set_number(b, Some(2)).unwrap();
+        let c = cx.create("C").unwrap();
+        let d = cx.create("D").unwrap();
+        cx.set_number(c, Some(5)).unwrap();
+        let e = cx.create("E").unwrap();
+        assert_eq!(
+            [a, b, c, d, e].map(|id| cx.get(id).unwrap().number),
+            [None, Some(2), Some(5), Some(3), Some(1)]
+        );
+    }
+
+    /// R5: a loaded number outside 1 to 9, 0 included, is dropped, and a new
+    /// context skips the loaded numbers.
+    #[test]
+    fn r5_loaded_numbers_outside_one_to_nine_are_dropped() {
+        let doc = serde_json::json!({
+            "version": 1,
+            "next_id": 4,
+            "use_seq": 0,
+            "contexts": [
+                { "id": 1, "name": "A", "number": 0 },
+                { "id": 2, "name": "B", "number": 1 },
+                { "id": 3, "name": "C", "number": 9 }
+            ]
+        });
+        let mut cx: Contexts = serde_json::from_value(doc).unwrap();
+        let d = cx.create("D").unwrap();
+        assert_eq!(d, ContextId(4));
+        assert_eq!(
+            cx.contexts().iter().map(|c| c.number).collect::<Vec<_>>(),
+            vec![None, Some(1), Some(9), Some(2)]
+        );
+    }
+
+    /// R6: after the active context is deleted, Unsorted is active. A switch
+    /// then keeps the windows that were only in the deleted context, parks
+    /// the ones in another context, and puts back the unsorted ones.
+    #[test]
+    fn r6_deleting_the_active_context_keeps_its_only_members_visible() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let only_a = window(1, 1, "App", "Only A");
+        let shared = window(1, 2, "App", "Shared");
+        let only_b = window(2, 1, "Other", "Only B");
+        let loose = window(3, 1, "Loose", "Loose");
+        let music = window(4, 1, "Music", "Music");
+        cx.add_window(a, &only_a).unwrap();
+        cx.add_window(a, &shared).unwrap();
+        cx.add_window(b, &shared).unwrap();
+        cx.add_window(b, &only_b).unwrap();
+        cx.pin(&music);
+        cx.switch_to(named(a)).unwrap();
+        assert_eq!(cx.delete(a).unwrap().name, "A");
+        assert_eq!(cx.active(), ContextKey::Unsorted);
+        assert_eq!(context_names(&cx), vec!["B"]);
+        assert_eq!(
+            records(&cx, b),
+            vec![
+                ("Shared", RecordLink::Live(shared.wid)),
+                ("Only B", RecordLink::Live(only_b.wid)),
+            ]
+        );
+        // Under A, only_b and loose were parked.
+        let plan = plan_switch(&one_screen(
+            cx.active(),
+            vec![
+                cx.switch_window(only_a.wid),
+                cx.switch_window(shared.wid),
+                SwitchWindow {
+                    parked: true,
+                    ..cx.switch_window(only_b.wid)
+                },
+                SwitchWindow {
+                    parked: true,
+                    ..cx.switch_window(loose.wid)
+                },
+                cx.switch_window(music.wid),
+            ],
+        ));
+        assert_eq!(plan.park, vec![shared.wid]);
+        assert_eq!(plan.unpark, vec![loose.wid]);
+    }
+
+    /// R6, R18: deleting the active context never leaves the previous
+    /// context equal to the new active one.
+    #[test]
+    #[ignore = "bug: deleting the active context can leave previous() equal to active()"]
+    fn r6_deleting_the_active_context_never_makes_it_previous() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        cx.switch_to(ContextKey::Unsorted).unwrap();
+        cx.switch_to(named(a)).unwrap();
+        cx.delete(a).unwrap();
+        assert_eq!(cx.active(), ContextKey::Unsorted);
+        assert_ne!(cx.previous(), Some(ContextKey::Unsorted));
+    }
+
+    /// R10: a window on a Space nobody sees is left alone. When its Space
+    /// becomes visible, the same active context applies to it.
+    #[test]
+    fn r10_windows_are_planned_when_their_space_becomes_visible() {
+        let stray = member_of(wid(1, 1), &[B]);
+        let plan = plan_switch(&one_screen(
+            ContextKey::Named(A),
+            vec![SwitchWindow {
+                unseen_space: true,
+                ..stray.clone()
+            }],
+        ));
+        assert_eq!(plan, SwitchPlan::default());
+        let parked_member = SwitchWindow {
+            parked: true,
+            ..member_of(wid(1, 2), &[A])
+        };
+        let plan = plan_switch(&one_screen(ContextKey::Named(A), vec![stray, parked_member]));
+        assert_eq!(
+            plan,
+            SwitchPlan {
+                park: vec![wid(1, 1)],
+                unpark: vec![wid(1, 2)],
+                focus: Some(wid(1, 2)),
+            }
+        );
+    }
+
+    /// R12: with no screens or no windows, a switch does nothing.
+    #[test]
+    fn r12_a_switch_without_windows_plans_nothing() {
+        assert_eq!(
+            plan_switch(&SwitchInput { screens: vec![] }),
+            SwitchPlan::default()
+        );
+        for active in [
+            ContextKey::Everything,
+            ContextKey::Unsorted,
+            ContextKey::Named(A),
+        ] {
+            assert_eq!(plan_switch(&one_screen(active, vec![])), SwitchPlan::default());
+        }
+    }
+
+    /// R7, R12: in global scope the focus goes to the most recently focused
+    /// member on any screen, including a member that is put back.
+    #[test]
+    fn r12_focus_is_the_most_recently_focused_member_on_any_screen() {
+        let input = SwitchInput {
+            screens: vec![
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![
+                        SwitchWindow {
+                            last_focus: Some(4),
+                            ..member_of(wid(1, 1), &[A])
+                        },
+                        SwitchWindow {
+                            last_focus: Some(9),
+                            ..member_of(wid(1, 2), &[B])
+                        },
+                    ],
+                },
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![
+                        SwitchWindow {
+                            last_focus: Some(7),
+                            parked: true,
+                            ..member_of(wid(2, 1), &[A, B])
+                        },
+                        SwitchWindow {
+                            last_focus: Some(6),
+                            pinned: true,
+                            ..member_of(wid(3, 1), &[])
+                        },
+                    ],
+                },
+            ],
+        };
+        assert_eq!(
+            plan_switch(&input),
+            SwitchPlan {
+                park: vec![wid(1, 2)],
+                unpark: vec![wid(2, 1)],
+                focus: Some(wid(2, 1)),
+            }
+        );
+    }
+
+    /// R3, R13: a switch shows exactly the members of the active context and
+    /// parks every other window. Pinned windows show under Unsorted too.
+    #[test]
+    fn r13_a_switch_shows_exactly_the_members_of_each_context() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let in_a = window(1, 1, "App", "In A");
+        let in_b = window(1, 2, "App", "In B");
+        let in_both = window(1, 3, "App", "In both");
+        let pinned = window(1, 4, "App", "Pinned");
+        let pinned_in_a = window(1, 5, "App", "Pinned in A");
+        let loose = window(1, 6, "App", "Loose");
+        for (id, w) in [
+            (a, &in_a),
+            (b, &in_b),
+            (a, &in_both),
+            (b, &in_both),
+            (a, &pinned_in_a),
+        ] {
+            cx.add_window(id, w).unwrap();
+        }
+        cx.pin(&pinned);
+        cx.pin(&pinned_in_a);
+        let all = [&in_a, &in_b, &in_both, &pinned, &pinned_in_a, &loose].map(|w| w.wid);
+        for (active, shown) in [
+            (ContextKey::Everything, all.to_vec()),
+            (
+                ContextKey::Unsorted,
+                vec![pinned.wid, pinned_in_a.wid, loose.wid],
+            ),
+            (
+                named(a),
+                vec![in_a.wid, in_both.wid, pinned.wid, pinned_in_a.wid],
+            ),
+            (
+                named(b),
+                vec![in_b.wid, in_both.wid, pinned.wid, pinned_in_a.wid],
+            ),
+        ] {
+            let plan = plan_switch(&one_screen(
+                active,
+                all.map(|wid| cx.switch_window(wid)).to_vec(),
+            ));
+            let hidden: Vec<WindowId> =
+                all.into_iter().filter(|wid| !shown.contains(wid)).collect();
+            assert_eq!(plan.park, hidden, "{active:?}");
+            let members: Vec<WindowId> =
+                all.into_iter().filter(|wid| cx.is_member(active, *wid)).collect();
+            assert_eq!(members, shown, "{active:?}");
+        }
+    }
+
+    /// R14 holds under Unsorted and every named context.
+    #[test]
+    fn r14_never_parks_protected_windows_under_any_context() {
+        let windows = vec![
+            SwitchWindow {
+                own: true,
+                ..member_of(wid(1, 1), &[A])
+            },
+            SwitchWindow {
+                untracked: true,
+                ..member_of(wid(1, 2), &[A])
+            },
+            SwitchWindow {
+                minimized: true,
+                ..member_of(wid(1, 3), &[A])
+            },
+            SwitchWindow {
+                app_hidden: true,
+                ..member_of(wid(1, 4), &[A])
+            },
+            SwitchWindow {
+                unseen_space: true,
+                ..member_of(wid(1, 5), &[A])
+            },
+        ];
+        for active in [ContextKey::Unsorted, ContextKey::Named(B)] {
+            let plan = plan_switch(&one_screen(active, windows.clone()));
+            assert_eq!(plan, SwitchPlan::default(), "{active:?}");
+        }
+    }
+
+    /// R16, R19: every switch, including one to the active context, takes
+    /// the next use number. A failed switch takes none.
+    #[test]
+    fn r19_every_switch_takes_the_next_use_number() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        cx.switch_to(named(a)).unwrap();
+        cx.switch_to(named(b)).unwrap();
+        cx.switch_to(named(b)).unwrap();
+        cx.switch_to(ContextKey::Everything).unwrap();
+        cx.switch_to(ContextKey::Unsorted).unwrap();
+        assert!(cx.switch_to(named(ContextId(99))).is_err());
+        assert_eq!(
+            [
+                named(a),
+                named(b),
+                ContextKey::Everything,
+                ContextKey::Unsorted
+            ]
+            .map(|key| cx.last_used(key)),
+            [1, 3, 4, 5]
+        );
+        assert_eq!(serde_json::to_value(&cx).unwrap()["use_seq"], 5);
+    }
+
+    /// R18: switching to the previous context again and again toggles
+    /// between the last two.
+    #[test]
+    fn r18_previous_context_toggles_between_the_last_two() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        cx.switch_to(named(a)).unwrap();
+        cx.switch_to(named(b)).unwrap();
+        for (active, previous) in [(a, b), (b, a), (a, b)] {
+            cx.switch_to(cx.previous().unwrap()).unwrap();
+            assert_eq!(
+                (cx.active(), cx.previous()),
+                (named(active), Some(named(previous)))
+            );
+        }
+    }
+
+    /// R20, R23: a new window that only matches a pending record joins the
+    /// active context. The pending record goes once the app shows it is
+    /// still running.
+    #[test]
+    fn r20_a_new_window_passes_over_pending_records() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let closed = window(1, 1, "Mail", "Inbox");
+        cx.add_window(a, &closed).unwrap();
+        cx.switch_to(named(b)).unwrap();
+        cx.window_closed(closed.wid);
+        let fresh = window(1, 2, "Mail", "Inbox");
+        assert_eq!(cx.window_appeared(&fresh, cx.active()), Arrival::Joined(b));
+        assert_eq!(records(&cx, a), vec![("Inbox", RecordLink::Pending(closed.wid))]);
+        cx.app_still_running(1);
+        assert_eq!(records(&cx, a), vec![]);
+        assert_eq!(records(&cx, b), vec![("Inbox", RecordLink::Live(fresh.wid))]);
+    }
+
+    /// R20: a live record never takes a second window with the same title.
+    #[test]
+    fn r20_a_second_window_with_a_members_title_joins_the_active_context() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let first = window(1, 1, "Terminal", "~/src");
+        cx.add_window(a, &first).unwrap();
+        cx.switch_to(named(b)).unwrap();
+        let second = window(1, 2, "Terminal", "~/src");
+        assert_eq!(cx.window_appeared(&second, cx.active()), Arrival::Joined(b));
+        assert_eq!(cx.contexts_of(first.wid), vec![a]);
+        assert_eq!(cx.contexts_of(second.wid), vec![b]);
+    }
+
+    /// R20, R22: when a window appears, step 4 doesn't claim it for a record
+    /// of its app with another title. It joins the active context and shows.
+    #[test]
+    fn r22_step_4_never_runs_when_a_window_appears() {
+        let (mut cx, ids) = with_records(&[
+            ("A", vec![empty_record("Chrome", "Docs", None)]),
+            ("B", vec![]),
+        ]);
+        cx.switch_to(named(ids[1])).unwrap();
+        let gmail = window(1, 1, "Chrome", "Gmail");
+        assert_eq!(cx.window_appeared(&gmail, cx.active()), Arrival::Joined(ids[1]));
+        assert_eq!(
+            cx.get(ids[0]).unwrap().members,
+            vec![empty_record("Chrome", "Docs", None)]
+        );
+        let plan = plan_switch(&one_screen(cx.active(), vec![cx.switch_window(gmail.wid)]));
+        assert_eq!(plan.park, vec![]);
+    }
+
+    /// R21: a relaunched window rejoins exactly the contexts that hold its
+    /// record, the records take its new details, and it shows while one of
+    /// those contexts is active.
+    #[test]
+    fn r21_a_rejoined_window_shows_only_under_its_contexts() {
+        let mut cx = Contexts::new();
+        let comms = cx.create("Comms").unwrap();
+        let relax = cx.create("Relax").unwrap();
+        let work = cx.create("Work").unwrap();
+        let whatsapp = window(1, 1, "WhatsApp", "WhatsApp");
+        cx.add_window(comms, &whatsapp).unwrap();
+        cx.add_window(relax, &whatsapp).unwrap();
+        cx.app_terminated(1);
+        cx.switch_to(named(relax)).unwrap();
+        let relaunched = window(2, 1, "WhatsApp", "WhatsApp");
+        assert_eq!(
+            cx.window_appeared(&relaunched, cx.active()),
+            Arrival::Rejoined(vec![
+                exact_title(Slot::Context(comms), 0),
+                exact_title(Slot::Context(relax), 0),
+            ])
+        );
+        let record = MemberRecord {
+            bundle_id: Some("com.example.WhatsApp".into()),
+            app_name: Some("WhatsApp".into()),
+            title: "WhatsApp".into(),
+            window_server_id: Some(WindowServerId(2001)),
+            link: RecordLink::Live(relaunched.wid),
+        };
+        assert_eq!(cx.get(comms).unwrap().members, vec![record.clone()]);
+        assert_eq!(cx.get(relax).unwrap().members, vec![record]);
+        assert_eq!(cx.get(work).unwrap().members, vec![]);
+        let plan = plan_switch(&one_screen(cx.active(), vec![cx.switch_window(relaunched.wid)]));
+        assert_eq!(plan.park, vec![]);
+        cx.switch_to(named(work)).unwrap();
+        let plan = plan_switch(&one_screen(cx.active(), vec![cx.switch_window(relaunched.wid)]));
+        assert_eq!(plan.park, vec![relaunched.wid]);
+    }
+
+    /// R22 step 1 needs the same app as well as the same window server id.
+    #[test]
+    #[ignore = "pending: R22 step 1 requires same app"]
+    fn r22_step_1_requires_the_same_app() {
+        let (cx, _) = with_records(&[("A", vec![empty_record("Other", "Unrelated", Some(1001))])]);
+        let w = window(1, 1, "App", "Title");
+        assert_eq!(match_window(&w, &cx, MatchPass::Switch), vec![]);
+    }
+
+    /// R22: within one context, a window server id match wins over an exact
+    /// title that comes first in the list.
+    #[test]
+    fn r22_step_1_beats_step_2_within_one_context() {
+        let (cx, ids) = with_records(&[(
+            "A",
+            vec![
+                empty_record("App", "Title", None),
+                empty_record("App", "Old title", Some(1001)),
+            ],
+        )]);
+        let w = window(1, 1, "App", "Title");
+        assert_eq!(
+            match_window(&w, &cx, MatchPass::Arrival),
+            vec![RecordMatch {
+                slot: Slot::Context(ids[0]),
+                index: 1,
+                step: MatchStep::WindowServerId,
+            }]
+        );
+    }
+
+    /// R21, R22: steps 1 and 2 have no "in no other context" condition, so a
+    /// window can match at step 1 in one context and at step 2 in another.
+    #[test]
+    fn r22_steps_1_and_2_match_in_different_contexts() {
+        let (cx, ids) = with_records(&[
+            ("A", vec![empty_record("App", "Old title", Some(1001))]),
+            ("B", vec![empty_record("App", "Title", None)]),
+        ]);
+        let w = window(1, 1, "App", "Title");
+        assert_eq!(
+            match_window(&w, &cx, MatchPass::Arrival),
+            vec![
+                RecordMatch {
+                    slot: Slot::Context(ids[0]),
+                    index: 0,
+                    step: MatchStep::WindowServerId,
+                },
+                exact_title(Slot::Context(ids[1]), 0),
+            ]
+        );
+    }
+
+    /// R22 step 2 needs exactly the same title. A title that differs only in
+    /// case matches at step 3.
+    #[test]
+    fn r22_step_2_is_case_sensitive() {
+        let (cx, ids) = with_records(&[("A", vec![empty_record("App", "Inbox", None)])]);
+        let w = window(1, 1, "App", "INBOX");
+        assert_eq!(
+            steps(&match_window(&w, &cx, MatchPass::Arrival)),
+            vec![(Slot::Context(ids[0]), MatchStep::SimilarTitle)]
+        );
+    }
+
+    /// R22: the same app means the same bundle id, even when two apps share
+    /// a name.
+    #[test]
+    fn r22_apps_that_share_a_name_but_not_a_bundle_id_never_match() {
+        let record = MemberRecord {
+            bundle_id: Some("com.google.Chrome".into()),
+            app_name: Some("Google Chrome".into()),
+            title: "Docs".into(),
+            window_server_id: None,
+            link: RecordLink::Empty,
+        };
+        let (cx, _) = with_records(&[("A", vec![record])]);
+        let beta = WindowDesc {
+            wid: wid(1, 1),
+            bundle_id: Some("com.google.Chrome.beta".into()),
+            app_name: Some("Google Chrome".into()),
+            title: "Docs".into(),
+            window_server_id: None,
+        };
+        assert_eq!(match_window(&beta, &cx, MatchPass::Switch), vec![]);
+    }
+
+    /// R22: an empty title never matches at step 2. Otherwise a new untitled
+    /// window would rejoin an old record and be parked (R21), the harm that
+    /// keeps step 4 out of arrivals. Rooms' exact-title pass also needs a
+    /// title.
+    #[test]
+    #[ignore = "bug: an empty record title matches any untitled window of its app at step 2"]
+    fn r22_an_empty_title_never_matches_at_step_2() {
+        let (mut cx, ids) =
+            with_records(&[("A", vec![empty_record("App", "", None)]), ("B", vec![])]);
+        cx.switch_to(named(ids[1])).unwrap();
+        let untitled = window(1, 1, "App", "");
+        assert_eq!(
+            cx.window_appeared(&untitled, cx.active()),
+            Arrival::Joined(ids[1])
+        );
+        assert_eq!(records(&cx, ids[0]), vec![("", RecordLink::Empty)]);
+    }
+
+    /// R22: each record binds one window, so two relaunched windows with one
+    /// title take two records, and a third window joins nothing.
+    #[test]
+    fn r22_two_windows_with_one_title_take_two_records() {
+        let (mut cx, ids) = with_records(&[(
+            "A",
+            vec![
+                empty_record("Chrome", "New Tab", None),
+                empty_record("Chrome", "New Tab", None),
+            ],
+        )]);
+        let first = window(1, 1, "Chrome", "New Tab");
+        let second = window(1, 2, "Chrome", "New Tab");
+        let third = window(1, 3, "Chrome", "New Tab");
+        let slot = Slot::Context(ids[0]);
+        assert_eq!(
+            cx.window_appeared(&first, ContextKey::Everything),
+            Arrival::Rejoined(vec![exact_title(slot, 0)])
+        );
+        assert_eq!(
+            cx.window_appeared(&second, ContextKey::Everything),
+            Arrival::Rejoined(vec![exact_title(slot, 1)])
+        );
+        assert_eq!(
+            cx.window_appeared(&third, ContextKey::Everything),
+            Arrival::Unsorted
+        );
+        assert_eq!(
+            records(&cx, ids[0]),
+            vec![
+                ("New Tab", RecordLink::Live(first.wid)),
+                ("New Tab", RecordLink::Live(second.wid)),
+            ]
+        );
+    }
+
+    /// R22 step 3, story 11: a window whose title changed a little while its
+    /// app was closed rejoins every context that holds its record.
+    #[test]
+    fn r22_step_3_rejoins_every_context_with_a_similar_record() {
+        let (mut cx, ids) = with_records(&[
+            ("Comms", vec![empty_record("WhatsApp", "WhatsApp", None)]),
+            ("Relax", vec![empty_record("WhatsApp", "WhatsApp", None)]),
+        ]);
+        let w = window(1, 1, "WhatsApp", "WhatsApp (3)");
+        assert_eq!(
+            steps(&cx.rejoin(&w, MatchPass::Arrival)),
+            vec![
+                (Slot::Context(ids[0]), MatchStep::SimilarTitle),
+                (Slot::Context(ids[1]), MatchStep::SimilarTitle),
+            ]
+        );
+        assert_eq!(
+            records(&cx, ids[1]),
+            vec![("WhatsApp (3)", RecordLink::Live(w.wid))]
+        );
+    }
+
+    /// R22: both titles need at least 4 characters after folding. Characters
+    /// are counted, not bytes, and combining accents don't count.
+    #[test]
+    fn r22_similar_titles_need_four_folded_characters_each() {
+        assert!(similar_titles("Mail", "Gmail"));
+        assert!(similar_titles("Mail", "MAIL"));
+        assert!(!similar_titles("Mai", "Mail"));
+        assert!(!similar_titles("Mai", "Main menu"));
+        assert!(!similar_titles("", ""));
+        assert!(!similar_titles("", "Mail"));
+        // 4 characters in 5 bytes.
+        assert!(similar_titles("Café", "Cafe society"));
+        // 3 characters in 9 bytes, then 4 in 12.
+        assert!(!similar_titles("日本語", "日本語の本"));
+        assert!(similar_titles("日本語の", "日本語の本"));
+        // 4 characters, one of them a combining accent.
+        assert!(!similar_titles("Moe\u{301}", "Moe\u{301} and more"));
+        assert!(similar_titles("Mote\u{301}", "mote and more"));
+    }
+
+    /// R22: without containment, a shared prefix of min(12, two-thirds of
+    /// the shorter title) is enough. These shorter titles have lengths that
+    /// are multiples of 3, so two-thirds is a whole number.
+    #[test]
+    fn r22_similar_prefix_threshold_at_whole_two_thirds() {
+        // Shorter title 6: 4 characters.
+        assert!(similar_titles("Report", "Repo-99"));
+        assert!(!similar_titles("Report", "Rep-999"));
+        // Shorter title 12: 8 characters.
+        assert!(similar_titles("Budget 2026a", "Budget 2-xxxxx"));
+        assert!(!similar_titles("Budget 2026a", "Budget -xxxxxx"));
+        // Shorter title 18: 12 characters.
+        assert!(similar_titles("Quarterly report 1", "Quarterly re-xxxxxxx"));
+        assert!(!similar_titles("Quarterly report 1", "Quarterly r-xxxxxxxx"));
+        // Shorter title 21: the cap of 12 applies, not 14.
+        assert!(similar_titles(
+            "Quarterly report 2026",
+            "Quarterly re-xxxxxxxxxx"
+        ));
+        assert!(!similar_titles(
+            "Quarterly report 2026",
+            "Quarterly r-xxxxxxxxxxx"
+        ));
+        // The order of the titles doesn't matter.
+        assert!(similar_titles("Repo-99", "Report"));
+        assert!(!similar_titles("Rep-999", "Report"));
+    }
+
+    /// R22: two-thirds of the shorter title is rounded down, as in Rooms'
+    /// `SlotMatcher.similar`, which the spec names as the definition.
+    #[test]
+    #[ignore = "bug: similar_titles rounds two-thirds of the shorter title up; Rooms rounds down"]
+    fn r22_similar_prefix_threshold_rounds_two_thirds_down() {
+        // Shorter title 4: 2 characters.
+        assert!(similar_titles("Plan", "Plxx"));
+        assert!(!similar_titles("Plan", "Pxxx"));
+        // Shorter title 7: 4 characters.
+        assert!(similar_titles("Q3 plan", "Q3 pitch"));
+        assert!(!similar_titles("Q3 plan", "Q3 xitch"));
+        // Shorter title 10: 6 characters.
+        assert!(similar_titles("Project AB", "Projec-99999"));
+        assert!(!similar_titles("Project AB", "Proje-999999"));
+    }
+
+    /// R23, Q4: ⌘Q where every window closes before the app terminates. The
+    /// records stay with their last titles and rejoin after a relaunch.
+    #[test]
+    fn r23_quit_with_windows_closed_before_termination() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let docs = window(1, 1, "Chrome", "New Tab");
+        let mail = window(1, 2, "Chrome", "Mail");
+        cx.add_window(a, &docs).unwrap();
+        cx.add_window(b, &docs).unwrap();
+        cx.add_window(b, &mail).unwrap();
+        cx.title_changed(docs.wid, "Docs");
+        cx.window_closed(docs.wid);
+        cx.window_closed(mail.wid);
+        assert_eq!(
+            records(&cx, b),
+            vec![
+                ("Docs", RecordLink::Pending(docs.wid)),
+                ("Mail", RecordLink::Pending(mail.wid)),
+            ]
+        );
+        cx.app_terminated(1);
+        assert_eq!(records(&cx, a), vec![("Docs", RecordLink::Empty)]);
+        assert_eq!(
+            records(&cx, b),
+            vec![("Docs", RecordLink::Empty), ("Mail", RecordLink::Empty)]
+        );
+        let docs_again = window(2, 1, "Chrome", "Docs");
+        let mail_again = window(2, 2, "Chrome", "Mail");
+        assert_eq!(
+            cx.window_appeared(&docs_again, ContextKey::Everything),
+            Arrival::Rejoined(vec![
+                exact_title(Slot::Context(a), 0),
+                exact_title(Slot::Context(b), 0),
+            ])
+        );
+        assert_eq!(
+            cx.window_appeared(&mail_again, ContextKey::Everything),
+            Arrival::Rejoined(vec![exact_title(Slot::Context(b), 1)])
+        );
+    }
+
+    /// R23, Q4: ⌘Q where the app terminates before its windows report
+    /// closed. The late closes change nothing.
+    #[test]
+    fn r23_quit_with_windows_closed_after_termination() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let docs = window(1, 1, "Chrome", "Docs");
+        let mail = window(1, 2, "Chrome", "Mail");
+        cx.add_window(a, &docs).unwrap();
+        cx.add_window(a, &mail).unwrap();
+        cx.app_terminated(1);
+        cx.window_closed(docs.wid);
+        cx.window_closed(mail.wid);
+        assert_eq!(
+            records(&cx, a),
+            vec![("Docs", RecordLink::Empty), ("Mail", RecordLink::Empty)]
+        );
+        let docs_again = window(2, 1, "Chrome", "Docs");
+        assert_eq!(
+            cx.window_appeared(&docs_again, ContextKey::Everything),
+            Arrival::Rejoined(vec![exact_title(Slot::Context(a), 0)])
+        );
+    }
+
+    /// R23, Q4: ⌘Q where one window closes before the app terminates and
+    /// the other after.
+    #[test]
+    fn r23_quit_with_one_window_closed_before_and_one_after_termination() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let docs = window(1, 1, "Chrome", "Docs");
+        let mail = window(1, 2, "Chrome", "Mail");
+        cx.add_window(a, &docs).unwrap();
+        cx.add_window(a, &mail).unwrap();
+        cx.window_closed(docs.wid);
+        cx.app_terminated(1);
+        cx.window_closed(mail.wid);
+        assert_eq!(
+            records(&cx, a),
+            vec![("Docs", RecordLink::Empty), ("Mail", RecordLink::Empty)]
+        );
+    }
+
+    /// R23, Q4: a window-server update that lists the app's remaining window
+    /// between the first close and termination shows the app is still
+    /// running, so the first window's records go. Q4 asks whether macOS
+    /// sends such an update during ⌘Q.
+    #[test]
+    fn r23_quit_with_an_update_listing_a_remaining_window_before_termination() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let docs = window(1, 1, "Chrome", "Docs");
+        let mail = window(1, 2, "Chrome", "Mail");
+        cx.add_window(a, &docs).unwrap();
+        cx.add_window(a, &mail).unwrap();
+        cx.add_window(b, &docs).unwrap();
+        cx.window_closed(docs.wid);
+        cx.app_still_running(1);
+        cx.app_terminated(1);
+        cx.window_closed(mail.wid);
+        assert_eq!(records(&cx, a), vec![("Mail", RecordLink::Empty)]);
+        assert_eq!(records(&cx, b), vec![]);
+        let docs_again = window(2, 1, "Chrome", "Docs");
+        let mail_again = window(2, 2, "Chrome", "Mail");
+        assert_eq!(
+            cx.window_appeared(&docs_again, ContextKey::Everything),
+            Arrival::Unsorted
+        );
+        assert_eq!(
+            cx.window_appeared(&mail_again, ContextKey::Everything),
+            Arrival::Rejoined(vec![exact_title(Slot::Context(a), 0)])
+        );
+    }
+
+    /// R23: another app's termination or activity leaves pending records
+    /// alone.
+    #[test]
+    fn r23_other_apps_leave_pending_records_alone() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let closed = window(1, 1, "App", "Closed");
+        cx.add_window(a, &closed).unwrap();
+        cx.window_closed(closed.wid);
+        cx.app_terminated(2);
+        cx.app_still_running(2);
+        assert_eq!(
+            records(&cx, a),
+            vec![("Closed", RecordLink::Pending(closed.wid))]
+        );
+    }
+
+    /// R23: records from an app's earlier run stay when the relaunched app
+    /// shows it is running, so windows it opens later can still rejoin.
+    #[test]
+    fn r23_a_relaunched_app_keeps_the_records_of_windows_still_to_come() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        cx.add_window(a, &window(1, 1, "Chrome", "Docs")).unwrap();
+        cx.add_window(a, &window(1, 2, "Chrome", "Mail")).unwrap();
+        cx.app_terminated(1);
+        let docs = window(2, 1, "Chrome", "Docs");
+        cx.window_appeared(&docs, ContextKey::Everything);
+        cx.app_still_running(2);
+        assert_eq!(
+            records(&cx, a),
+            vec![
+                ("Docs", RecordLink::Live(docs.wid)),
+                ("Mail", RecordLink::Empty),
+            ]
+        );
+        let mail = window(2, 2, "Chrome", "Mail");
+        assert_eq!(
+            cx.window_appeared(&mail, ContextKey::Everything),
+            Arrival::Rejoined(vec![exact_title(Slot::Context(a), 1)])
+        );
+    }
+
+    /// R23: a window closed for good leaves every context and the pinned
+    /// list.
+    #[test]
+    fn r23_a_window_closed_for_good_leaves_every_context_and_the_pinned_list() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let shared = window(1, 1, "App", "Shared");
+        let mail = window(1, 2, "App", "Mail");
+        cx.add_window(a, &shared).unwrap();
+        cx.add_window(a, &mail).unwrap();
+        cx.add_window(b, &shared).unwrap();
+        cx.pin(&shared);
+        cx.window_closed(shared.wid);
+        cx.app_still_running(1);
+        assert_eq!(records(&cx, a), vec![("Mail", RecordLink::Live(mail.wid))]);
+        assert_eq!(records(&cx, b), vec![]);
+        assert_eq!(cx.pinned(), &[]);
+    }
+
+    /// R24: focus on a member of the active context, pinned or not, never
+    /// switches. An unsorted window switches to Unsorted unless Unsorted is
+    /// already active.
+    #[test]
+    fn r24_focus_switches_only_for_windows_outside_the_active_context() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let shared = window(1, 1, "App", "Shared");
+        let music = window(2, 1, "Music", "Music");
+        let loose = window(3, 1, "Loose", "Loose");
+        cx.add_window(a, &shared).unwrap();
+        cx.add_window(b, &shared).unwrap();
+        cx.pin(&music);
+        cx.switch_to(named(b)).unwrap();
+        cx.switch_to(named(a)).unwrap();
+        let targets = |cx: &Contexts| [&shared, &music, &loose].map(|w| cx.focus_target(w.wid));
+        assert_eq!(targets(&cx), [named(a), named(a), ContextKey::Unsorted]);
+        cx.switch_to(ContextKey::Unsorted).unwrap();
+        assert_eq!(
+            targets(&cx),
+            [named(a), ContextKey::Unsorted, ContextKey::Unsorted]
+        );
+    }
+
+    /// R24: a new window's membership is decided before its focus counts, so
+    /// a launched app never switches to Unsorted, and a window that rejoined
+    /// another context switches there.
+    #[test]
+    fn r24_a_new_window_is_placed_before_its_focus_counts() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        cx.add_window(b, &window(1, 1, "Mail", "Inbox")).unwrap();
+        cx.app_terminated(1);
+        cx.switch_to(named(a)).unwrap();
+        let launched = window(2, 1, "Notes", "Notes");
+        assert_eq!(cx.window_appeared(&launched, cx.active()), Arrival::Joined(a));
+        assert_eq!(cx.focus_target(launched.wid), named(a));
+        let relaunched = window(3, 1, "Mail", "Inbox");
+        assert_eq!(
+            cx.window_appeared(&relaunched, cx.active()),
+            Arrival::Rejoined(vec![exact_title(Slot::Context(b), 0)])
+        );
+        assert_eq!(cx.focus_target(relaunched.wid), named(b));
+    }
+
+    /// R27: Everything puts back every parked window, including ones on
+    /// Spaces nobody sees, windows of hidden apps, and pinned ones.
+    #[test]
+    fn r27_everything_puts_back_parked_windows_in_any_state() {
+        let windows = vec![
+            SwitchWindow {
+                parked: true,
+                unseen_space: true,
+                ..member_of(wid(1, 1), &[A])
+            },
+            SwitchWindow {
+                parked: true,
+                app_hidden: true,
+                ..member_of(wid(1, 2), &[])
+            },
+            SwitchWindow {
+                parked: true,
+                pinned: true,
+                ..member_of(wid(1, 3), &[B])
+            },
+            member_of(wid(1, 4), &[B]),
+        ];
+        let plan = plan_switch(&one_screen(ContextKey::Everything, windows));
+        assert_eq!(plan.unpark, vec![wid(1, 1), wid(1, 2), wid(1, 3)]);
+        assert_eq!(plan.park, vec![]);
+    }
+
+    /// R28: with no contexts, which is the model's state while the feature
+    /// flag is off, Everything stays active, new windows get no records,
+    /// focus never switches, and a switch moves no window.
+    #[test]
+    fn r28_without_contexts_nothing_changes() {
+        let mut cx = Contexts::new();
+        let windows = [window(1, 1, "App", "One"), window(2, 1, "Other", "Two")];
+        for w in &windows {
+            assert_eq!(cx.window_appeared(w, cx.active()), Arrival::Unsorted);
+            cx.window_focused(w.wid);
+            assert_eq!(cx.focus_target(w.wid), ContextKey::Everything);
+        }
+        let plan = plan_switch(&one_screen(
+            cx.active(),
+            windows.iter().map(|w| cx.switch_window(w.wid)).collect(),
+        ));
+        assert_eq!(plan.park, vec![]);
+        assert_eq!(plan.unpark, vec![]);
+        cx.title_changed(windows[0].wid, "Renamed");
+        cx.window_closed(windows[0].wid);
+        cx.app_terminated(1);
+        cx.app_still_running(2);
+        assert_eq!(cx.active(), ContextKey::Everything);
+        assert_eq!(
+            serde_json::to_value(&cx).unwrap(),
+            serde_json::json!({
+                "version": 1,
+                "next_id": 1,
+                "use_seq": 0,
+                "contexts": [],
+                "pinned": [],
+                "active": { "global": "everything" }
+            })
+        );
+    }
+
+    /// R29: Unsorted's members are computed from membership. A pinned window
+    /// shows under Unsorted but isn't counted as unsorted.
+    #[test]
+    fn r29_unsorted_membership_follows_the_named_contexts() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let w = window(1, 1, "App", "W");
+        let state =
+            |cx: &Contexts| (cx.is_unsorted(w.wid), cx.is_member(ContextKey::Unsorted, w.wid));
+        assert_eq!(state(&cx), (true, true));
+        cx.add_window(a, &w).unwrap();
+        assert_eq!(state(&cx), (false, false));
+        cx.pin(&w);
+        assert_eq!(state(&cx), (false, true));
+        cx.remove_window(a, w.wid).unwrap();
+        assert_eq!(state(&cx), (false, true));
+        cx.unpin(w.wid);
+        assert_eq!(state(&cx), (true, true));
+        cx.add_window(a, &w).unwrap();
+        cx.delete(a).unwrap();
+        assert_eq!(state(&cx), (true, true));
+    }
+
+    /// Switcher ranking: the kind of match decides first, recent use second.
+    #[test]
+    fn rank_orders_by_kind_of_match_before_recent_use() {
+        let mut cx = Contexts::new();
+        let ids = ["Crew", "Client work", "Big cwm", "CWS", "CW"].map(|n| cx.create(n).unwrap());
+        // The weakest match is the most recently used.
+        for id in ids.iter().rev() {
+            cx.switch_to(named(*id)).unwrap();
+        }
+        assert_eq!(
+            rank("cw", &cx, true),
+            vec![
+                (named(ids[4]), NameMatch::Exact),
+                (named(ids[3]), NameMatch::NamePrefix),
+                (named(ids[2]), NameMatch::WordPrefix),
+                (named(ids[1]), NameMatch::Initials),
+                (named(ids[0]), NameMatch::LettersInOrder),
+            ]
+        );
+        let mut cx = Contexts::new();
+        let ids = ["Clown town", "Client work", "Cl wonder"].map(|n| cx.create(n).unwrap());
+        for id in ids.iter().rev() {
+            cx.switch_to(named(*id)).unwrap();
+        }
+        assert_eq!(
+            rank("cl wo", &cx, true),
+            vec![
+                (named(ids[2]), NameMatch::NamePrefix),
+                (named(ids[1]), NameMatch::AllWordPrefixes),
+                (named(ids[0]), NameMatch::LettersInOrder),
+            ]
+        );
+    }
+
+    /// Switcher ranking: ties go to the most recently used entry, Everything
+    /// and Unsorted included. A blank query lists every entry.
+    #[test]
+    fn rank_ties_go_to_the_most_recently_used_entry_including_built_ins() {
+        let mut cx = Contexts::new();
+        let evening = cx.create("Evening").unwrap();
+        let comms = cx.create("Comms").unwrap();
+        let unsure = cx.create("Unsure").unwrap();
+        cx.switch_to(named(evening)).unwrap();
+        cx.switch_to(ContextKey::Everything).unwrap();
+        cx.switch_to(named(comms)).unwrap();
+        cx.switch_to(ContextKey::Unsorted).unwrap();
+        for blank in ["", "   "] {
+            assert_eq!(
+                ranked_names(blank, &cx, true),
+                vec!["Unsorted", "Comms", "Everything", "Evening", "Unsure"]
+            );
+        }
+        assert_eq!(ranked_names("ev", &cx, true), vec!["Everything", "Evening"]);
+        assert_eq!(ranked_names("uns", &cx, true), vec!["Unsorted", "Unsure"]);
+        cx.switch_to(named(unsure)).unwrap();
+        cx.switch_to(named(evening)).unwrap();
+        assert_eq!(ranked_names("ev", &cx, true), vec!["Evening", "Everything"]);
+        assert_eq!(ranked_names("uns", &cx, true), vec!["Unsure", "Unsorted"]);
+    }
+
+    /// Switcher ranking: an exact match ignores case and accents, for named
+    /// contexts and for Everything and Unsorted.
+    #[test]
+    fn rank_exact_match_ignores_case_and_accents() {
+        let mut cx = Contexts::new();
+        let cafe = cx.create("Café Crème").unwrap();
+        assert_eq!(
+            rank("CAFE CREME", &cx, true),
+            vec![(named(cafe), NameMatch::Exact)]
+        );
+        assert_eq!(
+            rank("everything", &cx, true),
+            vec![(ContextKey::Everything, NameMatch::Exact)]
+        );
+        assert_eq!(
+            rank("UNSORTED", &cx, true),
+            vec![(ContextKey::Unsorted, NameMatch::Exact)]
+        );
+    }
+
+    /// Switcher ranking: the words of a query match as prefixes in any
+    /// order, as in Rooms' `Matcher.rank`.
+    #[test]
+    #[ignore = "bug: multi-word queries must match the name's words in order; Rooms' Matcher.rank takes any order"]
+    fn rank_all_words_match_as_prefixes_in_any_order() {
+        assert_eq!(
+            match_of("wo cl", "Client work"),
+            Some(NameMatch::AllWordPrefixes)
+        );
+    }
+
+    /// Switcher ranking: a query without letters or digits matches nothing.
+    #[test]
+    #[ignore = "bug: a query with no letters or digits matches every entry as AllWordPrefixes"]
+    fn rank_a_query_without_letters_or_digits_matches_nothing() {
+        let mut cx = Contexts::new();
+        cx.create("Comms").unwrap();
+        cx.create("Client work").unwrap();
+        for query in ["-", "?", "–", "()"] {
+            assert_eq!(rank(query, &cx, true), vec![], "{query:?}");
+        }
+    }
+
+    /// Switcher ranking: as in Rooms' `Matcher.rank`, letters in order need
+    /// a query of at least 2 characters, so one character matches only the
+    /// start of a word.
+    #[test]
+    #[ignore = "bug: a one-character query matches letters inside words; Rooms needs 2 characters"]
+    fn rank_one_character_matches_only_word_starts() {
+        let mut cx = Contexts::new();
+        cx.create("Comms").unwrap();
+        cx.create("Client work").unwrap();
+        assert_eq!(ranked_names("w", &cx, false), vec!["Client work"]);
+        assert_eq!(ranked_names("o", &cx, false), Vec::<String>::new());
+    }
+
+    /// Switcher ranking compares names without accents, including accents
+    /// outside Latin-1 and Latin Extended-A.
+    #[test]
+    #[ignore = "bug: fold keeps precomposed accents outside Latin-1 and Latin Extended-A"]
+    fn rank_ignores_accents_outside_latin_1_and_extended_a() {
+        let mut cx = Contexts::new();
+        let hanoi = cx.create("Hà Nội").unwrap();
+        let lu = cx.create("Lǚ Xíng").unwrap();
+        assert_eq!(
+            rank("ha noi", &cx, false),
+            vec![(named(hanoi), NameMatch::Exact)]
+        );
+        assert_eq!(rank("lu xing", &cx, false), vec![(named(lu), NameMatch::Exact)]);
+    }
+
+    /// `fold` folds every letter of Latin-1 Supplement and Latin Extended-A
+    /// to lowercase ASCII. The expected values follow the letters' Unicode
+    /// names.
+    #[test]
+    fn fold_folds_every_latin_1_and_extended_a_letter() {
+        let table = [
+            ("ÀÁÂÃÄÅàáâãäåĀāĂăĄą", "a"),
+            ("Ææ", "ae"),
+            ("ÇçĆćĈĉĊċČč", "c"),
+            ("ÐðĎďĐđ", "d"),
+            ("ÈÉÊËèéêëĒēĔĕĖėĘęĚě", "e"),
+            ("ĜĝĞğĠġĢģ", "g"),
+            ("ĤĥĦħ", "h"),
+            ("ÌÍÎÏìíîïĨĩĪīĬĭĮįİı", "i"),
+            ("Ĳĳ", "ij"),
+            ("Ĵĵ", "j"),
+            ("Ķķĸ", "k"),
+            ("ĹĺĻļĽľĿŀŁł", "l"),
+            ("ÑñŃńŅņŇňŉŊŋ", "n"),
+            ("ÒÓÔÕÖØòóôõöøŌōŎŏŐő", "o"),
+            ("Œœ", "oe"),
+            ("ŔŕŖŗŘř", "r"),
+            ("ŚśŜŝŞşŠšſ", "s"),
+            ("ß", "ss"),
+            ("ŢţŤťŦŧ", "t"),
+            ("Þþ", "th"),
+            ("ÙÚÛÜùúûüŨũŪūŬŭŮůŰűŲų", "u"),
+            ("Ŵŵ", "w"),
+            ("ÝýÿŶŷŸ", "y"),
+            ("ŹźŻżŽž", "z"),
+        ];
+        for (letters, folded) in table {
+            for letter in letters.chars() {
+                assert_eq!(
+                    fold(&letter.to_string()),
+                    folded,
+                    "U+{:04X} {letter}",
+                    letter as u32
+                );
+            }
+        }
+        let mut covered: Vec<char> =
+            table.iter().flat_map(|(letters, _)| letters.chars()).collect();
+        covered.sort();
+        let letters: Vec<char> =
+            ('\u{C0}'..='\u{17F}').filter(|c| !matches!(c, '×' | '÷')).collect();
+        assert_eq!(covered, letters);
+    }
+
+    /// `fold` drops every combining diacritical mark.
+    #[test]
+    fn fold_drops_every_combining_diacritical_mark() {
+        for mark in '\u{300}'..='\u{36F}' {
+            assert_eq!(fold(&format!("A{mark}b")), "ab", "U+{:04X}", mark as u32);
+        }
+    }
+
+    /// `contexts.json` with fields this version doesn't know loads, and a
+    /// missing `active` loads as Everything.
+    #[test]
+    fn contexts_json_ignores_unknown_fields_and_a_missing_active() {
+        let doc = serde_json::json!({
+            "version": 1,
+            "next_id": 3,
+            "use_seq": 7,
+            "written_by": "a later Sugarglider",
+            "contexts": [
+                { "id": 2, "name": "Comms", "number": 4, "last_used": 7, "color": "blue",
+                  "members": [
+                      { "bundle_id": "net.whatsapp.WhatsApp", "app_name": "WhatsApp",
+                        "title": "WhatsApp", "window_server_id": 81234, "frame": [0, 25] }
+                  ] }
+            ],
+            "pinned": [
+                { "bundle_id": "com.apple.Music", "title": "Music", "space": 3 }
+            ]
+        });
+        let cx: Contexts = serde_json::from_value(doc).unwrap();
+        assert_eq!(cx.active(), ContextKey::Everything);
+        assert_eq!(
+            cx.contexts().to_vec(),
+            vec![Context {
+                id: ContextId(2),
+                name: "Comms".into(),
+                number: Some(4),
+                members: vec![MemberRecord {
+                    bundle_id: Some("net.whatsapp.WhatsApp".into()),
+                    app_name: Some("WhatsApp".into()),
+                    title: "WhatsApp".into(),
+                    window_server_id: Some(WindowServerId(81234)),
+                    link: RecordLink::Empty,
+                }],
+                last_used: 7,
+            }]
+        );
+        assert_eq!(
+            cx.pinned().to_vec(),
+            vec![MemberRecord {
+                bundle_id: Some("com.apple.Music".into()),
+                app_name: None,
+                title: "Music".into(),
+                window_server_id: None,
+                link: RecordLink::Empty,
+            }]
+        );
+        assert_eq!(
+            serde_json::to_value(&cx).unwrap()["active"],
+            serde_json::json!({ "global": "everything" })
+        );
+    }
+
+    /// `contexts.json` keeps membership, numbers, the active context, and
+    /// the use order. The previous context and focus order start fresh.
+    #[test]
+    fn contexts_json_keeps_membership_and_use_order_across_a_restart() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let w = window(1, 1, "App", "W");
+        cx.add_window(a, &w).unwrap();
+        cx.set_number(a, Some(7)).unwrap();
+        cx.switch_to(named(a)).unwrap();
+        cx.switch_to(named(b)).unwrap();
+        cx.window_focused(w.wid);
+        let restored = round_trip(&cx);
+        assert_eq!(restored.active(), named(b));
+        assert_eq!(restored.previous(), None);
+        assert_eq!([named(a), named(b)].map(|key| restored.last_used(key)), [1, 2]);
+        assert_eq!(restored.last_focus(w.wid), None);
+        assert_eq!(
+            restored
+                .contexts()
+                .iter()
+                .map(|c| (c.id, c.name.as_str(), c.number))
+                .collect::<Vec<_>>(),
+            vec![(a, "A", Some(7)), (b, "B", Some(2))]
+        );
+        assert_eq!(records(&restored, a), vec![("W", RecordLink::Empty)]);
+    }
+
+    /// Context ids are never reused, after a delete or a restart.
+    #[test]
+    fn context_ids_are_never_reused() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        cx.delete(b).unwrap();
+        let c = cx.create("C").unwrap();
+        let mut restored = round_trip(&cx);
+        restored.delete(c).unwrap();
+        let d = restored.create("D").unwrap();
+        assert_eq!([a, b, c, d].map(ContextId::get), [1, 2, 3, 4]);
+    }
+
+    /// Text that isn't a JSON object is an error, so the caller can move the
+    /// file aside.
+    #[test]
+    fn contexts_json_that_is_not_an_object_is_an_error() {
+        for text in ["", "null", "[]", "{", "not json"] {
+            assert!(serde_json::from_str::<Contexts>(text).is_err(), "{text:?}");
+        }
+    }
+
+    /// Extreme ids and use numbers in `contexts.json` don't panic. The file
+    /// is refused, or it loads with fresh unique ids and a working use order.
+    #[test]
+    #[ignore = "bug: an id of u32::MAX or a last_used of u64::MAX in contexts.json overflows"]
+    fn contexts_json_with_extreme_counters_never_overflows() {
+        let doc = serde_json::json!({
+            "version": 1,
+            "next_id": 1,
+            "use_seq": 0,
+            "contexts": [
+                { "id": u32::MAX, "name": "Last", "last_used": u64::MAX }
+            ]
+        });
+        let Ok(mut cx) = serde_json::from_value::<Contexts>(doc) else {
+            return;
+        };
+        let fresh = cx.create("Fresh").unwrap();
+        assert_ne!(fresh, ContextId(u32::MAX));
+        cx.switch_to(named(fresh)).unwrap();
+        assert!(cx.last_used(named(fresh)) > cx.last_used(named(ContextId(u32::MAX))));
+    }
 }
