@@ -221,7 +221,6 @@ default_keys = false
 # Context commands are experimental and not bound by default. If you enable
 # settings.experimental.contexts.enable, add keybindings in your personal
 # config under [keys], for example:
-# "Ctrl + Alt + Space" = "open_context_switcher"
 # "Ctrl + Alt + 0" = "show_everything"
 # "Ctrl + Alt + 1" = { switch_context = 1 }
 # "Ctrl + Alt + 2" = { switch_context = 2 }
