@@ -152,7 +152,7 @@ impl Reactor {
     /// hasn't reported it closed. A window that is minimized, that is only on
     /// another Space, or that was closed with ⌘W is not on screen, and its
     /// frame is its last tile, which another window of the app can share.
-    fn window_on_screen(&self, wid: WindowId) -> bool {
+    pub(super) fn window_on_screen(&self, wid: WindowId) -> bool {
         self.windows.get(&wid).is_some_and(|window| {
             window.window_server_id.is_some_and(|wsid| {
                 self.visible_windows.contains(&wsid) && !self.hidden_windows.contains(&wsid)

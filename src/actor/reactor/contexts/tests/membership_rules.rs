@@ -1386,7 +1386,6 @@ fn r36_r13_a_window_on_another_space_at_the_same_frame_is_no_tab() {
 /// longer lists it, and it counts as gone. A switch to C fills the record with
 /// window 2, the app's open window that is in no context, and window 2 shows.
 #[test]
-#[ignore = "bug: a switch fills an empty record at step 4 with a window closed with Cmd-W that was never reported destroyed"]
 fn r22_step_4_fills_a_record_with_an_open_window_and_not_a_closed_one() {
     let mut s = Setup::new(1);
     let c = s.create("C", &[wid(1)]);

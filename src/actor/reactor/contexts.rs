@@ -591,7 +591,10 @@ impl Reactor {
     /// Matches the windows of the running apps against the empty member
     /// records, as a switch to `target` does: a window that matches no
     /// record by its window server id or its title, and is in no context,
-    /// can fill an empty record of the target for its app.
+    /// can fill an empty record of the target for its app. Only windows on
+    /// screen take a record: a window closed with ⌘W that the app never
+    /// reported destroyed still has its last frame and no live window of
+    /// its own.
     fn rejoin_for_switch(&mut self, target: ContextKey) {
         let own_pid = std::process::id() as pid_t;
         let mut wids: Vec<WindowId> = self
@@ -599,6 +602,7 @@ impl Reactor {
             .keys()
             .copied()
             .filter(|wid| wid.pid != own_pid && self.apps.contains_key(&wid.pid))
+            .filter(|&wid| self.window_on_screen(wid))
             .filter(|&wid| {
                 self.layout_window_info(wid)
                     .is_some_and(|info| !self.layout.is_untracked(&info))
