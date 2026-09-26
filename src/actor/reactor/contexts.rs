@@ -705,6 +705,7 @@ mod tests {
     use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
 
     mod focus;
+    mod focus_rules;
     mod membership;
     mod membership_rules;
 

@@ -1,0 +1,638 @@
+// Copyright The Glide Authors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Reactor tests for the focus rules of M5b, taken from the spec: focus from
+//! outside on windows in no context, pinned windows, members, new windows and
+//! panels (R24), the end of a switch's wait (R25), raising a member instead
+//! of switching (R40), a new tab that takes focus (R36), and activating
+//! Finder when no window can take focus (R12 step 6). The raise manager's
+//! channel is replaced by one the test reads, and the test sends the
+//! activation and main window events that the raises would cause.
+
+use test_log::test;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tracing::Span;
+
+use super::*;
+use crate::actor::reactor::testing::{WindowState, test_app_info};
+use crate::sys::app::AppInfo;
+
+type Raises = UnboundedReceiver<(Span, raise::Event)>;
+
+/// Replaces the raise manager's channel with one the test reads.
+fn capture_raises(s: &mut Setup) -> Raises {
+    let (raise_manager_tx, raise_manager_rx) = mpsc::unbounded_channel();
+    s.reactor.raise_manager_tx = raise_manager_tx;
+    raise_manager_rx
+}
+
+/// The sequence id and the focus window of each raise request so far.
+fn raise_requests(raises: &mut Raises) -> Vec<(u64, Option<WindowId>)> {
+    let mut requests = vec![];
+    while let Ok((_, event)) = raises.try_recv() {
+        if let raise::Event::RaiseRequest(request) = event {
+            requests.push((request.sequence_id, request.focus_window.map(|(wid, _)| wid)));
+        }
+    }
+    requests
+}
+
+/// The focus window of each raise request so far.
+fn focused(raises: &mut Raises) -> Vec<Option<WindowId>> {
+    raise_requests(raises).into_iter().map(|(_, focus)| focus).collect()
+}
+
+/// Ends the raise sequences of earlier switches, as the raise manager's
+/// timeout would, so that focus from outside counts again.
+fn end_raises(s: &mut Setup) {
+    let sequence_id = s.reactor.raise_sequence;
+    s.reactor.handle_event(Event::RaiseTimeout { sequence_id });
+}
+
+/// How the events of an activation reach the reactor. macOS reports the
+/// app's global activation in its own order relative to the app's events.
+#[derive(Clone, Copy, Debug)]
+enum Order {
+    GloballyFirst,
+    GloballyLast,
+}
+
+/// The user activates app `pid`, whose main window is `main`, for example
+/// with ⌘-Tab.
+fn activate(s: &mut Setup, pid: i32, main: WindowId, order: Order) {
+    if let Order::GloballyFirst = order {
+        s.reactor.handle_event(Event::ApplicationGloballyActivated(pid));
+    }
+    s.reactor
+        .handle_event(Event::ApplicationMainWindowChanged(pid, Some(main), Quiet::No));
+    s.reactor.handle_event(Event::ApplicationActivated(pid, Quiet::No));
+    if let Order::GloballyLast = order {
+        s.reactor.handle_event(Event::ApplicationGloballyActivated(pid));
+    }
+}
+
+/// The window's app takes the focus, as a switch's own raise does, so that
+/// no focus from outside counts.
+fn focus_quietly(s: &mut Setup, wid: WindowId) {
+    s.reactor.handle_event(Event::ApplicationGloballyActivated(wid.pid));
+    s.reactor.handle_event(Event::ApplicationActivated(wid.pid, Quiet::Yes));
+    s.reactor.handle_event(Event::ApplicationMainWindowChanged(
+        wid.pid,
+        Some(wid),
+        Quiet::Yes,
+    ));
+    assert_eq!(Some(wid), s.reactor.main_window());
+}
+
+fn window_at(sys_id: u32, x: f64) -> WindowInfo {
+    WindowInfo {
+        sys_id: Some(WindowServerId::new(sys_id)),
+        frame: rect(x, 100., 50., 50.),
+        ..make_window(1)
+    }
+}
+
+/// Registers app `pid`, which `info` describes, with `windows`, and lists
+/// every window in `listed` and the app's as visible.
+fn launch(
+    s: &mut Setup,
+    pid: i32,
+    info: AppInfo,
+    windows: Vec<WindowInfo>,
+    listed: &[WindowId],
+) -> Vec<WindowId> {
+    let count = windows.len() as u32;
+    let events = s.apps.make_app_with_info(pid, info, windows, None, false);
+    s.reactor.handle_events(events);
+    let wids: Vec<WindowId> = (1..=count).map(|idx| WindowId::new(pid, idx)).collect();
+    let mut all = listed.to_vec();
+    all.extend(&wids);
+    report_visible(s, &all);
+    wids
+}
+
+fn finder_info() -> AppInfo {
+    AppInfo {
+        bundle_id: Some("com.apple.finder".into()),
+        localized_name: Some("Finder".into()),
+    }
+}
+
+/// The activations among `requests`.
+fn activations(requests: &[Request]) -> Vec<Quiet> {
+    requests
+        .iter()
+        .filter_map(|request| match request {
+            Request::Activate(quiet) => Some(*quiet),
+            _ => None,
+        })
+        .collect()
+}
+
+/// App 1's window 1, a member of C, and app 2's window, a member of D. C is
+/// active, so app 2's window is parked.
+struct TwoApps {
+    s: Setup,
+    c: ContextKey,
+    d: ContextKey,
+    other: WindowId,
+}
+
+fn two_apps() -> TwoApps {
+    let mut s = Setup::new(1);
+    let other = launch(&mut s, 2, test_app_info(2), vec![window_at(21, 700.)], &[wid(1)])[0];
+    let c = s.create("C", &[wid(1)]);
+    let d = s.create("D", &[other]);
+    s.switch(d);
+    s.switch(c);
+    end_raises(&mut s);
+    assert_eq!(vec![other], s.parked());
+    TwoApps { s, c, d, other }
+}
+
+/// R24. The user focuses a window that is in no context, of an app that has
+/// no member of C. Sugarglider switches to Unsorted and raises the window,
+/// which takes the whole screen, and C's member is parked. Both orders of the
+/// activation events give the same result.
+#[test]
+fn r24_focus_on_a_window_in_no_context_switches_to_unsorted() {
+    for order in [Order::GloballyFirst, Order::GloballyLast] {
+        let mut s = Setup::new(1);
+        let loose = launch(&mut s, 2, test_app_info(2), vec![window_at(21, 700.)], &[wid(1)])[0];
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        end_raises(&mut s);
+        assert_eq!(vec![loose], s.parked());
+        let mut raises = capture_raises(&mut s);
+
+        activate(&mut s, 2, loose, order);
+
+        assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active(), "{order:?}");
+        assert_eq!(vec![Some(loose)], focused(&mut raises), "{order:?}");
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(vec![(loose, screen())], s.tiles(), "{order:?}");
+        assert_eq!(screen(), s.frame(loose));
+        assert_eq!(vec![wid(1)], s.parked(), "{order:?}");
+    }
+}
+
+/// R24. While the screen shows Everything, focus on a window of a context
+/// switches nothing and raises nothing.
+#[test]
+fn r24_under_everything_focus_on_a_window_of_a_context_switches_nothing() {
+    let TwoApps { mut s, other, .. } = two_apps();
+    s.switch(ContextKey::Everything);
+    end_raises(&mut s);
+    let mut raises = capture_raises(&mut s);
+
+    activate(&mut s, 2, other, Order::GloballyFirst);
+    activate(&mut s, 1, wid(1), Order::GloballyLast);
+
+    assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+    assert!(raise_requests(&mut raises).is_empty());
+    assert!(s.parked().is_empty());
+}
+
+/// R24, R3. A pinned window is a member of every context, so focus on it
+/// switches nothing, although it is in D too.
+#[test]
+fn r24_focus_on_a_pinned_window_switches_nothing() {
+    let mut s = Setup::new(1);
+    let other = launch(&mut s, 2, test_app_info(2), vec![window_at(21, 700.)], &[wid(1)])[0];
+    let c = s.create("C", &[wid(1)]);
+    s.create("D", &[other]);
+    s.reactor.contexts.pin(&s.desc(other));
+    s.switch(c);
+    end_raises(&mut s);
+    assert!(s.parked().is_empty());
+    let mut raises = capture_raises(&mut s);
+
+    activate(&mut s, 2, other, Order::GloballyFirst);
+
+    assert_eq!(c, s.reactor.contexts.active());
+    assert!(raise_requests(&mut raises).is_empty());
+    assert!(s.parked().is_empty());
+}
+
+/// R24, R12 step 5. Focus on a member of the active context keeps the
+/// context and counts as the member's latest focus, so the next switch back
+/// to C focuses that member.
+#[test]
+fn r24_focus_on_a_member_counts_for_the_next_switch_to_its_context() {
+    let mut s = Setup::new(3);
+    let c = s.create("C", &[wid(1), wid(2)]);
+    let d = s.create("D", &[wid(3)]);
+    s.switch(d);
+    s.switch(c);
+    end_raises(&mut s);
+
+    for wid in [wid(2), wid(1), wid(2)] {
+        activate(&mut s, 1, wid, Order::GloballyFirst);
+        assert_eq!(c, s.reactor.contexts.active());
+    }
+    s.switch(d);
+    end_raises(&mut s);
+    focus_quietly(&mut s, wid(3));
+    let mut raises = capture_raises(&mut s);
+
+    s.command(c);
+
+    assert_eq!(vec![Some(wid(2))], focused(&mut raises));
+}
+
+/// R24, R20, R38. An app launches while C is active, and macOS reports its
+/// global activation last, after its window. The new window joins C, and
+/// nothing switches, whether the window reaches the reactor before or after
+/// the app's main window change.
+#[test]
+fn r24_launching_an_app_whose_global_activation_comes_last_never_switches() {
+    for window_first in [true, false] {
+        let TwoApps { mut s, c, other, .. } = two_apps();
+        let mut raises = capture_raises(&mut s);
+        let launched = WindowId::new(3, 1);
+        let window = window_at(31, 300.);
+        s.apps.windows.insert(
+            launched,
+            WindowState {
+                frame: window.frame,
+                ..Default::default()
+            },
+        );
+        let events = s.apps.make_app_with_opts(3, vec![], Some(launched), true);
+        s.reactor.handle_events(events);
+        let created = Event::WindowCreated(launched, window, MouseState::Up);
+        let main_changed = Event::ApplicationMainWindowChanged(3, Some(launched), Quiet::No);
+        if window_first {
+            s.reactor.handle_events(vec![created, main_changed]);
+        } else {
+            s.reactor.handle_events(vec![main_changed, created]);
+        }
+        s.reactor.handle_event(Event::ApplicationActivated(3, Quiet::No));
+        s.reactor.handle_event(Event::ApplicationGloballyActivated(3));
+        report_visible(&mut s, &[wid(1), other, launched]);
+
+        assert_eq!(c, s.reactor.contexts.active(), "window first: {window_first}");
+        assert_eq!(vec![id_of(c)], s.reactor.contexts.contexts_of(launched));
+        assert_eq!(vec![other], s.parked(), "window first: {window_first}");
+        assert!(
+            focused(&mut raises).iter().all(|&focus| focus == Some(launched)),
+            "window first: {window_first}"
+        );
+    }
+}
+
+/// R24, R14, R20. App 3's main window is only in D, so it is parked while C
+/// is active. The app opens a panel on a layer of its own, which reaches the
+/// reactor as a new window does: `WindowCreated` comes before the window
+/// server's list that gives the panel's layer. The layout doesn't track the
+/// panel, so it joins no context and isn't parked. When the user then
+/// activates the app, whose main window is still the parked one, Sugarglider
+/// switches to D, because the app has no member of C.
+#[test]
+#[ignore = "bug: a new panel's layer is unknown at WindowCreated, so it joins the active context, and R40 raises it instead of switching"]
+fn r24_r14_a_new_panel_joins_no_context_and_focus_on_its_app_still_switches() {
+    let mut s = Setup::new(1);
+    let main = launch(&mut s, 3, test_app_info(3), vec![window_at(31, 700.)], &[wid(1)])[0];
+    let c = s.create("C", &[wid(1)]);
+    let d = s.create("D", &[main]);
+    s.switch(d);
+    s.switch(c);
+    end_raises(&mut s);
+    assert_eq!(vec![main], s.parked());
+    let panel = WindowId::new(3, 2);
+    let info = window_at(32, 300.);
+    s.apps.windows.insert(
+        panel,
+        WindowState {
+            frame: info.frame,
+            ..Default::default()
+        },
+    );
+
+    s.reactor.handle_event(Event::WindowCreated(panel, info, MouseState::Up));
+    let mut listed = on_screen(&s, &[wid(1), main, panel]);
+    listed.info[2].layer = 3;
+    s.reactor.handle_event(Event::WindowsOnScreenUpdated {
+        pid: Some(3),
+        on_screen: listed,
+    });
+    s.reactor.handle_event(Event::WindowBecameVisible(panel));
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    assert!(s.reactor.contexts.is_unsorted(panel));
+    assert_eq!(vec![main], s.parked());
+    let mut raises = capture_raises(&mut s);
+    activate(&mut s, 3, main, Order::GloballyFirst);
+    assert_eq!(d, s.reactor.contexts.active());
+    assert_eq!(vec![Some(main)], focused(&mut raises));
+}
+
+/// R36, R24, R38. A browser makes a new tab its main window before the
+/// reactor sees the tab. The tab joins the contexts of its group's main tab,
+/// here C and D, and the focus on it switches nothing and raises nothing.
+/// The group keeps one tile.
+#[test]
+fn r36_a_new_tab_that_takes_focus_before_it_is_seen_joins_its_group() {
+    let mut s = Setup::new(2);
+    let c = s.create("C", &[wid(1), wid(2)]);
+    let d = s.create("D", &[wid(1)]);
+    s.switch(c);
+    end_raises(&mut s);
+    focus_quietly(&mut s, wid(1));
+    let frames: Vec<CGRect> = s.tiles().into_iter().map(|(_, frame)| frame).collect();
+    let mut raises = capture_raises(&mut s);
+
+    s.reactor
+        .handle_event(Event::ApplicationMainWindowChanged(1, Some(wid(3)), Quiet::No));
+    let tab = WindowInfo {
+        frame: s.frame(wid(1)),
+        ..make_window(3)
+    };
+    s.apps.windows.insert(
+        wid(3),
+        WindowState {
+            frame: tab.frame,
+            ..Default::default()
+        },
+    );
+    s.reactor.handle_event(Event::WindowCreated(wid(3), tab, MouseState::Up));
+    let on_screen = on_screen(&s, &[wid(1), wid(2), wid(3)]);
+    s.reactor
+        .handle_event(Event::WindowsOnScreenUpdated { pid: Some(1), on_screen });
+    s.reactor.handle_event(Event::WindowBecameVisible(wid(3)));
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    assert_eq!(c, s.reactor.contexts.active());
+    assert_eq!(vec![id_of(c), id_of(d)], s.reactor.contexts.contexts_of(wid(3)));
+    assert!(raise_requests(&mut raises).is_empty());
+    assert!(s.parked().is_empty());
+    let mut after: Vec<CGRect> = s.tiles().into_iter().map(|(_, frame)| frame).collect();
+    after.sort_by(|a, b| a.origin.x.total_cmp(&b.origin.x));
+    assert_eq!(frames, after);
+}
+
+/// R25. After a switch that focus from outside started, the completion of a
+/// raise of another window of the sequence, and the end of an older
+/// sequence, don't end the wait: an activation of another app still doesn't
+/// switch. The completed raise of the focused window does.
+#[test]
+fn r25_a_raise_of_another_window_or_an_older_sequence_keeps_the_wait() {
+    let TwoApps { mut s, c, d, other } = two_apps();
+    let mut raises = capture_raises(&mut s);
+    activate(&mut s, 2, other, Order::GloballyFirst);
+    assert_eq!(d, s.reactor.contexts.active());
+    let [(sequence_id, Some(focus))] = raise_requests(&mut raises)[..] else {
+        panic!()
+    };
+    assert_eq!(other, focus);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    s.reactor.handle_event(Event::RaiseCompleted { window_id: wid(1), sequence_id });
+    s.reactor.handle_event(Event::RaiseTimeout { sequence_id: sequence_id - 1 });
+    s.reactor.handle_event(Event::RaiseRequestFailed {
+        windows: vec![other],
+        sequence_id: sequence_id - 1,
+        quiet: Quiet::No,
+    });
+    activate(&mut s, 1, wid(1), Order::GloballyLast);
+    assert_eq!(d, s.reactor.contexts.active());
+
+    s.reactor.handle_event(Event::RaiseCompleted { window_id: other, sequence_id });
+    activate(&mut s, 1, wid(1), Order::GloballyLast);
+    assert_eq!(c, s.reactor.contexts.active());
+}
+
+/// R25. The wait for a switch's raise ends when the window it focuses is
+/// destroyed, or when that window's app quits, because no event of the raise
+/// can come any more.
+#[test]
+fn r25_the_wait_ends_when_the_focused_window_or_its_app_goes_away() {
+    for gone in ["window", "app"] {
+        let TwoApps { mut s, c, d, other } = two_apps();
+        let _raises = capture_raises(&mut s);
+        activate(&mut s, 2, other, Order::GloballyFirst);
+        assert_eq!(d, s.reactor.contexts.active(), "{gone}");
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        activate(&mut s, 1, wid(1), Order::GloballyLast);
+        assert_eq!(d, s.reactor.contexts.active(), "{gone}");
+
+        match gone {
+            "window" => s.close(other),
+            _ => {
+                s.apps.windows.remove(&other);
+                s.reactor.handle_event(Event::ApplicationTerminated(2));
+                s.reactor.handle_event(Event::ApplicationThreadTerminated(2));
+            }
+        }
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        activate(&mut s, 1, wid(1), Order::GloballyLast);
+
+        assert_eq!(c, s.reactor.contexts.active(), "{gone}");
+    }
+}
+
+/// App 1's windows 1 and 2 and app 2's window, all showing under
+/// Everything. C holds window 1, and D holds the other two. Window 1 has the
+/// focus, quietly.
+fn three_windows_under_everything() -> (Setup, ContextKey, ContextKey, WindowId) {
+    let mut s = Setup::new(2);
+    let listed = [wid(1), wid(2)];
+    let other = launch(&mut s, 2, test_app_info(2), vec![window_at(21, 700.)], &listed)[0];
+    let c = s.create("C", &[wid(1)]);
+    let d = s.create("D", &[wid(2), other]);
+    focus_quietly(&mut s, wid(1));
+    assert!(s.parked().is_empty());
+    (s, c, d, other)
+}
+
+/// R25. A switch to C raises nothing, because C's window has the focus
+/// already, and it parks two windows. It waits for the echo of both parking
+/// writes: after one echo, an activation of app 2 still doesn't switch.
+/// After both, it does.
+#[test]
+fn r25_a_switch_that_raises_nothing_waits_for_the_echo_of_every_window_it_parked() {
+    let (mut s, c, d, other) = three_windows_under_everything();
+    let mut raises = capture_raises(&mut s);
+
+    s.command(c);
+
+    assert!(focused(&mut raises).iter().all(Option::is_none));
+    let (app_2, app_1): (Vec<Request>, Vec<Request>) =
+        s.apps.requests().into_iter().partition(
+            |request| matches!(request, Request::SetWindowFrame(wid, ..) if wid.pid == 2),
+        );
+    assert_eq!(1, frame_writes(&app_1, wid(2)).len());
+    assert_eq!(1, frame_writes(&app_2, other).len());
+    answer(&mut s, app_2);
+    activate(&mut s, 2, other, Order::GloballyFirst);
+    assert_eq!(c, s.reactor.contexts.active(), "window 2's echo hasn't arrived");
+
+    answer(&mut s, app_1);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    activate(&mut s, 2, other, Order::GloballyLast);
+    assert_eq!(d, s.reactor.contexts.active());
+}
+
+/// R25. When the echoes of a switch's parking writes never arrive, or
+/// Finder's activation never does, focus from outside counts again at the
+/// first visibility refresh 2 seconds after the switch, and not before.
+#[test]
+fn r25_the_2_second_fallback_also_ends_a_wait_for_echoes_or_for_finder() {
+    for waits_for in ["echoes", "Finder"] {
+        let (mut s, c, d, other) = three_windows_under_everything();
+        let _raises = capture_raises(&mut s);
+        let target = if waits_for == "Finder" {
+            launch(&mut s, 9, finder_info(), vec![], &[wid(1), wid(2), other]);
+            s.create("Empty", &[])
+        } else {
+            c
+        };
+
+        s.command(target);
+        if waits_for == "Finder" {
+            // The parking writes are answered, but Finder's activation
+            // never arrives.
+            let requests = s.apps.requests();
+            assert_eq!(vec![Quiet::Yes], activations(&requests));
+            answer(&mut s, requests);
+            s.apps.simulate_until_quiet(&mut s.reactor);
+        }
+        let since = s.reactor.switch_guard.since.unwrap();
+        s.reactor.guard_deadline_tick(since + Duration::from_millis(1999));
+        activate(&mut s, 2, other, Order::GloballyFirst);
+        assert_eq!(target, s.reactor.contexts.active(), "{waits_for}");
+
+        s.reactor.guard_deadline_tick(since + Duration::from_secs(2));
+        activate(&mut s, 2, other, Order::GloballyLast);
+        assert_eq!(d, s.reactor.contexts.active(), "{waits_for}");
+    }
+}
+
+/// R25. A second switch starts before the first one's raise ends. The end of
+/// the first switch's raise doesn't end the wait for the second's, so an
+/// activation of app 2 doesn't switch until the second raise completes.
+#[test]
+fn r25_a_second_switch_waits_for_its_own_raise() {
+    let TwoApps { mut s, c, d, other } = two_apps();
+    let mut raises = capture_raises(&mut s);
+    activate(&mut s, 2, other, Order::GloballyFirst);
+    assert_eq!(d, s.reactor.contexts.active());
+    let [(first, Some(_))] = raise_requests(&mut raises)[..] else {
+        panic!()
+    };
+
+    s.command(c);
+    let [(second, Some(focus))] = raise_requests(&mut raises)[..] else {
+        panic!()
+    };
+    assert_eq!(wid(1), focus);
+    assert!(second > first);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    s.reactor.handle_event(Event::RaiseCompleted {
+        window_id: other,
+        sequence_id: first,
+    });
+    activate(&mut s, 2, other, Order::GloballyFirst);
+    assert_eq!(c, s.reactor.contexts.active());
+
+    s.reactor.handle_event(Event::RaiseCompleted {
+        window_id: wid(1),
+        sequence_id: second,
+    });
+    activate(&mut s, 2, other, Order::GloballyLast);
+    assert_eq!(d, s.reactor.contexts.active());
+}
+
+/// R40. The user activates app 1, whose main window 2 is parked. Its member
+/// of C, window 1, is minimized, so there is no visible member to raise, and
+/// the app has a member of C, so Sugarglider doesn't switch either.
+#[test]
+fn r40_an_app_whose_member_of_the_active_context_is_minimized_neither_raises_nor_switches() {
+    let mut s = Setup::new(2);
+    let c = s.create("C", &[wid(1)]);
+    let d = s.create("D", &[wid(2)]);
+    s.switch(d);
+    s.switch(c);
+    end_raises(&mut s);
+    assert_eq!(vec![wid(2)], s.parked());
+    report_visible(&mut s, &[wid(2)]);
+    assert!(s.tiles().is_empty());
+    let mut raises = capture_raises(&mut s);
+
+    activate(&mut s, 1, wid(2), Order::GloballyFirst);
+
+    assert_eq!(c, s.reactor.contexts.active());
+    assert!(raise_requests(&mut raises).is_empty());
+    assert_eq!(vec![wid(2)], s.parked());
+}
+
+/// R40, R3. A visible pinned window of the app is a member of the active
+/// context. When it is the app's most recently focused member, activating
+/// the app with a parked main window raises it.
+#[test]
+fn r40_a_visible_pinned_window_of_the_app_is_a_member_to_raise() {
+    let mut s = Setup::new(3);
+    let c = s.create("C", &[wid(3)]);
+    let d = s.create("D", &[wid(2)]);
+    s.reactor.contexts.pin(&s.desc(wid(1)));
+    s.switch(d);
+    s.switch(c);
+    end_raises(&mut s);
+    assert_eq!(vec![wid(2)], s.parked());
+    s.reactor.contexts.window_focused(wid(3));
+    s.reactor.contexts.window_focused(wid(1));
+    let mut raises = capture_raises(&mut s);
+
+    activate(&mut s, 1, wid(2), Order::GloballyFirst);
+
+    assert_eq!(c, s.reactor.contexts.active());
+    assert_eq!(vec![Some(wid(1))], focused(&mut raises));
+    assert_eq!(vec![wid(2)], s.parked());
+}
+
+/// R12 step 6, R37. Moving C's last window to D parks it and leaves no
+/// window to focus, so Finder is activated quietly and nothing is raised.
+#[test]
+fn r12_step_6_moving_the_last_member_out_activates_finder_quietly() {
+    let mut s = Setup::new(1);
+    launch(&mut s, 9, finder_info(), vec![], &[wid(1)]);
+    let c = s.create("C", &[wid(1)]);
+    let d = s.create("D", &[]);
+    s.switch(c);
+    end_raises(&mut s);
+    focus_quietly(&mut s, wid(1));
+    let mut raises = capture_raises(&mut s);
+
+    s.reactor.handle_event(Event::Command(Command::Context(
+        ContextCommand::MoveWindowToContext(ContextRef::Id(id_of(d))),
+    )));
+
+    let requests = s.apps.requests();
+    assert_eq!(vec![Quiet::Yes], activations(&requests));
+    assert_eq!(vec![corner(screen().size)], frame_writes(&requests, wid(1)));
+    assert!(focused(&mut raises).iter().all(Option::is_none));
+    answer(&mut s, requests);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    assert_eq!(vec![wid(1)], s.parked());
+    assert_eq!(c, s.reactor.contexts.active());
+}
+
+/// R12 step 6. Without Finder running, a switch to a context without windows
+/// activates no app and raises nothing, and it parks every window.
+#[test]
+fn r12_step_6_without_finder_a_switch_to_an_empty_context_activates_nothing() {
+    let TwoApps { mut s, other, .. } = two_apps();
+    let empty = s.create("Empty", &[]);
+    let mut raises = capture_raises(&mut s);
+
+    s.command(empty);
+
+    let requests = s.apps.requests();
+    assert!(activations(&requests).is_empty());
+    assert!(focused(&mut raises).iter().all(Option::is_none));
+    answer(&mut s, requests);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    assert_eq!(vec![wid(1), other], s.parked());
+    assert_eq!(empty, s.reactor.contexts.active());
+}
