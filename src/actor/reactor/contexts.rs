@@ -16,8 +16,8 @@ use crate::actor::app::{WindowId, pid_t};
 use crate::actor::contexts_store::{ContextsStore, Loaded, empty_contexts_after};
 use crate::actor::layout::{ActiveContext, EventResponse, LayoutEvent};
 use crate::model::contexts::{
-    ContextError, ContextId, ContextKey, Contexts, MatchPass, RecordLink, SwitchInput, SwitchPlan,
-    SwitchScreen, WindowDesc, plan_switch, rank,
+    ContextError, ContextId, ContextKey, Contexts, MatchPass, NameMatch, RecordLink, SwitchInput,
+    SwitchPlan, SwitchScreen, WindowDesc, plan_switch, rank,
 };
 use crate::sys::screen::SpaceId;
 
@@ -357,7 +357,8 @@ impl Reactor {
     }
 
     /// The context that a command names. A name takes the best match of the
-    /// switcher's ranking.
+    /// switcher's ranking among the named contexts. Everything and Unsorted
+    /// match only their exact names, and Unsorted only while it is listed.
     fn resolve(&self, reference: &ContextRef) -> Option<ContextKey> {
         match reference {
             ContextRef::Number(number) => {
@@ -367,8 +368,32 @@ impl Reactor {
                 self.contexts.get(*id).map(|context| ContextKey::Named(context.id))
             }
             ContextRef::Name(name) if name.trim().is_empty() => None,
-            ContextRef::Name(name) => rank(name, &self.contexts, true).first().map(|(key, _)| *key),
+            ContextRef::Name(name) => rank(name, &self.contexts, self.lists_unsorted())
+                .into_iter()
+                .find(|&(key, found)| {
+                    matches!(key, ContextKey::Named(_)) || found == NameMatch::Exact
+                })
+                .map(|(key, _)| key),
         }
+    }
+
+    /// Whether Unsorted is listed among the contexts to switch to: some
+    /// context exists, and some window of a running app is in no context.
+    /// Sugarglider's own windows and windows the layout doesn't track don't
+    /// count. Before the first context exists, only Everything is listed.
+    pub(super) fn lists_unsorted(&self) -> bool {
+        if self.contexts.contexts().is_empty() {
+            return false;
+        }
+        let own_pid = std::process::id() as pid_t;
+        self.windows.keys().any(|&wid| {
+            wid.pid != own_pid
+                && self.apps.contains_key(&wid.pid)
+                && self.contexts.is_unsorted(wid)
+                && self
+                    .layout_window_info(wid)
+                    .is_some_and(|info| !self.layout.is_untracked(&info))
+        })
     }
 
     /// Applies the active context after contexts were turned on, or shows
@@ -4604,5 +4629,76 @@ mod tests {
         assert!(s.parked().is_empty());
         assert_eq!(everything[1..], s.frames(&[wid(2), wid(3)])[..]);
         assert!(s.journal_on_disk().is_empty());
+    }
+
+    fn switch_by_name(s: &mut Setup, name: &str) {
+        s.reactor
+            .handle_event(Event::Command(Command::Context(ContextCommand::SwitchContext(
+                ContextRef::Name(name.into()),
+            ))));
+    }
+
+    /// R28, R29. A name resolves to Unsorted only while a context exists and
+    /// a window is in no context. Sugarglider's own windows don't count.
+    /// Otherwise the switch is refused and nothing moves.
+    #[test]
+    fn a_name_resolves_to_unsorted_only_while_a_context_exists_and_unsorted_has_a_window() {
+        let mut s = Setup::new(2);
+        switch_by_name(&mut s, "Unsorted");
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+
+        let c = s.create("C", &[wid(1), wid(2)]);
+        s.switch(c);
+        let own_pid = std::process::id() as i32;
+        let own_window = WindowInfo {
+            sys_id: Some(WindowServerId::new(50)),
+            ..make_window(3)
+        };
+        s.reactor.handle_events(s.apps.make_app(own_pid, vec![own_window]));
+        let own = WindowId::new(own_pid, 1);
+        report_visible(&mut s, &[wid(1), wid(2), own]);
+        switch_by_name(&mut s, "unsorted");
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(c, s.reactor.contexts.active());
+
+        s.reactor.contexts.remove_window(id_of(c), wid(2)).unwrap();
+        switch_by_name(&mut s, "unsorted");
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+        let tiled: Vec<WindowId> = s.tiles().into_iter().map(|(wid, _)| wid).collect();
+        assert_eq!(vec![wid(2), own], tiled);
+        assert_eq!(vec![wid(1)], s.parked());
+    }
+
+    /// Commands and dispatch, R29. A name resolves to Everything or Unsorted
+    /// only by the entry's exact name. A partial name takes the named
+    /// context it matches, even when a built-in entry was used more
+    /// recently, and otherwise nothing.
+    #[test]
+    fn a_name_resolves_to_a_built_in_entry_only_by_its_exact_name() {
+        let mut s = Setup::new(3);
+        let unicorn = s.create("Unicorn", &[wid(1)]);
+        s.switch(unicorn);
+        s.switch(ContextKey::Unsorted);
+        assert_eq!(vec![wid(1)], s.parked());
+
+        switch_by_name(&mut s, "un");
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(unicorn, s.reactor.contexts.active());
+
+        for partial in ["every", "unsort", "ev"] {
+            switch_by_name(&mut s, partial);
+            assert!(s.apps.requests().is_empty(), "{partial}");
+            assert_eq!(unicorn, s.reactor.contexts.active(), "{partial}");
+        }
+
+        switch_by_name(&mut s, "UNSORTED");
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+        switch_by_name(&mut s, " everything ");
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+        assert!(s.parked().is_empty());
     }
 }
