@@ -219,8 +219,11 @@ impl Reactor {
 
     /// Applies contexts to the visible Spaces in the order a switch takes:
     /// the journal entries of the windows it parks, then the layouts, then
-    /// the members put back and laid out, then the parking. Returns the plan
-    /// and the layout's response to the exposure, which the caller handles.
+    /// the members put back and laid out, then the parking. Parked windows
+    /// that are no longer in their corners, for example because their app
+    /// moved them, are parked again, except while quitting and with contexts
+    /// off. Returns the plan and the layout's response to the exposure,
+    /// which the caller handles.
     fn apply(&mut self, apply: Apply) -> io::Result<(SwitchPlan, Option<EventResponse>)> {
         let active = match apply {
             Apply::Switch(target) => target,
@@ -254,6 +257,9 @@ impl Reactor {
         self.put_back_unplaced(&released);
         self.update_layout(&[], true);
         self.move_to_corners(parking);
+        if self.contexts_enabled() && self.pending_exit.is_none() {
+            self.repark_moved_windows();
+        }
         Ok((plan, response))
     }
 
@@ -3286,7 +3292,6 @@ mod tests {
     /// in, and switching to the active context parks it again. Its journal
     /// entry keeps the frame from before it was first parked.
     #[test]
-    #[ignore = "bug: R16 leaves a parked window that its app moved back on screen where it is"]
     fn r16_switching_to_the_active_context_parks_a_window_its_app_moved_back() {
         let mut s = Setup::new(2);
         let c = s.create("C", &[wid(1)]);
@@ -3309,6 +3314,39 @@ mod tests {
         assert_eq!(vec![(wid(1), screen())], s.tiles());
 
         s.switch(c);
+
+        assert_eq!(parked_at, s.frame(wid(2)));
+        assert_eq!(vec![wid(2)], s.parked());
+        assert_eq!(vec![entry(2, rect(600., 0., 600., 1000.))], s.journal_on_disk());
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+    }
+
+    /// R10, R16. A Space change applies the active context again, which
+    /// parks again a parked window that its app moved back on screen.
+    #[test]
+    fn r10_r16_a_space_change_parks_again_a_window_its_app_moved_back() {
+        let mut s = Setup::new(2);
+        let c = s.create("C", &[wid(1)]);
+        s.switch(c);
+        let parked_at = corner(CGSize::new(600., 1000.));
+        assert_eq!(parked_at, s.frame(wid(2)));
+        let moved = rect(300., 200., 600., 700.);
+        let txid = s.reactor.windows[&wid(2)].last_sent_txid;
+        s.apps.windows.get_mut(&wid(2)).unwrap().frame = moved;
+        s.reactor.handle_event(Event::WindowFrameChanged(
+            wid(2),
+            moved,
+            txid,
+            Requested(false),
+            None,
+        ));
+
+        let snapshot = on_screen(&s, &[wid(1), wid(2)]);
+        s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], snapshot));
+        let requests = s.apps.requests();
+        assert_eq!(vec![parked_at], frame_writes(&requests, wid(2)));
+        answer(&mut s, requests);
+        s.apps.simulate_until_quiet(&mut s.reactor);
 
         assert_eq!(parked_at, s.frame(wid(2)));
         assert_eq!(vec![wid(2)], s.parked());
