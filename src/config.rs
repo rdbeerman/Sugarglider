@@ -444,7 +444,13 @@ impl ConfigPartial {
         } else {
             Default::default()
         };
-        keys.extend(high.keys.unwrap_or_default());
+        for (key, cmd) in high.keys.unwrap_or_default() {
+            // "Alt + T" and "Alt + KeyT" name the same hotkey.
+            if let Ok(hotkey) = Hotkey::from_str(&key) {
+                keys.retain(|low_key, _| Hotkey::from_str(low_key) != Ok(hotkey));
+            }
+            keys.insert(key, cmd);
+        }
         Self {
             settings: SettingsPartial::merge(low.settings, high.settings),
             window_rules: high.window_rules.or(low.window_rules),
@@ -1188,6 +1194,32 @@ mod tests {
         assert!(!config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + KeyT"));
         // But other default keys should still be present
         assert!(config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + Slash"));
+    }
+
+    /// A key replaces or disables the default binding of the same hotkey,
+    /// however the file spells the hotkey.
+    #[test]
+    fn keys_replace_default_bindings_spelled_differently() {
+        let config = Config::parse(
+            r#"
+            [settings]
+            default_keys = true
+
+            [keys]
+            "Alt + KeyT" = "disable"
+            "Ctrl + Alt + KeyH" = "debug"
+            "#,
+        )
+        .unwrap();
+
+        let bound_to = |key: &str| -> Vec<serde_json::Value> {
+            let hotkey = Hotkey::from_str(key).unwrap();
+            let bindings = config.keys.iter().filter(|(hk, _)| *hk == hotkey);
+            bindings.map(|(_, cmd)| command_json(cmd)).collect()
+        };
+        assert_eq!(Vec::<serde_json::Value>::new(), bound_to("Alt + T"));
+        assert_eq!(vec![serde_json::json!("debug")], bound_to("Alt + Ctrl + H"));
+        assert_eq!(Config::default().keys.len() - 1, config.keys.len());
     }
 
     #[test]
