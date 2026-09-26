@@ -900,6 +900,51 @@ mod tests {
         assert!(!Config::default().settings.experimental.scroll.enable);
     }
 
+    /// In TOML, a bare integer names a context by number, a string by name,
+    /// and `{ id = 7 }` by id.
+    #[test]
+    fn context_commands_parse() {
+        use crate::actor::reactor::{ContextCommand, ContextRef};
+
+        let config = Config::parse(
+            r#"
+            [keys]
+            "Ctrl + Alt + Digit1" = { switch_context = 1 }
+            "Ctrl + Alt + KeyC" = { switch_context = "Comms" }
+            "Ctrl + Alt + KeyI" = { switch_context = { id = 7 } }
+            "Ctrl + Alt + Digit0" = "show_everything"
+            "Ctrl + Alt + Tab" = "previous_context"
+            "#,
+        )
+        .unwrap();
+        let command = |key: &str| {
+            config
+                .keys
+                .iter()
+                .find(|(hotkey, _)| hotkey.to_string() == key)
+                .map(|(_, cmd)| match cmd {
+                    WmCommand::ReactorCommand(ReactorCommand::Context(cmd)) => cmd.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .unwrap()
+        };
+        let id = serde_json::from_value(serde_json::json!(7)).unwrap();
+        assert_eq!(
+            ContextCommand::SwitchContext(ContextRef::Number(1)),
+            command("Ctrl + Alt + Digit1")
+        );
+        assert_eq!(
+            ContextCommand::SwitchContext(ContextRef::Name("Comms".into())),
+            command("Ctrl + Alt + KeyC")
+        );
+        assert_eq!(
+            ContextCommand::SwitchContext(ContextRef::Id(id)),
+            command("Ctrl + Alt + KeyI")
+        );
+        assert_eq!(ContextCommand::ShowEverything, command("Ctrl + Alt + Digit0"));
+        assert_eq!(ContextCommand::PreviousContext, command("Ctrl + Alt + Tab"));
+    }
+
     /// R28.
     #[test]
     fn contexts_are_off_by_default_and_turn_on_with_their_flag() {

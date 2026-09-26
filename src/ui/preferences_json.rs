@@ -12,7 +12,9 @@ use livesplit_hotkey::Hotkey;
 use serde::{Deserialize, Serialize};
 
 use crate::actor::layout::{LayoutCommand, SizeShare};
-use crate::actor::reactor::{Command as ReactorCommand, ReactorCommand as ReactorCmd};
+use crate::actor::reactor::{
+    Command as ReactorCommand, ContextCommand, ContextRef, ReactorCommand as ReactorCmd,
+};
 use crate::actor::wm_controller::{WmCmd, WmCommand};
 use crate::config::{Config, WindowRule, WindowRuleConditions};
 use crate::log::MetricsCommand;
@@ -444,7 +446,45 @@ fn describe_command(cmd: &WmCommand) -> (String, String, String, u32) {
                     10,
                 ),
             },
+            ReactorCommand::Context(context_cmd) => describe_context_command(context_cmd),
         },
+    }
+}
+
+/// Get the description, category, command ID, and sort order for a ContextCommand.
+fn describe_context_command(cmd: &ContextCommand) -> (String, String, String, u32) {
+    let category = "Contexts".to_string();
+    match cmd {
+        ContextCommand::ShowEverything => (
+            "Show every window".to_string(),
+            category,
+            "show_everything".to_string(),
+            0,
+        ),
+        ContextCommand::SwitchContext(ContextRef::Number(number)) => (
+            format!("Switch to context {number}"),
+            category,
+            format!("switch_context_{number}"),
+            u32::from(*number),
+        ),
+        ContextCommand::PreviousContext => (
+            "Switch to the previous context".to_string(),
+            category,
+            "previous_context".to_string(),
+            10,
+        ),
+        ContextCommand::SwitchContext(ContextRef::Name(name)) => (
+            format!("Switch to context \"{name}\""),
+            category,
+            format!("switch_context_name_{name}"),
+            20,
+        ),
+        ContextCommand::SwitchContext(ContextRef::Id(id)) => (
+            format!("Switch to context with id {}", id.get()),
+            category,
+            format!("switch_context_id_{}", id.get()),
+            30,
+        ),
     }
 }
 

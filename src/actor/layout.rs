@@ -2737,6 +2737,20 @@ impl LayoutManager {
         );
     }
 
+    /// The named contexts that have a layout on some Space.
+    pub fn context_ids(&self) -> impl Iterator<Item = ContextId> + '_ {
+        self.context_layouts.keys().filter_map(|&(_, key)| match key {
+            ContextKey::Named(id) => Some(id),
+            ContextKey::Everything | ContextKey::Unsorted => None,
+        })
+    }
+
+    /// Whether the layout leaves the window alone, as it does with panels and
+    /// other windows that aren't on the normal layer.
+    pub fn is_untracked(&self, info: &LayoutWindowInfo) -> bool {
+        classify_window(&self.window_rules, info) == WindowClass::Untracked
+    }
+
     /// Deletes every layout of the context, on every Space and screen size.
     pub fn remove_context_layouts(&mut self, id: ContextId) {
         self.retain_context_layouts(|other| other != id);

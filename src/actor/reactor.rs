@@ -8,6 +8,7 @@
 //! changes by sending requests out to the other actors in the system.
 
 mod animation;
+mod contexts;
 mod main_window;
 mod parking;
 mod replay;
@@ -35,9 +36,9 @@ use tracing::{Span, debug, error, info, instrument, trace, warn};
 
 use super::mouse;
 use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, pid_t};
+use crate::actor::contexts_store::{self, ContextsStore};
 use crate::actor::layout::{
-    self, ActiveContext, DragUpdate, DropAction, LayoutCommand, LayoutEvent, LayoutManager,
-    LayoutWindowInfo,
+    self, DragUpdate, DropAction, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo,
 };
 use crate::actor::parked_journal::ParkedJournal;
 use crate::actor::raise::{self, RaiseManager, RaiseRequest};
@@ -47,6 +48,7 @@ use crate::collections::{HashMap, HashSet};
 use crate::config::Config;
 use crate::log::{self, MetricsCommand};
 use crate::model::NodeId;
+use crate::model::contexts::{ContextId, Contexts};
 use crate::sys::app::Process;
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
@@ -227,6 +229,7 @@ pub enum Command {
     Layout(LayoutCommand),
     Metrics(MetricsCommand),
     Reactor(ReactorCommand),
+    Context(ContextCommand),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -235,6 +238,64 @@ pub enum ReactorCommand {
     Debug,
     Serialize,
     SaveAndExit,
+}
+
+/// Commands that switch between contexts, the named window sets.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCommand {
+    /// Shows the context's windows in its layout and parks every other window.
+    SwitchContext(ContextRef),
+    /// Shows every window in each Space's normal layout.
+    ShowEverything,
+    /// Switches back to the context used before the current one.
+    PreviousContext,
+}
+
+/// Names a context in a command.
+///
+/// A bare integer is always a number from 1 to 9, and a string is a name. An
+/// id is tagged, `{ id = 7 }` in TOML and `Id(7)` in RON.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(from = "ContextRefRepr", into = "ContextRefRepr")]
+pub enum ContextRef {
+    Number(u8),
+    Name(String),
+    Id(ContextId),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum ContextRefRepr {
+    Number(u8),
+    Name(String),
+    Tagged(TaggedContextRef),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+enum TaggedContextRef {
+    #[serde(rename = "id", alias = "Id")]
+    Id(ContextId),
+}
+
+impl From<ContextRefRepr> for ContextRef {
+    fn from(repr: ContextRefRepr) -> Self {
+        match repr {
+            ContextRefRepr::Number(number) => ContextRef::Number(number),
+            ContextRefRepr::Name(name) => ContextRef::Name(name),
+            ContextRefRepr::Tagged(TaggedContextRef::Id(id)) => ContextRef::Id(id),
+        }
+    }
+}
+
+impl From<ContextRef> for ContextRefRepr {
+    fn from(reference: ContextRef) -> Self {
+        match reference {
+            ContextRef::Number(number) => ContextRefRepr::Number(number),
+            ContextRef::Name(name) => ContextRefRepr::Name(name),
+            ContextRef::Id(id) => ContextRefRepr::Tagged(TaggedContextRef::Id(id)),
+        }
+    }
 }
 
 /// Tracks a potential title bar drag for drag-to-rearrange.
@@ -304,6 +365,12 @@ pub struct Reactor {
     /// Windows put back from parking whose next frame write goes out even
     /// when their known frame already matches it.
     forced_writes: HashSet<WindowId>,
+    /// The user's contexts and the active context.
+    contexts: Contexts,
+    /// Where `contexts` are saved.
+    contexts_store: ContextsStore,
+    /// Names the boot of the Mac, saved with the contexts.
+    boot_id: Option<String>,
 }
 
 /// How many times in a row we write the same frame to a window before giving
@@ -452,6 +519,11 @@ impl Reactor {
                     group_indicators_tx.clone(),
                     journal,
                 );
+                reactor.open_contexts(
+                    ContextsStore::new(crate::config::contexts_file()),
+                    contexts_store::boot_id(),
+                    SystemTime::now(),
+                );
                 reactor.mouse_tx.replace(mouse_tx.clone());
                 reactor.status_tx.replace(status_tx.clone());
                 let space_manager = SpaceManager::new(
@@ -516,6 +588,9 @@ impl Reactor {
             journal,
             process_lookup: Box::new(Process::with_pid),
             forced_writes: HashSet::default(),
+            contexts: Contexts::new(),
+            contexts_store: ContextsStore::in_memory(),
+            boot_id: None,
         }
     }
 
@@ -622,6 +697,7 @@ impl Reactor {
                 self.apps.remove(&pid);
                 self.forget_parked_app(pid);
                 self.send_layout_event(LayoutEvent::AppClosed(pid));
+                self.app_quit(pid);
             }
             Event::ApplicationActivated(..)
             | Event::ApplicationDeactivated(..)
@@ -951,17 +1027,7 @@ impl Reactor {
                         scale_factor,
                     })
                     .collect();
-                let response = self
-                    .screens
-                    .iter()
-                    .filter_map(|screen| screen.space.map(|space| (space, screen.frame.size)))
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(|(space, size)| {
-                        let context = ActiveContext::EVERYTHING;
-                        self.layout.handle_event(LayoutEvent::SpaceExposed(space, size, context))
-                    })
-                    .reduce(layout::EventResponse::coalesce);
+                let response = self.show_visible_spaces();
                 if let Some(response) = response {
                     self.handle_layout_response_with_context(
                         response,
@@ -1002,15 +1068,7 @@ impl Reactor {
                 for (space, screen) in spaces.iter().zip(&mut self.screens) {
                     screen.space = *space;
                 }
-                let response = self
-                    .screens
-                    .iter()
-                    .filter_map(|screen| screen.space.map(|space| (space, screen.frame.size)))
-                    .map(|(space, size)| {
-                        let context = ActiveContext::EVERYTHING;
-                        self.layout.handle_event(LayoutEvent::SpaceExposed(space, size, context))
-                    })
-                    .reduce(layout::EventResponse::coalesce);
+                let response = self.show_visible_spaces();
                 if let Some(response) = response {
                     self.handle_layout_response_with_context(
                         response,
@@ -1309,6 +1367,10 @@ impl Reactor {
                 }
             }
             Event::Command(Command::Metrics(cmd)) => log::handle_command(cmd),
+            Event::Command(Command::Context(cmd)) => {
+                info!(?cmd);
+                self.handle_context_command(cmd);
+            }
             Event::Command(Command::Reactor(ReactorCommand::Debug)) => {
                 for screen in &self.screens {
                     if let Some(space) = screen.space {
@@ -1339,14 +1401,21 @@ impl Reactor {
                 }
             }
             Event::ConfigChanged(config) => {
+                let contexts_were_enabled = self.contexts_enabled();
                 self.layout.set_config(&config);
                 self.config = config;
+                if self.contexts_enabled() != contexts_were_enabled {
+                    self.contexts_turned_on_or_off();
+                }
             }
         }
         if let Some(raised_window) = raised_window {
             let spaces = self.screens.iter().flat_map(|screen| screen.space).collect();
             self.send_layout_event(LayoutEvent::WindowFocused(spaces, raised_window));
             self.update_active_screen();
+            if self.contexts_enabled() {
+                self.contexts.window_focused(raised_window);
+            }
         }
         if !self.in_drag {
             self.update_layout(&animation_focus_wids, is_resize);
@@ -1506,6 +1575,9 @@ impl Reactor {
             let Some(space) = self.best_space_for_window(&layout_info.frame) else {
                 continue;
             };
+            if !self.may_tile(space, wid) {
+                continue;
+            }
             // Tabs in the same window group will have the same visual frame.
             // Parked windows share a corner without being tabs.
             if self.own_frame_reaches_layout(wid) {
@@ -1983,7 +2055,7 @@ pub mod tests {
     use super::testing::*;
     use super::*;
     use crate::actor::app::Request;
-    use crate::actor::layout::{LayoutManager, SizeShare};
+    use crate::actor::layout::{ActiveContext, LayoutManager, SizeShare};
     use crate::model::Direction;
     use crate::sys::window_server::WindowServerId;
 

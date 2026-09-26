@@ -66,7 +66,7 @@ impl Reactor {
     /// that are left where they are.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "only tests park windows until context switching")
+        expect(dead_code, reason = "switches park through journal_parking")
     )]
     pub(super) fn park_windows(&mut self, wids: &[WindowId]) -> io::Result<Vec<WindowId>> {
         let parking = self.journal_parking(wids)?;
@@ -213,10 +213,6 @@ impl Reactor {
     /// frame in the layout now. Any other window, such as a floating one, goes
     /// back to the frame it had before it was parked. The journal entries stay
     /// until the windows report the frames written.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "only tests park windows until context switching")
-    )]
     pub(super) fn unpark_windows(&mut self, wids: &[WindowId]) {
         let released = self.release_parked(wids);
         self.put_back_unplaced(&released);
