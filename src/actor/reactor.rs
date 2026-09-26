@@ -2359,6 +2359,71 @@ pub mod tests {
     }
 
     #[test]
+    fn h1_a_display_without_reported_bounds_uses_its_visible_frame() {
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let main = CGRect::new(CGPoint::new(0., 25.), CGSize::new(1000., 975.));
+        let main_bounds = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let right = CGRect::new(CGPoint::new(1000., 25.), CGSize::new(1000., 975.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![main, right],
+            bounds: vec![main_bounds],
+            spaces: vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
+            scale_factors: vec![2.0, 2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        assert_eq!(
+            vec![(main, main_bounds), (right, right)],
+            reactor
+                .screens
+                .iter()
+                .map(|screen| (screen.frame, screen.bounds))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_recording_file_made_before_displays_reported_bounds_replays() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("trace.ron");
+        let mut config = Config::default();
+        config.settings.default_disable = false;
+        config.settings.animate = false;
+        let (group_indicators_tx, _) = crate::actor::channel();
+        let mut reactor = Reactor::new(
+            Arc::new(config),
+            LayoutManager::new_for_test(),
+            Record::new(Some(&path)),
+            group_indicators_tx,
+            ParkedJournal::in_memory(),
+        );
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            frames: vec![screen],
+            bounds: vec![screen],
+            spaces: vec![Some(SpaceId::new(1))],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        let mut apps = Apps::new();
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        drop(reactor);
+
+        let recorded = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(1, recorded.matches("bounds:[").count());
+        let start = recorded.find("bounds:[").unwrap();
+        let end = start + recorded[start..].find("],").unwrap() + 2;
+        let old_recording = format!("{}{}", &recorded[..start], &recorded[end..]);
+        assert!(!old_recording.contains("bounds:"));
+        std::fs::write(&path, old_recording).unwrap();
+
+        replay(&path, |_, _| {}).unwrap();
+    }
+
+    #[test]
     fn it_selects_the_main_window_on_space_enable() {
         let mut apps = Apps::new();
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());

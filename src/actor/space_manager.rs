@@ -344,7 +344,7 @@ impl SpaceManager {
 mod tests {
     use std::sync::Arc;
 
-    use objc2_core_foundation::CGRect;
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use test_log::test;
     use tokio::sync::mpsc;
     use tracing::Span;
@@ -733,5 +733,33 @@ mod tests {
             wm_events.iter().any(|e| matches!(e, WmEvent::HotkeysActive(false))),
             "Expected HotkeysActive(false), got {wm_events:?}"
         );
+    }
+
+    #[test]
+    fn h1_display_bounds_reach_the_reactor_next_to_the_visible_frames() {
+        let mut h = TestHarness::new();
+        let rect =
+            |x, y, width, height| CGRect::new(CGPoint::new(x, y), CGSize::new(width, height));
+        let frames = vec![rect(0., 25., 1920., 1055.), rect(0., -1055., 1920., 1055.)];
+        let bounds = vec![rect(0., 0., 1920., 1080.), rect(0., -1080., 1920., 1080.)];
+        h.on_event(Event::ScreenParametersChanged {
+            screens: vec![screen(1), screen(2)],
+            frames: frames.clone(),
+            bounds: bounds.clone(),
+            spaces: vec![Some(space(10)), Some(space(20))],
+            scale_factors: vec![2.0, 2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: WindowsOnScreen::new(vec![]),
+        });
+        let sent: Vec<_> = drain(&mut h.reactor_rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                reactor::Event::ScreenParametersChanged { frames, bounds, .. } => {
+                    Some((frames, bounds))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vec![(frames, bounds)], sent);
     }
 }
