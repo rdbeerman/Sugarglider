@@ -32,6 +32,7 @@ impl Reactor {
     /// refresh 2 seconds after `now`. The saved active context doesn't
     /// change.
     pub(super) fn save_and_exit(&mut self, now: Instant) {
+        self.hide_context_switcher();
         if self.pending_exit.is_some() {
             debug!("Already waiting to quit");
             return;

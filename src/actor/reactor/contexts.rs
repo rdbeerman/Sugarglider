@@ -210,12 +210,8 @@ impl Reactor {
     /// window that has the focus, the switch's focus step runs, so that
     /// keystrokes don't go to a parked window.
     fn finish_apply(&mut self, plan: SwitchPlan, response: Option<EventResponse>) {
-        let parked: Vec<WindowId> = plan
-            .park
-            .iter()
-            .copied()
-            .filter(|wid| self.parked.contains_key(wid))
-            .collect();
+        let parked: Vec<WindowId> =
+            plan.park.iter().copied().filter(|wid| self.parked.contains_key(wid)).collect();
         let main_parked = self.main_window().is_some_and(|main| parked.contains(&main));
         if !main_parked {
             if let Some(response) = response {
@@ -391,6 +387,7 @@ impl Reactor {
         self.rejoin_for_switch(target);
         match self.apply(Apply::Switch(target)) {
             Ok((plan, response)) => {
+                self.hide_context_switcher();
                 self.save_contexts();
                 let parked: Vec<WindowId> =
                     plan.park.iter().copied().filter(|wid| self.parked.contains_key(wid)).collect();
@@ -436,6 +433,7 @@ impl Reactor {
     /// is about to stop managing. The active context doesn't change, and the
     /// next space change applies it again.
     pub(super) fn show_everything_on(&mut self, spaces: &[SpaceId]) {
+        self.hide_context_switcher();
         if !self.contexts_in_use() {
             return;
         }
@@ -473,6 +471,7 @@ impl Reactor {
         if self.pending_exit.is_some() {
             return Err(QUITTING.to_string());
         }
+        let opens = matches!(command, ContextCommand::OpenContextSwitcher);
         let switches = matches!(
             command,
             ContextCommand::SwitchContext(_)
@@ -480,11 +479,13 @@ impl Reactor {
                 | ContextCommand::PreviousContext
                 | ContextCommand::CreateContext(_)
                 | ContextCommand::CreateContextFromWindows { .. }
+                | ContextCommand::OpenContextSwitcher
         );
         if switches && self.screens.iter().all(|screen| screen.space.is_none()) {
             return Err(NO_MANAGED_SPACE.to_string());
         }
-        match command {
+        let result = match command {
+            ContextCommand::OpenContextSwitcher => self.open_context_switcher(),
             ContextCommand::SwitchContext(reference) => {
                 let key = self.resolve(&reference).map_err(|err| err.to_string())?;
                 self.switch_context(key)
@@ -528,7 +529,11 @@ impl Reactor {
                 self.set_context_number(&context, number)
             }
             ContextCommand::DeleteContext(reference) => self.delete_context_named(&reference),
+        };
+        if result.is_ok() && !opens {
+            self.hide_context_switcher();
         }
+        result
     }
 
     /// The named context that a command names. Everything and Unsorted
@@ -544,7 +549,7 @@ impl Reactor {
 
     /// The entry that a command names, as `model::contexts::resolve` finds
     /// it.
-    fn resolve(&self, reference: &ContextRef) -> Result<ContextKey, ContextError> {
+    pub(super) fn resolve(&self, reference: &ContextRef) -> Result<ContextKey, ContextError> {
         resolve(reference.query(), &self.contexts, self.lists_unsorted())
     }
 
@@ -588,6 +593,7 @@ impl Reactor {
             }
         } else {
             info!("Contexts are off; showing every window");
+            self.hide_context_switcher();
             // A window that waits for the window server's list is not new when
             // contexts come back: it was found while they were off.
             self.pending_first_seen.clear();
@@ -5145,7 +5151,10 @@ mod tests {
         s.reactor
             .handle_event(Event::WindowsOnScreenUpdated { pid: None, on_screen: listed });
         s.reactor.contexts.add_window(id_of(c), &s.desc(quitting)).unwrap();
-        assert!(!s.reactor.contexts.is_member(c, panel), "the panel is in no context");
+        assert!(
+            !s.reactor.contexts.is_member(c, panel),
+            "the panel is in no context"
+        );
         assert!(!s.reactor.lists_unsorted(), "only the panel is in no context");
 
         s.reactor.contexts.remove_window(id_of(c), quitting).unwrap();

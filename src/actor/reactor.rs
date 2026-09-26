@@ -17,6 +17,7 @@ mod membership;
 mod parking;
 mod quit;
 mod replay;
+mod switcher;
 
 #[cfg(test)]
 mod restore_snapshots;
@@ -77,8 +78,10 @@ pub fn channel() -> (Sender, Receiver) {
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Event {
-    /// The screen layout, including resolution, changed. This is always the
-    /// first event sent on startup.
+    /// Physical display ids in the order of the next screen parameters event.
+    DisplayIdsChanged(Vec<u32>),
+    /// The screen layout, including resolution, changed. DisplayIdsChanged
+    /// precedes it on startup.
     ///
     /// `frames` holds the visible frame of each screen, and `bounds` the full
     /// bounds of its display. The main screen is always first in both lists.
@@ -297,6 +300,9 @@ pub enum ContextCommand {
     /// Creates a context with this name, whose members are the windows that
     /// show on the visible Spaces, and switches to it.
     CreateContext(String),
+    /// Opens the switcher panel, or closes it when it is open. The panel
+    /// decides, so Rust doesn't track whether it is open.
+    OpenContextSwitcher,
     /// Adds `window` to the context. `None` means the focused window, which
     /// only a key binding uses: the switcher always passes `Some`, and the
     /// reactor never falls back to the focused window when it has one.
@@ -328,15 +334,9 @@ pub enum ContextCommand {
         remove_records: Vec<RecordRef>,
     },
     /// Renames a context (R4).
-    RenameContext {
-        context: ContextRef,
-        name: String,
-    },
+    RenameContext { context: ContextRef, name: String },
     /// Gives a context a number from 1 to 9 (R5).
-    SetContextNumber {
-        context: ContextRef,
-        number: u8,
-    },
+    SetContextNumber { context: ContextRef, number: u8 },
     /// Deletes a context (R6).
     DeleteContext(ContextRef),
 }
@@ -514,6 +514,13 @@ pub struct Reactor {
     command_results: VecDeque<CommandResult>,
     /// The snapshot of the contexts published last.
     published_contexts: Option<Arc<ContextsSnapshot>>,
+    /// Physical display ids in screen order, supplied by SpaceManager.
+    display_ids: Vec<u32>,
+    /// Shows the switcher panel with its payload, or closes it when it is
+    /// open. Tests replace it.
+    show_switcher: Box<dyn FnMut(String) + Send>,
+    /// Hides the switcher panel if it is open. Tests replace it.
+    hide_switcher: Box<dyn FnMut() + Send>,
     /// Where snapshots of the contexts go.
     publish_contexts: Box<dyn FnMut(Arc<ContextsSnapshot>) + Send>,
 }
@@ -763,6 +770,9 @@ impl Reactor {
             exit: Box::new(|code| info!(code, "Not quitting a reactor that has no exit")),
             command_results: VecDeque::new(),
             published_contexts: None,
+            display_ids: Vec::new(),
+            show_switcher: Box::new(swift_bridge::show_context_switcher),
+            hide_switcher: Box::new(swift_bridge::hide_context_switcher),
             publish_contexts: Box::new(|_| {}),
         }
     }
@@ -881,6 +891,7 @@ impl Reactor {
             _ => false,
         };
         match event {
+            Event::DisplayIdsChanged(ids) => self.display_ids = ids,
             Event::ApplicationLaunched {
                 pid,
                 info,
@@ -1027,11 +1038,8 @@ impl Reactor {
                 self.in_drag = false;
                 self.resizing_window = None;
                 // Clean up hidden_windows tracking for this window.
-                if let Some(wsid) = self
-                    .window_ids
-                    .iter()
-                    .find(|(_, w)| **w == wid)
-                    .map(|(wsid, _)| *wsid)
+                if let Some(wsid) =
+                    self.window_ids.iter().find(|(_, w)| **w == wid).map(|(wsid, _)| *wsid)
                 {
                     self.hidden_windows.remove(&wsid);
                 }
@@ -1297,6 +1305,9 @@ impl Reactor {
                         scale_factor,
                     })
                     .collect();
+                if self.screens.iter().all(|screen| screen.space.is_none()) {
+                    self.hide_context_switcher();
+                }
                 let response = self.show_visible_spaces();
                 if let Some(response) = response {
                     self.handle_layout_response_with_context(
@@ -1341,6 +1352,9 @@ impl Reactor {
                 self.repark_counts.clear();
                 for (space, screen) in spaces.iter().zip(&mut self.screens) {
                     screen.space = *space;
+                }
+                if self.screens.iter().all(|screen| screen.space.is_none()) {
+                    self.hide_context_switcher();
                 }
                 let response = self.show_visible_spaces();
                 if let Some(response) = response {
@@ -1741,10 +1755,7 @@ impl Reactor {
         // with Cmd+W). The window server might still show them as visible, but
         // we should not include them in the layout.
         self.visible_windows.extend(
-            on_screen
-                .visible
-                .into_iter()
-                .filter(|wsid| !self.hidden_windows.contains(wsid)),
+            on_screen.visible.into_iter().filter(|wsid| !self.hidden_windows.contains(wsid)),
         );
         self.window_server_info
             .extend(on_screen.info.into_iter().map(|info| (info.id, info)));

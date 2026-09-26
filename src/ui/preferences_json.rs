@@ -338,7 +338,7 @@ impl HotkeyBindingJson {
 }
 
 /// Format a hotkey using macOS-style symbols.
-fn format_hotkey(hotkey: &Hotkey) -> String {
+pub(crate) fn format_hotkey(hotkey: &Hotkey) -> String {
     let s = hotkey.to_string();
     // Convert "Alt + Ctrl + Shift + KeyH" to "⌥⌃⇧H"
     let mut result = String::new();
@@ -467,6 +467,12 @@ fn describe_context_command(cmd: &ContextCommand) -> (String, String, String, u3
             category,
             "show_everything".to_string(),
             0,
+        ),
+        ContextCommand::OpenContextSwitcher => (
+            "Open the context switcher".to_string(),
+            category,
+            "open_context_switcher".to_string(),
+            11,
         ),
         ContextCommand::SwitchContext(ContextRef::Number(number)) => (
             format!("Switch to context {number}"),
