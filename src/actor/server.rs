@@ -770,7 +770,6 @@ mod tests {
         for unreadable in [
             &b"Context(Delete)"[..],
             b"Context(Run(switch_context(\"cli\")))",
-            b"Context(Run(9, delete_context(1)))",
             b"Context(Run(9, switch_context(300)))",
             b"Context(Result(-1))",
             b"",
@@ -778,12 +777,24 @@ mod tests {
         ] {
             assert!(send(unreadable).is_empty(), "{}", AsciiEscaped(unreadable));
         }
+        assert_eq!(
+            Response::Success,
+            reply(send(b"Context(Run(10, delete_context(1)))"))
+        );
 
         let (_, event) = wm_rx.try_recv().unwrap();
         let wm_controller::WmEvent::ContextCommandRequested(request, command) = event else {
             panic!("{event:?}");
         };
         assert_eq!((RequestId(9), switch(name("cli"))), (request, command));
+        let (_, event) = wm_rx.try_recv().unwrap();
+        let wm_controller::WmEvent::ContextCommandRequested(request, command) = event else {
+            panic!("{event:?}");
+        };
+        assert_eq!(
+            (RequestId(10), ContextCommand::DeleteContext(ContextRef::Number(1))),
+            (request, command)
+        );
         assert!(wm_rx.try_recv().is_err());
     }
 }

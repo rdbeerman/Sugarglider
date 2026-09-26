@@ -11,13 +11,14 @@ use std::time::{Instant, SystemTime};
 use objc2_core_foundation::CGSize;
 use tracing::{debug, error, info, warn};
 
-use super::{ContextCommand, ContextRef, Event, Reactor};
+use super::{ContextCommand, ContextRef, Reactor, RecordRef};
+use super::Event;
 use crate::actor::app::{Request, WindowId, pid_t};
-use crate::actor::contexts_snapshot::CONTEXTS_OFF;
+use crate::actor::contexts_snapshot::{CONTEXTS_OFF, app_name};
 use crate::actor::contexts_store::{ContextsStore, Loaded, empty_contexts_after};
 use crate::actor::layout::{ActiveContext, EventResponse, LayoutEvent};
 use crate::model::contexts::{
-    ContextError, ContextId, ContextKey, Contexts, MatchPass, SwitchInput, SwitchPlan,
+    ContextError, ContextId, ContextKey, Contexts, MatchPass, Slot, SwitchInput, SwitchPlan,
     SwitchScreen, SwitchWindow, WindowDesc, plan_switch, resolve,
 };
 use crate::sys::screen::SpaceId;
@@ -504,7 +505,165 @@ impl Reactor {
             }
             ContextCommand::ToggleWindowPinned => self.toggle_window_pinned(self.main_window()),
             ContextCommand::CreateContext(name) => self.create_context(&name),
+            ContextCommand::RenameContext { context, name } => {
+                let id = self.resolve_named_context(&context, "renamed")?;
+                self.contexts.rename(id, &name).map_err(|err| err.to_string())?;
+                info!(?id, name, "Renamed a context");
+                self.save_contexts();
+                Ok(())
+            }
+            ContextCommand::SetContextNumber { context, number } => {
+                let id = self.resolve_named_context(&context, "numbered")?;
+                self.contexts
+                    .set_number(id, Some(number))
+                    .map_err(|err| err.to_string())?;
+                info!(?id, number, "Gave a context a number");
+                self.save_contexts();
+                Ok(())
+            }
+            ContextCommand::DeleteContext(context) => {
+                let id = self.resolve_named_context(&context, "deleted")?;
+                self.delete_context(id).map_err(|err| err.to_string())?;
+                info!(?id, "Deleted a context");
+                Ok(())
+            }
+            ContextCommand::EditContextMembers {
+                context,
+                add,
+                remove,
+                remove_records,
+            } => {
+                let id = self.resolve_named_context(&context, "edited")?;
+                self.edit_context_members(id, &add, &remove, &remove_records)
+            }
+            ContextCommand::RemoveRecord { context, record } => {
+                let id = self.resolve_named_context(&context, "edited")?;
+                self.remove_record(id, record)
+            }
         }
+    }
+
+    /// The named context that a command names. Everything and Unsorted
+    /// can't be renamed, numbered, edited, or deleted.
+    fn resolve_named_context(
+        &self,
+        reference: &ContextRef,
+        action: &str,
+    ) -> Result<ContextId, String> {
+        match self.resolve(reference).map_err(|err| err.to_string())? {
+            ContextKey::Named(id) => Ok(id),
+            ContextKey::Everything | ContextKey::Unsorted => {
+                Err(format!("Only a named context can be {action}"))
+            }
+        }
+    }
+
+    /// Removes the member record at `record`, whose window is gone. A
+    /// record whose window is open is left alone: `remove_window_from_context`
+    /// is how a window leaves a context.
+    fn remove_record(&mut self, id: ContextId, record: usize) -> Result<(), String> {
+        let open = self
+            .contexts
+            .get(id)
+            .and_then(|context| context.members.get(record))
+            .is_some_and(|member| member.window().is_some());
+        if open {
+            return Err("The member's window is open; remove the window instead".to_string());
+        }
+        let removed = self
+            .contexts
+            .remove_record(Slot::Context(id), record)
+            .map_err(|err| err.to_string())?;
+        info!(?id, record, ?removed, "Removed a member record");
+        self.save_contexts();
+        Ok(())
+    }
+
+    /// Changes a context's members. The records in `remove_records` go
+    /// first, from the highest index down, and only while the index still
+    /// names a record with no open window and the same app and title. Then
+    /// the windows in `remove` leave at once, as R37 says, and the windows
+    /// in `add` join for the next switch. Pinned windows are members of
+    /// every context already, so they get no record and are left alone (R3).
+    fn edit_context_members(
+        &mut self,
+        id: ContextId,
+        add: &[WindowId],
+        remove: &[WindowId],
+        remove_records: &[RecordRef],
+    ) -> Result<(), String> {
+        let mut records: Vec<&RecordRef> = remove_records.iter().collect();
+        records.sort_by_key(|item| std::cmp::Reverse(item.record));
+        for item in records {
+            if !self.remove_record_matching(id, item) {
+                warn!(
+                    ?id,
+                    record = item.record,
+                    "Skipping a member record that changed since it was listed"
+                );
+            }
+        }
+        let mut removed: Vec<WindowId> = Vec::new();
+        for &window in remove {
+            for tab in self.edit_windows(window) {
+                if removed.contains(&tab) {
+                    continue;
+                }
+                removed.push(tab);
+                _ = self.contexts.remove_window(id, tab);
+                self.added_since_switch.remove(&tab);
+            }
+        }
+        let mut added: Vec<WindowId> = Vec::new();
+        for &window in add {
+            for tab in self.edit_windows(window) {
+                if added.contains(&tab) {
+                    continue;
+                }
+                if let Some(desc) = self.window_desc(tab) {
+                    _ = self.contexts.add_window(id, &desc);
+                    self.added_since_switch.insert(tab);
+                    added.push(tab);
+                }
+            }
+        }
+        info!(?id, added = added.len(), removed = removed.len(), "Edited a context's members");
+        self.save_contexts();
+        if !removed.is_empty() {
+            self.park_windows_that_left(&removed);
+        }
+        Ok(())
+    }
+
+    /// Removes the record at the index of `item` while it still has no open
+    /// window and the same app and title. Returns whether it was removed.
+    fn remove_record_matching(&mut self, id: ContextId, item: &RecordRef) -> bool {
+        let matches = self
+            .contexts
+            .get(id)
+            .and_then(|context| context.members.get(item.record))
+            .is_some_and(|record| {
+                record.window().is_none()
+                    && app_name(record) == item.app
+                    && record.title == item.title
+            });
+        matches && self.contexts.remove_record(Slot::Context(id), item.record).is_ok()
+    }
+
+    /// The windows that an edit's `add` or `remove` applies to: the
+    /// window's native tab group (R36), without pinned windows (R3), and
+    /// without windows the reactor or the layout doesn't track.
+    fn edit_windows(&self, window: WindowId) -> Vec<WindowId> {
+        self.tabs_of(self.membership_window(window))
+            .into_iter()
+            .filter(|&tab| {
+                !self.contexts.is_pinned(tab)
+                    && self.window_desc(tab).is_some()
+                    && self
+                        .layout_window_info(tab)
+                        .is_some_and(|info| !self.layout.is_untracked(&info))
+            })
+            .collect()
     }
 
     /// The named context that a command names. Everything and Unsorted
@@ -578,18 +737,12 @@ impl Reactor {
     }
 
     /// Deletes a context. Its windows stay open, and the ones that were only
-    /// in it become unsorted. When it was active, Unsorted shows first, and
-    /// then the context's layouts go.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no command deletes a context yet")
-    )]
+    /// in it become unsorted. The active context is applied again first, so
+    /// that they show when Unsorted is active, and then the context's
+    /// layouts go.
     pub(super) fn delete_context(&mut self, id: ContextId) -> Result<(), ContextError> {
-        let was_active = self.contexts.active() == ContextKey::Named(id);
         self.contexts.delete(id)?;
-        if was_active {
-            self.apply_again();
-        }
+        self.apply_again();
         self.layout.remove_context_layouts(id);
         if self.contexts_enabled() {
             self.save_contexts();
@@ -785,6 +938,7 @@ mod tests {
 
     mod focus;
     mod focus_rules;
+    mod management;
     mod membership;
     mod membership_rules;
     mod replay_rules;

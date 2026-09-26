@@ -528,6 +528,51 @@ fn describe_context_command(cmd: &ContextCommand) -> (String, String, String, u3
             format!("create_context_{name}"),
             40,
         ),
+        ContextCommand::RenameContext { context, name } => {
+            let (context, id, order) = describe_context_ref(context);
+            (
+                format!("Rename {context} to \"{name}\""),
+                category,
+                format!("rename_context_{id}"),
+                100 + order,
+            )
+        }
+        ContextCommand::SetContextNumber { context, number } => {
+            let (context, id, order) = describe_context_ref(context);
+            (
+                format!("Give {context} the number {number}"),
+                category,
+                format!("set_context_number_{id}"),
+                120 + order,
+            )
+        }
+        ContextCommand::DeleteContext(context) => {
+            let (context, id, order) = describe_context_ref(context);
+            (
+                format!("Delete {context}"),
+                category,
+                format!("delete_context_{id}"),
+                140 + order,
+            )
+        }
+        ContextCommand::EditContextMembers { context, .. } => {
+            let (context, id, order) = describe_context_ref(context);
+            (
+                format!("Change the windows of {context}"),
+                category,
+                format!("edit_context_members_{id}"),
+                160 + order,
+            )
+        }
+        ContextCommand::RemoveRecord { context, record } => {
+            let (context, id, order) = describe_context_ref(context);
+            (
+                format!("Forget member record {record} of {context}"),
+                category,
+                format!("remove_record_{id}"),
+                180 + order,
+            )
+        }
     }
 }
 
@@ -878,6 +923,24 @@ mod tests {
             ),
             ("Ctrl + Alt + KeyR", ContextCommand::RemoveWindowFromContext),
             ("Ctrl + Alt + KeyP", ContextCommand::ToggleWindowPinned),
+            (
+                "Ctrl + Alt + KeyD",
+                ContextCommand::DeleteContext(ContextRef::Number(3)),
+            ),
+            (
+                "Ctrl + Alt + KeyN",
+                ContextCommand::SetContextNumber {
+                    context: ContextRef::Name("Comms".into()),
+                    number: 4,
+                },
+            ),
+            (
+                "Ctrl + Alt + KeyF",
+                ContextCommand::RemoveRecord {
+                    context: ContextRef::Id(id),
+                    record: 0,
+                },
+            ),
         ];
         let mut config = Config::default();
         config.keys = bindings
@@ -897,9 +960,12 @@ mod tests {
         assert_eq!(
             vec![
                 "add_window_to_context_2",
+                "delete_context_3",
                 "move_window_to_context_name_Comms",
                 "previous_context",
+                "remove_record_id_7",
                 "remove_window_from_context",
+                "set_context_number_name_Comms",
                 "show_everything",
                 "switch_context_1",
                 "switch_context_2",

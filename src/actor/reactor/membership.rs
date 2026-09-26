@@ -405,7 +405,7 @@ impl Reactor {
     /// Parks the windows that left the active context and no longer show, with
     /// their journal entries written first, takes them out of the layout, and
     /// focuses the active context's most recently focused member.
-    fn park_windows_that_left(&mut self, wids: &[WindowId]) {
+    pub(super) fn park_windows_that_left(&mut self, wids: &[WindowId]) {
         if !self.contexts_in_use() {
             return;
         }

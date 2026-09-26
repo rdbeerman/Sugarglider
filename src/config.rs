@@ -953,6 +953,9 @@ mod tests {
             "Ctrl + Alt + KeyN" = { move_window_to_context = "Comms" }
             "Ctrl + Alt + KeyR" = "remove_window_from_context"
             "Ctrl + Alt + KeyP" = "toggle_window_pinned"
+            "Ctrl + Alt + KeyD" = { delete_context = 3 }
+            "Ctrl + Alt + KeyU" = { set_context_number = { context = "Comms", number = 2 } }
+            "Ctrl + Alt + KeyF" = { remove_record = { context = { id = 7 }, record = 0 } }
             "#,
         )
         .unwrap();
@@ -999,6 +1002,24 @@ mod tests {
             command("Ctrl + Alt + KeyR")
         );
         assert_eq!(ContextCommand::ToggleWindowPinned, command("Ctrl + Alt + KeyP"));
+        assert_eq!(
+            ContextCommand::DeleteContext(ContextRef::Number(3)),
+            command("Ctrl + Alt + KeyD")
+        );
+        assert_eq!(
+            ContextCommand::SetContextNumber {
+                context: ContextRef::Name("Comms".into()),
+                number: 2,
+            },
+            command("Ctrl + Alt + KeyU")
+        );
+        assert_eq!(
+            ContextCommand::RemoveRecord {
+                context: ContextRef::Id(id),
+                record: 0,
+            },
+            command("Ctrl + Alt + KeyF")
+        );
     }
 
     /// Key bindings. The default config ships the context bindings of the

@@ -297,6 +297,47 @@ pub enum ContextCommand {
     /// Creates a context with this name, whose members are the windows that
     /// show on the visible Spaces, and switches to it.
     CreateContext(String),
+    /// Renames a context (R4).
+    RenameContext {
+        context: ContextRef,
+        name: String,
+    },
+    /// Gives a context a number from 1 to 9, away from the context that
+    /// holds it (R5).
+    SetContextNumber {
+        context: ContextRef,
+        number: u8,
+    },
+    /// Deletes a context (R6). Its windows stay open, and the ones that
+    /// were only in it become unsorted.
+    DeleteContext(ContextRef),
+    /// Changes a context's members: removes the records of closed windows,
+    /// removes windows at once, and adds windows for the next switch (R37).
+    EditContextMembers {
+        context: ContextRef,
+        #[serde(default)]
+        add: Vec<WindowId>,
+        #[serde(default)]
+        remove: Vec<WindowId>,
+        #[serde(default)]
+        remove_records: Vec<RecordRef>,
+    },
+    /// Removes the member record at `record`, whose window is gone (R23).
+    RemoveRecord {
+        context: ContextRef,
+        record: usize,
+    },
+}
+
+/// Names a member record of a context in an edit command: its index in
+/// `Context.members`, and the app and title a client read there. The
+/// reactor removes the record only while all three still match, because
+/// the record can change while the switcher is open (R23).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RecordRef {
+    pub record: usize,
+    pub app: String,
+    pub title: String,
 }
 
 /// Names a context in a command.

@@ -207,11 +207,9 @@ mod tests {
         s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], all));
         assert_eq!(shows(ContextKey::Named(work)), last(&published).screens);
 
-        // The context is deleted. No command deletes a context yet, so the
-        // next event publishes the change. Unsorted is active, and without a
-        // context no window counts as unsorted.
-        s.reactor.delete_context(work).unwrap();
-        s.reactor.handle_event(Event::StartupComplete);
+        // The context is deleted. Unsorted is active, and without a context
+        // no window counts as unsorted.
+        s.run(ContextCommand::DeleteContext(ContextRef::Id(work)));
         let deleted = last(&published);
         assert!(deleted.contexts.is_empty());
         assert_eq!(ContextKey::Unsorted, deleted.active);
