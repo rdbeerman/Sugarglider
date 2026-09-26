@@ -1,18 +1,22 @@
 # Contexts
 
-Status: implemented behind `settings.experimental.contexts.enable`, which defaults to false. Written 2026-09-25, revised 2026-09-26.
+Status: partly implemented behind `settings.experimental.contexts.enable`, which defaults to false. Written 2026-09-25, revised 2026-09-26.
 
-Code references point at commit `912d0ce`. Each reference names the symbol first; line numbers are hints and will drift.
+Code references point at commit `945794a`, the tip of the feature branch when this revision was verified. Each reference names the symbol first; line numbers are hints and will drift.
 
-The M1 spike and the manual QA still need a person. The questions in [What we don't know yet](#what-we-dont-know-yet) have no answers yet, and the checks under Manual QA in [Testing](#testing) haven't run.
+Implemented: M2 to M5c and M7, with the M5b fixes through `945794a`. That is the model, global-scope switching, membership and focus, parking and the journal, `contexts.json`, the IPC, the minimal command line (`list`, `current`, `create`, `switch`, `add`, `everything`), and the menu bar.
+
+Still to build: M6's full command line and the Raycast script, M8's Rust half (the Swift panel is in the tree, but no command opens it and its bridge functions don't exist), M9's per-screen scope, and M10's scope picker and the final user page.
+
+The M1 spike (Q1 to Q4), Q5's target, and the manual QA still need a person. The questions in [What we don't know yet](#what-we-dont-know-yet) have no answers yet, and the checks under Manual QA in [Testing](#testing) haven't run.
 
 ## Start here
 
 This section is for whoever picks up the work next.
 
-- Branch: `feat-rooms-context-switching`, PR #25. The implementation is there, behind `settings.experimental.contexts.enable`. The M1 spike and the manual QA still need a person.
+- Branch: `feat-rooms-context-switching`, PR #25. The implementation so far is there, behind `settings.experimental.contexts.enable`: global-scope switching, membership and focus, parking and the journal, `contexts.json`, the IPC and minimal command line, and the menu bar. M6's full command line, M8's Rust half, M9, and M10 remain. The M1 spike, Q5's target, and the manual QA still need a person.
 - The design decisions in [Settled decisions](#settled-decisions) came from the product owner. Build on them; don't reopen them.
-- Build every milestone now. Each design works whatever the answers to the questions in [What we don't know yet](#what-we-dont-know-yet) turn out to be. The spike ([M1](#m1-spike-answer-the-macos-questions)) runs at the end, and anything it contradicts is fixed then.
+- What is built works whatever the answers to the questions in [What we don't know yet](#what-we-dont-know-yet) turn out to be. The spike ([M1](#m1-spike-answer-the-macos-questions)) runs at the end, and anything it contradicts is fixed then.
 - Agent sessions must not start the live window manager (`cargo run`, `sugarglider launch`). See `agents.md`. A person runs the spike and the manual QA checklist. Agents run `cargo test`, `cargo +nightly fmt --check`, and `devtool`.
 - Rules are numbered (R1, R2, …) so commits and tests can cite them. Numbers never change. A new rule takes the next free number, and so do new design items (L, H, I) and questions (Q).
 
@@ -65,7 +69,8 @@ And on 2026-09-26:
 - Sugarglider hides windows only by parking them. It never hides apps.
 - Global scope ships first. `per_screen` scope follows in its own milestone ([M9](#m9-per-screen-scope)).
 - A window's records survive when its app quits, even if macOS reports the window closed before the app quit (R23).
-- Every milestone is built now. No milestone waits for the spike. Each design works with either answer to Q1 to Q4. A person runs the spike and the manual QA at the end, and anything the spike contradicts is fixed then.
+- In `per_screen` scope, a window that a switch moves to another screen keeps its saved tile position in the layout of the screen it left. That screen closes the visible gap while the window is away, and the window returns to the saved position (R9).
+- No milestone waits for the spike. Each design works with either answer to Q1 to Q4. A person runs the spike and the manual QA at the end, and anything the spike contradicts is fixed then.
 
 ## Terms
 
@@ -103,7 +108,7 @@ And on 2026-09-26:
 - **R4.** Context names are unique, ignoring case and accents. "Everything" and "Unsorted" are reserved.
 - **R5.** A context can have a number from 1 to 9. Numbers are unique. A new context gets the lowest free number, or none when 1 to 9 are taken. Giving a context a number that another context holds takes the number away from that context.
 - **R6.** Deleting a context never touches its windows. Windows that were only in that context become unsorted. If the deleted context was active, Unsorted becomes active, so those windows stay visible. This counts as a use of Unsorted (R19). The context's layouts are deleted with it (L2).
-- **R36.** Native window tabs are separate windows that share one frame. Tabs that share a frame share membership. The group's main tab decides which contexts the whole group is in.
+- **R36.** Native window tabs are separate windows that share one frame. Tabs that share a frame share membership. The group's main tab decides which contexts the whole group is in. Two windows are tabs only while both are on screen and neither is parked; a window that shares the last frame of one that is minimized, on another Space, or closed with ⌘W is not a tab of it.
 - **R37.** `add_window_to_context` takes effect at the next switch. The window stays visible now, even when adding it takes it out of an active Unsorted. Until the next switch, including one that applies the same context again (R16), H2's predicate treats the window as a member of the active context, so it keeps its tile. `move_window_to_context` and `remove_window_from_context` take effect at once. If the window no longer must show (R13), Sugarglider parks it (R30 first) and focuses the active context's most recently focused member.
 
 ### Scope and active context
@@ -112,7 +117,7 @@ R8, R9, R11, and R26 apply to `per_screen` scope, which lands in [M9](#m9-per-sc
 
 - **R7.** In `global` scope, one active context covers all screens. A switch changes every screen. Windows stay on the screen they're on.
 - **R8.** In `per_screen` scope, each screen has its own active context. A switch changes only the focused screen. The members that are on other visible screens move to the focused screen.
-- **R9.** In `per_screen` scope, a shared window can only be on one screen. It goes to the screen that switched most recently. The other screen's layout closes the gap. The window returns when that screen switches again.
+- **R9.** In `per_screen` scope, a shared window can only be on one screen. It goes to the screen that switched most recently. The other screen's layout closes the gap. The window returns when that screen switches again. The screen the window leaves keeps its saved tile position for that return, so the window comes back to its old place.
 - **R10.** A screen's active context applies to whichever Space the screen shows. When the user changes Space, Sugarglider applies the active context to the newly visible Space. It does this in the reactor event that reports the change, before any other event reaches that Space's layout (L2).
 - **R11.** Changing scope from `per_screen` to `global` makes the focused screen's context the global one. Changing from `global` to `per_screen` gives every screen the current global context.
 
@@ -124,7 +129,9 @@ R8, R9, R11, and R26 apply to `per_screen` scope, which lands in [M9](#m9-per-sc
   3. Reconcile C's members (L8) and lay them out. Members that were parked return to their place in C's layout. Floating members return to their journal frame (H3).
   4. Park the windows that must not show.
   5. Focus a window. A switch that R24 started focuses the window the user focused. Any other switch focuses C's most recently focused member.
-  6. If no window can take focus in step 5, activate Finder through the raise mechanism (the SkyLight front-process call), so keystrokes don't go to a parked window.
+  6. If no window can take focus in step 5, activate Finder through the window server, the way the raise path makes an app frontmost, so keystrokes don't go to a parked window. A refused activation is reported, so the wait for Finder ends either way.
+
+  Steps 5 and 6 also run when Sugarglider applies the active context outside a switch: at `StartupComplete`, and when a config reload turns contexts on. If the apply parked the window that had the focus, its context's most recently focused member takes the focus, or Sugarglider activates Finder when there is none (`apply_again_focusing_parked_main`).
 - **R13.** A window "must show" when it is a member of the active context of the screen it is on, or will move to (R8). Under Everything, every window on that screen's visible Space must show.
 - **R14.** Sugarglider never parks:
   - its own windows;
@@ -144,7 +151,7 @@ R8, R9, R11, and R26 apply to `per_screen` scope, which lands in [M9](#m9-per-sc
   1. same app and same window server id;
   2. same app and exactly the same title, which isn't blank;
   3. same app and a similar title, and the window is in no context;
-  4. any window of the same app that is in no context, only during a switch and only for the records of the target context.
+  4. any window of the same app that is in no context and is on screen, only during a switch and only for the records of the target context.
 
   Every step needs the same app. A window and a record belong to the same app when their bundle ids are equal. When either bundle id is unknown, their app names must be equal. Window server ids are valid within one login session, so after a reboot a saved id can name an unrelated window, even one of another app. M5a stores the boot id in `contexts.json`. At launch, when the boot id has changed, the reactor calls `Contexts::forget_window_server_ids` before any matching.
 
@@ -160,7 +167,7 @@ R8, R9, R11, and R26 apply to `per_screen` scope, which lands in [M9](#m9-per-sc
   A single-window app that stays running after the user closes its window with ⌘W sends none of these signals. Its record stays pending until the app quits, and then it stays. This is accepted behavior.
 
   A context, and the pinned list, keeps at most 50 empty records (`MAX_EMPTY_RECORDS`). When a quitting app takes a list over that limit, the oldest empty records go. The records that were empty already go first, then the app's own, each in list order, which is the order the records were added. Lists that hold no record of the app stay as they are. Loading `contexts.json` applies no limit, because every record is empty after a restart. The user removes a record whose window is gone in the edit view or from the command line (`Contexts::remove_record`).
-- **R38.** The reactor decides a window's membership once, the first time it sees the window (`WindowCreated`, `WindowsDiscovered`, or `ApplicationLaunched`). It keeps the set of windows it has seen, so R20 and R21 apply only to windows seen for the first time. A window that comes back from being minimized, from a hidden app, or from another Space is not new. Windows that the reactor discovers before `StartupComplete` were open before Sugarglider started. They rejoin their contexts through R21 (`Contexts::rejoin_all` with `MatchPass::Arrival`) or stay unsorted, and R20 never applies to them.
+- **R38.** The reactor decides a window's membership once, the first time it sees the window (`WindowCreated`, `WindowsDiscovered`, or `ApplicationLaunched`). A window whose layer the window server hasn't listed yet waits; the list decides it when it arrives, and the app's own list decides a window the app reports there. This keeps a panel, whose layer is reported after its creation, out of the contexts (R20). The reactor keeps the set of windows it has seen, so R20 and R21 apply only to windows seen for the first time. A window that comes back from being minimized, from a hidden app, or from another Space is not new. Windows that the reactor discovers before `StartupComplete` were open before Sugarglider started. They rejoin their contexts through R21 (`Contexts::rejoin_all` with `MatchPass::Arrival`) or stay unsorted, and R20 never applies to them.
 - **R39.** A known window that becomes visible without taking focus is parked when it must not show (R13), with its journal entry written first (R30). For example, the user unminimizes it or unhides its app, it moves in from another Space, or its app moves it back from its parking spot. If it takes focus, R24 applies instead.
 
 ### Focus from outside
@@ -170,7 +177,7 @@ R8, R9, R11, and R26 apply to `per_screen` scope, which lands in [M9](#m9-per-sc
   - Sugarglider's own windows, including the switcher.
 
   Sugarglider decides a new window's membership (R20, R21, R38) before it applies this rule to the window, so launching an app never switches to Unsorted. If a focus event names a window the reactor hasn't seen yet, the rule waits and applies when R38 first sees the window. Sugarglider keeps each app's events in order, because an app thread sends its events and its window-server requests through one channel (`send_event` and `send_ws_request` in `src/actor/app.rs`). Spike question Q3 is only about the order in which macOS sends the Accessibility notifications.
-- **R25.** Only focus the user started counts. Sugarglider's focus raise is not quiet. The raise manager sends the other raises of a sequence with `Quiet::Yes`, and the focus raise last, with `Quiet::No`, so that it produces `WindowFocused` (`src/actor/raise.rs`, `RaiseManager::start_new_sequence` and `process_active_sequence`). A switch therefore ignores activations and main-window changes until its raise sequence ends. The reactor learns the end from `RaiseCompleted` for the focused window, `RaiseRequestFailed`, or `RaiseTimeout` with the switch's sequence id. The reactor chooses that id and passes it in `RaiseRequest`. Today `RaiseManager::start_new_sequence` assigns ids itself from `next_sequence_id`. When the switch issues no raise, the guard ends when the reactor has the `Requested(true)` frame echo of every window the switch parked. When step 6 of R12 runs, the guard also lasts until Finder's `ApplicationActivated` arrives. Parking the focused window may make macOS send an activation or main-window change that looks like the user's (spike question Q2).
+- **R25.** Only focus the user started counts. Sugarglider's focus raise is not quiet. The raise manager sends the other raises of a sequence with `Quiet::Yes`, and the focus raise last, with `Quiet::No`, so that it produces `WindowFocused` (`src/actor/raise.rs`, `RaiseManager::start_new_sequence` and `process_active_sequence`). The reactor chooses each sequence's id and passes it in `RaiseRequest`. A switch therefore ignores activations and main-window changes until its wait ends. The wait starts when the raise manager reports that it sent the switch's focusing raise (`RaiseFocusSent`), so a failure or timeout of a batch before that raise doesn't end it. It ends on a completed raise of the switch's window, on a `RaiseRequestFailed` that names that window once the raise was sent, or on a `RaiseTimeout` after the raise was sent. A second switch or a membership command extends the wait instead of replacing it, so what the first switch waited for still ends it. When the switch issues no raise, the wait ends when the reactor has the `Requested(true)` frame echo of every window the switch parked. When step 6 of R12 runs, the wait also lasts until Finder's activation arrives or fails; the switch's own activation of Finder doesn't count as the user's focus. Focus that arrived while the wait was on is looked at again when it ends, unless it is the window the switch focused. A wait that lasts 2 seconds stops and logs a warning (`GUARD_DEADLINE`, `guard_deadline_tick`). Parking the focused window may make macOS send an activation or main-window change that looks like the user's (spike question Q2).
 - **R26.** In `per_screen` scope, the switch happens on the screen where the window was last shown, or on the focused screen when that is unknown.
 - **R40.** When the user activates an app whose main window is parked, and the app has a visible member of the active context, Sugarglider raises that member and doesn't switch. With several such members, it raises the most recently focused one. It switches (R24) only when the app has no member in the active context. For example, Chrome has window w1 in C and w2 in D. C is active, and Chrome's main window is still the parked w2. ⌘-Tab to Chrome raises w1. Only an activation of the app is this rule's trigger. A main-window change inside the app that is already frontmost, as ⌘\` or a Mission Control pick of a parked window makes, takes R24's path instead: Sugarglider switches to the context that holds the window.
 
@@ -247,8 +254,8 @@ The JSON contract `docs/specs/contexts-switcher-contract.md` fixes the payload a
 
 ### Menu bar
 
-- The status item shows the name of the active context. In `per_screen` scope it shows the focused screen's context. It shows nothing extra when Everything is active. If `experimental.status_icon.space_index` is on, it shows both, for example "2 · Comms".
-- The menu gains a section with each context (a checkmark on the active one, and the number as the key equivalent), "Show Everything", "New Context from Current Windows…", a "Send Window to" submenu, and "Open Switcher…".
+- The status item shows the name of the active context. In `per_screen` scope it shows the focused screen's context. It shows nothing extra when Everything is active. If `experimental.status_icon.space_index` is on, it shows both, for example "2 · Comms". A context name longer than 20 characters is cut to 20 and an ellipsis is added (`src/actor/status.rs`, `short_name` and `MAX_STATUS_NAME`).
+- The menu gains a section with each context (a checkmark on the active one, and the actual key of a `switch_context` binding for that context as the key equivalent when one exists, not the context's number), "Show Everything", "New Context from Current Windows…", a "Send Window to" submenu, and "Open Switcher…".
 
 ### Key bindings
 
@@ -334,7 +341,7 @@ set -euo pipefail
 
 ### Preferences
 
-The Preferences window gets a "Contexts (experimental)" switch and a scope picker. `write_preferences_to_file` (`src/config.rs`) writes only a fixed list of keys, so these two keys must be added to it.
+The Preferences window has a "Contexts (experimental)" switch. `write_preferences_to_file` (`src/config.rs`) writes a fixed list of keys, and `settings.experimental.contexts.enable` is one of them. M10 adds the scope picker, which that list must include too.
 
 ## Design
 
@@ -460,13 +467,13 @@ Facts from the current code:
 - A window whose frame is on no screen belongs to no Space and drops out of the layout at the next refresh (`best_screen_idx_for_window`, test `windows_parked_off_screen_belong_to_no_screen`). A window with 1 pixel on screen does belong to that screen.
 - `ScreenInfo` (`src/sys/screen.rs`) and the reactor's `Screen` (`src/actor/reactor.rs`) carry only each display's visible frame, not its full bounds.
 - A `SetWindowFrame` echo comes back as `WindowFrameChanged` with `requested` set. The reactor handles only minimum sizes there and returns without touching `frame_monotonic` (`Reactor::handle_event`, `Event::WindowFrameChanged`). `update_layout` skips a window whose target equals `frame_monotonic`. It stops writing a target after `MAX_FRAME_ATTEMPTS` (5) tries within `FRAME_ATTEMPT_RESET` (2 seconds).
-- The reactor treats windows of one app with the same rounded frame (`Reactor::frame_key`) as tabs. `WindowBecameVisible` skips a window that such a sibling covers (`dominated_by_existing`). `WindowDestroyed` skips `WindowRemoved` when a sibling has the same frame (`dominated_by_sibling`). `send_visible_windows_to_layout` keeps one window per frame.
+- The reactor treats windows of one app that are on screen and share the same rounded frame (`Reactor::frame_key`, `window_on_screen`) as tabs; a parked window and a window that isn't on screen are no tab. `WindowBecameVisible` skips a window that such a sibling covers (`dominated_by_existing`). `WindowDestroyed` skips `WindowRemoved` when a sibling has the same frame (`dominated_by_sibling`). `send_visible_windows_to_layout` keeps one window per frame.
 - Floating windows live outside the tree, in `LayoutManager.floating_windows`. `update_layout` writes only the frames that `calculate_layout_and_groups` returns, plus the one-shot `pending_frame_overrides`.
 
 Design:
 
 - **H1.** Parking sends `SetWindowFrame` to a corner position that keeps 1 pixel on screen. `parking_origin(size, target, others)` in `src/model/parking.rs` ports Rooms' `Geometry.parkingOrigin`. `target` is the visible frame of the window's display, and `others` are the full bounds of the other displays. It tries the four corners of `target` and takes the first one where the parked window overlaps no other display. The reactor needs each display's full bounds (`CGDisplayBounds`) next to its visible frame, in `ScreenInfo` and in the reactor's `Screen`.
-- **H2.** The reactor keeps `parked: HashMap<WindowId, CGRect>`, with the frame from before parking; a parked window's Space is the Space of that frame, not of the corner it sits in. One predicate, `reaches_layout(space, wid)`, decides whether a window may reach the layout: it rejects parked windows, whatever their geometry says, and applies L4's member filter. Every path that sends a layout event for a window applies it: `WindowBecameVisible` (which sends `WindowAdded`), the frame change (`LayoutEvent::WindowFrameChanged`, `WindowResized`, and the `WindowSpaceChanged` of a frame change across screens), `MouseMovedOverWindow`, and `send_visible_windows_to_layout` (the window-server snapshot), which keeps a parked window that shows in a layout, at its frame from before parking, so parking never removes its node (L5). A frame change of a parked window is kept out of the layout entirely; it only updates the window's observed frame and re-parks it when its app moved it out of its corner, at most 5 times per window between switches.
+- **H2.** The reactor keeps `parked: HashMap<WindowId, CGRect>`, with the frame from before parking; a parked window's Space is the Space of that frame, not of the corner it sits in. One predicate, `reaches_layout(space, wid)`, decides whether a window may reach the layout: it rejects parked windows, whatever their geometry says, and applies L4's member filter. Every path that sends a layout event for a window applies it: `WindowBecameVisible` (which sends `WindowAdded`), the frame change (`LayoutEvent::WindowFrameChanged`, `WindowResized`, and the `WindowSpaceChanged` of a frame change across screens), `MouseMovedOverWindow`, and `send_visible_windows_to_layout` (the window-server snapshot), which keeps a parked window that shows in a layout, at its frame from before parking, so parking never removes its node (L5). A frame change of a parked window is kept out of the layout entirely; it only updates the window's observed frame and re-parks it when its app moved it out of its corner, at most 5 times since the last switch or Space change; after that it leaves the window where the app put it and warns once.
 - **H3.** Putting a member back needs no special request. The reconcile (L8) gives the member a node in the active layout, so `update_layout` writes its frame. The reactor clears the member's parked state before that write, and R31 removes the journal entry when the echo confirms the frame. A member the layout doesn't place, a floating member or one with no node, has no tile to return to, so the reactor puts it back at its frame from before parking through `pending_frame_overrides`. Showing Everything puts non-members back at their journal frames (R27).
 - **H4.** Park and unpark writes go through the reactor's frame bookkeeping. Each write takes a new transaction id (`WindowState::next_txid`), so the reactor ignores stale frame reads from before it. Parking sets `frame_monotonic` to the parked frame, so `update_layout` doesn't skip the unpark write as unchanged. Parking and unparking both clear the window's `frame_attempts` entry, so quick switches never reach `MAX_FRAME_ATTEMPTS`.
 - **H5.** Parked windows keep the exact 1-point corner that `parking_origin` returns, so parked windows of one app with the same size share a frame. The tab checks skip parked windows. `dominated_by_existing`, `dominated_by_sibling`, and the frame grouping in `send_visible_windows_to_layout` never treat a parked window as a sibling tab.
@@ -543,7 +550,7 @@ Design:
 ### Swift bridge
 
 - Rust to Swift: add `sugarglider_show_context_switcher(json)` and `sugarglider_hide_context_switcher()`. The reactor calls them (see Commands and dispatch). The JSON is the contract's show payload: the snapshot, the target window, and the windows on screen with their titles and app names. A show while the panel is open closes it, so the hotkey toggles. Rust never tracks whether the panel is open; Swift decides.
-- Swift to Rust: add `sugarglider_rank_contexts(query)` (returns JSON, freed with `sugarglider_free_string`) and `sugarglider_run_context_command(json)`. `rank_contexts` returns `model::contexts::rank` over the published snapshot, or NULL while contexts are unavailable; it replaces the `sugarglider_get_contexts()` of the earlier draft. `run_context_command` checks the command against the same snapshot — invalid JSON, an unknown command, the flag off, an unknown context id, a create or rename name that is empty, reserved, or taken (R4), a `set_number` outside 1 to 9, or a stale `remove_records` item — and then either returns NULL after sending it or returns an error message for the user. Only the commands that act on a window, `add_window`, `move_window`, and `toggle_pinned`, carry one, the target window. Neither function waits on the reactor or on `WmController`.
+- Swift to Rust: add `sugarglider_rank_contexts(query)` (returns JSON, freed with `sugarglider_free_string`) and `sugarglider_run_context_command(json)`. `rank_contexts` returns `model::contexts::rank` over the published snapshot, or NULL while contexts are unavailable; it replaces the `sugarglider_get_contexts()` of the earlier draft. `run_context_command` checks the command against the same snapshot and returns an error for invalid JSON, an unknown command, the flag off, an unknown context id, a create or rename name that is empty, reserved, or taken (R4), a `set_number` outside 1 to 9, or a stale `remove_records` item. Otherwise it returns NULL after sending the command. Only the commands that act on a window, `add_window`, `move_window`, and `toggle_pinned`, carry one, the target window. Neither function waits on the reactor or on `WmController`.
 - The published snapshot carries what `rank` and `run` need: each context's id, name, use number, and member records, with the app name a record derives and whether it has an open window; the use numbers of Unsorted and Everything; and the unsorted count that leaves pinned windows out (R3). The show payload lists one row per native tab group, with its `tab_count`. The contract `docs/specs/contexts-switcher-contract.md` fixes the payload, the commands, the rank result, and the error messages.
 - `sugarglider_run_context_command` sends the command through the sender that `CONFIG_UPDATE_SENDER` (`src/ui/swift_bridge.rs`) already holds, a `wm_controller::Sender`. Rename that global if its name gets in the way; don't add a second one. The reactor hides the panel after a context command succeeds, whatever sent it, when the feature turns off, and when an exit is pending (R32, R33).
 - Each new Swift-to-Rust symbol needs a `-Wl,-u,_<symbol>` line in `build.rs` and a `black_box` reference in `swift_bridge::init`. Commit `73ae968` explains why.
@@ -578,12 +585,12 @@ scope = "global"
 
 ## What we don't know yet
 
-These are facts about macOS that the code can't answer. The spike (M1) answers Q1 to Q4 on a real Mac, after the other milestones are built, and M5a answers Q5. No milestone waits for the answers. Each question below names the design that works with either answer, and the rule that changes if the spike contradicts it. Replace each question with the finding.
+These are facts about macOS that the code can't answer. The spike (M1) answers Q1 to Q4 on a real Mac, after the remaining milestones are built, and M5a answers Q5. No milestone waits for the answers. Each question below names the design that works with either answer, and the rule that changes if the spike contradicts it. Replace each question with the finding.
 
 - **Q1.** Does macOS keep a window where Sugarglider puts it when only 1 pixel stays on screen? Check all four corners, with one display and with two. Check that the window stays parked when its app is activated, and whether apps move their own parked windows back.
-  - Not blocking. `parking_origin` is a pure function, so a different corner order changes only H1. If an app moves a parked window back, R39 parks it again, up to H2's cap of 5 per window between switches. If an app keeps moving it back past the cap, the fix goes into R39.
+  - Not blocking. `parking_origin` is a pure function, so a different corner order changes only H1. If an app moves a parked window back, R39 parks it again, up to H2's cap of 5 since the last switch or Space change. If an app keeps moving it back past the cap, the fix goes into R39.
 - **Q2.** When Sugarglider parks the focused window, does macOS send an activation or main-window change, and does it arrive with `Quiet::No`? When no member can take focus, does activating Finder (R12, step 6) take key focus away from the parked window? Does Finder report a main-window change after that activation, for example to a parked Finder window?
-  - Not blocking. R25's guard lasts until the switch's raise sequence ends, so it ignores an activation that the switch caused whether or not macOS sends one. If such an activation can arrive after the sequence ends, R25's end condition changes. Step 6 of R12 runs whether or not the parked window keeps key focus. If Finder reports a main-window change after its activation, R25's guard for step 6 changes.
+  - Not blocking. R25's wait covers the switch's own raise and its parking echoes, so it ignores an activation that the switch caused whether or not macOS sends one. If such an activation can arrive after the wait ends, R25's end conditions change. Step 6 of R12 runs whether or not the parked window keeps key focus. If Finder reports a main-window change after its activation, R25's wait for step 6 changes.
 - **Q3.** When the user launches an app, does `ApplicationActivated` or `ApplicationMainWindowChanged` reach the reactor before the new window does (`ApplicationLaunched`, `WindowsDiscovered`, or `WindowCreated`)? Sugarglider keeps each app's events in order (R24), so this is only about the order of the Accessibility notifications.
   - Not blocking. R38 decides membership when the reactor first sees the window, and R24 waits for a window the reactor hasn't seen. Either order gives the same result.
 - **Q4.** When the user quits an app with ⌘Q, do `WindowDestroyed` events reach the reactor before `ApplicationTerminated`? How long is the gap? Check several apps, including Chrome and a single-window app. For an app with several windows, can a window-server update that lists its remaining windows arrive between the first `WindowDestroyed` and `ApplicationTerminated`? Before the M5b decision, such an update deleted the first window's records during the quit.
@@ -629,7 +636,7 @@ M1 to M5c give a usable feature in global scope with a command line. The menu ba
 
 - R7, R10, R12 (steps 1 to 5), R13 to R19, R27 to R29, R32 with the pending exit, and R33 with `SpaceManager`'s event.
 - H3, L4's member filter in `send_visible_windows_to_layout`, L5, L6, L8, and L10. Floating members return at their journal frames (H3).
-- Applying the active context inside `SpaceChanged` and `ScreenParametersChanged` (L2), and once at `StartupComplete`, then for each app as it registers (R38).
+- Applying the active context inside `SpaceChanged` and `ScreenParametersChanged` (L2), once at `StartupComplete`, and after a config reload that turns contexts on; the last two run the switch's focus step when the apply parked the focused window (R12). Each app joins its context as it registers (R38).
 - Parked windows are parked again when a display change moves or resizes their screen, and at every switch (`repark_moved_windows`), with a fresh journal frame first when the old frame is on no screen.
 - The switching commands (`switch_context`, `show_everything`, and `previous_context`) with the tagged `ContextRef`.
 - `contexts.json` and the `enable` config flag.
@@ -667,12 +674,12 @@ M1 to M5c give a usable feature in global scope with a command line. The menu ba
 ### M9. Per-screen scope
 
 - R8, R9, R11, and R26, the `scope` config key, and `per_screen` inputs to `plan_switch`.
-- R8 moves windows to another display, and so to another Space. Layouts are per Space. Decide here whether a window that R9 moved keeps its place in the other screen's layout. Until then, the test "switching away and back gives the same frames" covers one screen.
+- R8 moves windows to another display, and so to another Space. Layouts are per Space. A window that R8 or R9 moved keeps its saved tile position in the layout of the screen it left; that screen closes the visible gap while the window is away, and the window returns to the saved position. Until the two-screen tests land, the test "switching away and back gives the same frames" covers one screen.
 - Model and reactor tests with two screens.
 
 ### M10. Preferences and docs
 
-- The Preferences switch and scope picker.
+- The Preferences scope picker (the experimental contexts switch is already there).
 - A user page in `site/src/content/docs`.
 - Check the Preferences save path first. The research for this spec found that `HotkeyBindingJson.sort_order` is required in Rust while the Swift `HotkeyBinding` has no such field. That may make saving fail whenever hotkeys exist. Nobody has confirmed this at runtime.
 
@@ -682,7 +689,7 @@ Model tests (M2):
 
 - A switch parks exactly the windows that must not show. An app with windows inside and outside the target context gets only its non-member windows parked (R12, R15).
 - A switch doesn't park untracked windows, Sugarglider's own windows, or windows outside the visible-window set (R14). M5b updates these tests when it replaces the `minimized`, `app_hidden`, and `unseen_space` flags.
-- Matching follows the R22 order. Step 1 needs the same app, and steps 2 and 3 never match a blank title. Steps 3 and 4 never take another context's window. Step 4 fills only the switch target's records and never runs when a window arrives. Windows matched together get the same records in any order. Forgotten window server ids match nothing.
+- Matching follows the R22 order. Step 1 needs the same app, and steps 2 and 3 never match a blank title. Steps 3 and 4 never take another context's window. Step 4 fills only the switch target's records, with windows that are on screen, and it never runs when a window arrives. Windows matched together get the same records in any order. Forgotten window server ids match nothing.
 - A record follows its window's title. A relaunched window with the last title rejoins at step 2 (R22).
 - Pending records match nothing. They stay when the app terminates, and they go when the app shows it is still running (R23).
 - A single-window app that stays running after ⌘W keeps its record pending. The record stays when the app quits (R23).
@@ -692,7 +699,7 @@ Model tests (M2):
 - Giving a context a number that another context holds takes the number from that context (R5).
 - A pinned window shows under Unsorted and doesn't count as unsorted (R3, R29).
 - `contexts.json` loads `active` as a context id, `"everything"`, or `"unsorted"`. A missing or unknown value loads as Everything.
-- M9: a window shared by two contexts, in `per_screen` scope, goes to the screen that switched last (R9).
+- M9: a window shared by two contexts, in `per_screen` scope, goes to the screen that switched last, and keeps its saved place in the layout of the screen it left (R9).
 
 Parking and journal tests (M3):
 
@@ -776,7 +783,7 @@ Manual QA (a person, on a real Mac):
 - Keeping layout shapes across reboots.
 - A `SIGTERM` handler that shows Everything before exit.
 - A `sugarglider context recover` command that restores the journal without the server.
-- Replay of a session that uses contexts. A recording now carries the journal and the contexts read at launch, and a replay starts from them, but contexts read later in the session and the switch guard's deadline still come from the replaying machine.
+- Replay of a session that uses contexts. A recording now carries the contexts read at launch and at a reload, the journal, the layout after the contexts pruned it, and the process checks the launch recovery makes; a replay answers from the recording. The 2-second deadline ticks of the switch guard and of the quit depend on the wall clock and aren't recorded, so a replay still doesn't reproduce them.
 - A URL scheme (`sugarglider://context/<name>`). It needs app bundle work first: `glide_bundle()` requires a bundle id containing "glidewm", and the packaged id is `com.rdbeerman.sugarglider` (`src/sys/bundle.rs`).
 - Per-context floating frames.
 
