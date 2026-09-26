@@ -231,9 +231,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::actor::app::WindowId;
     use crate::actor::contexts_snapshot::ScreenContext;
     use crate::actor::wm_controller::WmCmd;
-    use crate::model::contexts::Contexts;
+    use crate::model::contexts::{Contexts, WindowDesc};
 
     /// Comms (1), Relax (2), and Build (3), with `active` active and
     /// `unsorted` unsorted windows.
@@ -574,5 +575,575 @@ mod tests {
         assert_eq!(everything, json(command_named(everything.clone())));
         assert!(command_named(serde_json::json!("no_such_command")).is_none());
         assert!(command_named(serde_json::json!({ "no_such_command": { "id": 7 } })).is_none());
+    }
+
+    /// The snapshot of `contexts` on one screen that shows the active
+    /// context, with `unsorted` unsorted windows.
+    fn on_screen(contexts: &Contexts, unsorted: usize) -> ContextsSnapshot {
+        let screens = vec![ScreenContext {
+            id: 1,
+            shows: contexts.active(),
+        }];
+        ContextsSnapshot::new(contexts, screens, unsorted)
+    }
+
+    /// The check that the status menu makes: whether the action's command
+    /// exists.
+    fn exists(action: &MenuAction) -> bool {
+        action.command().is_some()
+    }
+
+    fn hotkey(text: &str) -> Hotkey {
+        Hotkey::from_str(text).unwrap()
+    }
+
+    fn context(command: ContextCommand) -> WmCommand {
+        WmCommand::ReactorCommand(reactor::Command::Context(command))
+    }
+
+    fn switch_to_number(number: u8) -> WmCommand {
+        context(ContextCommand::SwitchContext(ContextRef::Number(number)))
+    }
+
+    fn key(key: &str, modifiers: NSEventModifierFlags) -> MenuKeyEquivalent {
+        MenuKeyEquivalent {
+            key: key.to_string(),
+            modifiers,
+        }
+    }
+
+    /// The command of a key binding written as `command` in the config
+    /// file, in JSON.
+    fn bound(command: &str) -> Value {
+        #[derive(serde::Deserialize)]
+        struct Binding {
+            command: WmCommand,
+        }
+        let binding: Binding = toml::from_str(&format!("command = {command}")).unwrap();
+        serde_json::to_value(binding.command).unwrap()
+    }
+
+    /// Menu bar, R29. Under Everything, Show Everything has the checkmark,
+    /// Unsorted is listed while it has windows, and every context can take
+    /// the focused window.
+    #[test]
+    fn under_everything_show_everything_is_checked_and_unsorted_is_listed() {
+        let snapshot = snapshot(None, 2);
+        let [comms, relax, build] = ["Comms", "Relax", "Build"].map(|name| id(&snapshot, name));
+
+        assert_eq!(
+            vec![
+                MenuEntry::Item(MenuItem {
+                    key: ctrl_alt("1"),
+                    ..item("Comms", MenuAction::Switch(ContextKey::Named(comms)))
+                }),
+                MenuEntry::Item(MenuItem {
+                    key: ctrl_alt("2"),
+                    ..item("Relax", MenuAction::Switch(ContextKey::Named(relax)))
+                }),
+                MenuEntry::Item(item("Build", MenuAction::Switch(ContextKey::Named(build)))),
+                MenuEntry::Item(item("Unsorted", MenuAction::Switch(ContextKey::Unsorted))),
+                MenuEntry::Item(MenuItem {
+                    key: ctrl_alt("0"),
+                    checked: true,
+                    ..item("Show Everything", MenuAction::Switch(ContextKey::Everything))
+                }),
+                MenuEntry::Separator,
+                MenuEntry::Item(item(
+                    "New Context from Current Windows…",
+                    MenuAction::NewContext("Context 4".to_string())
+                )),
+                MenuEntry::Submenu {
+                    title: "Send Window to".to_string(),
+                    enabled: true,
+                    items: vec![
+                        item("Comms", MenuAction::SendWindowTo(comms)),
+                        item("Relax", MenuAction::SendWindowTo(relax)),
+                        item("Build", MenuAction::SendWindowTo(build)),
+                    ],
+                },
+                MenuEntry::Item(MenuItem {
+                    key: ctrl_alt(" "),
+                    ..item("Open Switcher…", MenuAction::OpenSwitcher)
+                }),
+                MenuEntry::Separator,
+            ],
+            context_menu(&snapshot, &keys(), all)
+        );
+    }
+
+    /// Menu bar, R16. In each state exactly the active entry has the
+    /// checkmark, and its item stays enabled, because switching to the
+    /// active context applies it again.
+    #[test]
+    fn only_the_active_entry_is_checked_and_it_stays_enabled() {
+        for (active, unsorted, expected) in [
+            (None, 0, "Show Everything"),
+            (None, 2, "Show Everything"),
+            (Some("Comms"), 0, "Comms"),
+            (Some("Relax"), 2, "Relax"),
+            (Some("Build"), 0, "Build"),
+            (Some("Unsorted"), 0, "Unsorted"),
+            (Some("Unsorted"), 2, "Unsorted"),
+        ] {
+            let snapshot = snapshot(active, unsorted);
+            let entries = context_menu(&snapshot, &keys(), exists);
+
+            let checked: Vec<(&str, &MenuAction, bool)> = items(&entries)
+                .into_iter()
+                .filter(|item| item.checked)
+                .map(|item| (item.title.as_str(), &item.action, item.enabled))
+                .collect();
+            assert_eq!(
+                vec![(expected, &MenuAction::Switch(snapshot.active), true)],
+                checked,
+                "{active:?} with {unsorted} unsorted windows"
+            );
+        }
+    }
+
+    /// Menu bar. Send Window to offers each named context in order, never
+    /// Unsorted or Everything, and not the active context, which already
+    /// shows the window. With only the active context to offer, the submenu
+    /// is disabled.
+    #[test]
+    fn send_window_to_offers_each_named_context_but_the_active_one() {
+        for (active, enabled) in [
+            (None, [true, true, true]),
+            (Some("Comms"), [false, true, true]),
+            (Some("Build"), [true, true, false]),
+            (Some("Unsorted"), [true, true, true]),
+        ] {
+            let snapshot = snapshot(active, 2);
+            let entries = context_menu(&snapshot, &keys(), all);
+
+            let (submenu_enabled, send) = submenu(&entries);
+            let expected: Vec<MenuItem> = ["Comms", "Relax", "Build"]
+                .into_iter()
+                .zip(enabled)
+                .map(|(name, enabled)| MenuItem {
+                    enabled,
+                    ..item(name, MenuAction::SendWindowTo(id(&snapshot, name)))
+                })
+                .collect();
+            assert_eq!(expected, send, "{active:?}");
+            assert!(submenu_enabled, "{active:?}");
+        }
+
+        let mut contexts = Contexts::new();
+        let solo = contexts.create("Solo").unwrap();
+        contexts.switch_to(ContextKey::Named(solo)).unwrap();
+        let entries = context_menu(&on_screen(&contexts, 0), &keys(), all);
+        let only_active = [MenuItem {
+            enabled: false,
+            ..item("Solo", MenuAction::SendWindowTo(solo))
+        }];
+        assert_eq!((false, &only_active[..]), submenu(&entries));
+    }
+
+    /// Menu bar, R5. A context's key equivalent follows its number. A
+    /// context that gives its number to another loses the key with it, a
+    /// number that no binding names gives no key, a binding of a number
+    /// that no context has shows nowhere, and the tenth context has no
+    /// number and so no key.
+    #[test]
+    fn key_equivalents_follow_the_context_numbers() {
+        let names = [
+            "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+        ];
+        let mut contexts = Contexts::new();
+        for name in names {
+            contexts.create(name).unwrap();
+        }
+        let three = contexts.by_name("Three").unwrap().id;
+        contexts.set_number(three, Some(1)).unwrap();
+        contexts.switch_to(ContextKey::Everything).unwrap();
+        let snapshot = on_screen(&contexts, 1);
+        let numbers: Vec<Option<u8>> =
+            snapshot.contexts.iter().map(|context| context.number).collect();
+        assert_eq!(
+            vec![
+                None,
+                Some(2),
+                Some(1),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+                Some(8),
+                Some(9),
+                None
+            ],
+            numbers
+        );
+        let bindings: Vec<(Hotkey, WmCommand)> = [1, 2, 3, 5]
+            .into_iter()
+            .map(|n| (hotkey(&format!("Ctrl + Alt + Digit{n}")), switch_to_number(n)))
+            .collect();
+
+        let entries = context_menu(&snapshot, &ContextMenuKeys::new(&bindings), all);
+
+        let with_keys: Vec<(&str, Option<MenuKeyEquivalent>)> = items(&entries)
+            .into_iter()
+            .filter(|item| item.key.is_some())
+            .map(|item| (item.title.as_str(), item.key.clone()))
+            .collect();
+        assert_eq!(
+            vec![
+                ("Two", ctrl_alt("2")),
+                ("Three", ctrl_alt("1")),
+                ("Five", ctrl_alt("5"))
+            ],
+            with_keys
+        );
+    }
+
+    /// Menu bar. A number's key equivalent carries the modifiers of its
+    /// binding, whichever they are, and none for a binding without
+    /// modifiers. `Option` in a binding is Alt. Show Everything takes the
+    /// key and the modifiers of its binding.
+    #[test]
+    fn key_equivalents_carry_the_modifiers_of_each_binding() {
+        let bindings = vec![
+            (hotkey("Ctrl + Digit1"), switch_to_number(1)),
+            (hotkey("Alt + Shift + Digit2"), switch_to_number(2)),
+            (hotkey("Option + Digit3"), switch_to_number(3)),
+            (hotkey("Ctrl + Alt + Shift + Digit4"), switch_to_number(4)),
+            (hotkey("Digit5"), switch_to_number(5)),
+            (hotkey("Shift + Digit0"), context(ContextCommand::ShowEverything)),
+        ];
+
+        assert_eq!(
+            ContextMenuKeys {
+                numbers: [
+                    (1, key("1", NSEventModifierFlags::Control)),
+                    (
+                        2,
+                        key("2", NSEventModifierFlags::Option | NSEventModifierFlags::Shift)
+                    ),
+                    (3, key("3", NSEventModifierFlags::Option)),
+                    (
+                        4,
+                        key(
+                            "4",
+                            NSEventModifierFlags::Control
+                                | NSEventModifierFlags::Option
+                                | NSEventModifierFlags::Shift
+                        )
+                    ),
+                    (5, key("5", NSEventModifierFlags::empty())),
+                ]
+                .into(),
+                show_everything: Some(key("0", NSEventModifierFlags::Shift)),
+                open_switcher: None,
+            },
+            ContextMenuKeys::new(&bindings)
+        );
+    }
+
+    /// Menu bar. A binding with ⌘, which the config writes as `Meta`, shows
+    /// ⌘ on its item, for a number and for Show Everything.
+    #[test]
+    #[ignore = "bug: MenuKeyEquivalent::from_hotkey ignores Meta, so a ⌘ binding shows no ⌘"]
+    fn a_command_key_binding_shows_the_command_modifier() {
+        let bindings = vec![
+            (hotkey("Meta + Digit1"), switch_to_number(1)),
+            (hotkey("Ctrl + Meta + Digit2"), switch_to_number(2)),
+            (hotkey("Meta + Digit0"), context(ContextCommand::ShowEverything)),
+        ];
+
+        assert_eq!(
+            ContextMenuKeys {
+                numbers: [
+                    (1, key("1", NSEventModifierFlags::Command)),
+                    (
+                        2,
+                        key(
+                            "2",
+                            NSEventModifierFlags::Control | NSEventModifierFlags::Command
+                        )
+                    ),
+                ]
+                .into(),
+                show_everything: Some(key("0", NSEventModifierFlags::Command)),
+                open_switcher: None,
+            },
+            ContextMenuKeys::new(&bindings)
+        );
+    }
+
+    /// Menu bar. Show Everything takes the first of its bindings. Bindings
+    /// that name a context by id or by name, and the other context commands,
+    /// give no key equivalent.
+    #[test]
+    fn show_everything_takes_its_first_binding_and_other_commands_give_no_key() {
+        let seven: ContextId = serde_json::from_value(serde_json::json!(7)).unwrap();
+        let bindings = vec![
+            (
+                hotkey("Ctrl + Alt + Digit0"),
+                context(ContextCommand::ShowEverything),
+            ),
+            (hotkey("Alt + Digit0"), context(ContextCommand::ShowEverything)),
+            (
+                hotkey("Ctrl + Alt + Digit7"),
+                context(ContextCommand::SwitchContext(ContextRef::Id(seven))),
+            ),
+            (
+                hotkey("Ctrl + Alt + Digit8"),
+                context(ContextCommand::SwitchContext(ContextRef::Name("8".into()))),
+            ),
+            (
+                hotkey("Ctrl + Alt + Tab"),
+                context(ContextCommand::PreviousContext),
+            ),
+            (
+                hotkey("Ctrl + Alt + KeyN"),
+                context(ContextCommand::CreateContext("New".into())),
+            ),
+        ];
+
+        assert_eq!(
+            ContextMenuKeys {
+                numbers: BTreeMap::default(),
+                show_everything: ctrl_alt("0"),
+                open_switcher: None,
+            },
+            ContextMenuKeys::new(&bindings)
+        );
+    }
+
+    /// R4. New Context from Current Windows… names the context "Context
+    /// <n>" from one more than the number of contexts, and skips each name
+    /// that a context has in another case or with accents. The name check
+    /// of the command line takes the name it gives, and refuses the names it
+    /// skips. Pins the commit's naming, which no rule states.
+    #[test]
+    fn new_context_names_skip_case_and_accent_variants() {
+        let create = |name: &str| ContextCommand::CreateContext(name.to_string());
+        for (names, skipped, expected) in [
+            (&[][..], &[][..], "Context 1"),
+            (&["Comms", "Relax"][..], &[][..], "Context 3"),
+            (&["Comms", "context 3"][..], &["Context 3"][..], "Context 4"),
+            (&["Cöntéxt 3", "Relax"][..], &["Context 3"][..], "Context 4"),
+            (&["Comms", "ÇONTEXT 3"][..], &["Context 3"][..], "Context 4"),
+            (
+                &["Context 2", "context 3", "CONTEXT 4"][..],
+                &["Context 4"][..],
+                "Context 5",
+            ),
+            (&["Context 1"][..], &[][..], "Context 2"),
+            (&["Context 5"][..], &[][..], "Context 2"),
+        ] {
+            let mut contexts = Contexts::new();
+            for name in names {
+                contexts.create(name).unwrap();
+            }
+            contexts.switch_to(ContextKey::Everything).unwrap();
+            let snapshot = on_screen(&contexts, 0);
+
+            let entries = context_menu(&snapshot, &keys(), all);
+
+            let offered: Vec<&MenuAction> = items(&entries)
+                .into_iter()
+                .map(|item| &item.action)
+                .filter(|action| matches!(action, MenuAction::NewContext(_)))
+                .collect();
+            let expected_action = MenuAction::NewContext(expected.to_string());
+            assert_eq!(vec![&expected_action], offered, "{names:?}");
+            assert_eq!(
+                Ok(create(expected)),
+                snapshot.resolve_command(create(expected)),
+                "{names:?}"
+            );
+            for name in skipped {
+                assert!(snapshot.resolve_command(create(name)).is_err(), "{name}");
+            }
+        }
+
+        // A deleted context frees its name, and the count starts lower.
+        let mut contexts = Contexts::new();
+        for name in ["Context 1", "Context 2", "Context 3"] {
+            contexts.create(name).unwrap();
+        }
+        contexts.delete(contexts.by_name("Context 1").unwrap().id).unwrap();
+        assert_eq!("Context 4", new_context_name(&on_screen(&contexts, 0)));
+    }
+
+    /// Menu bar. With the check that the status menu makes, an item is
+    /// enabled exactly when its command exists, except that the active
+    /// context can't take the focused window. Switching and creating always
+    /// have a command. The Send Window to submenu is enabled while one of
+    /// its items is.
+    #[test]
+    fn with_the_menu_check_an_item_is_enabled_when_its_command_exists() {
+        for (active, unsorted) in [(None, 0), (Some("Comms"), 2), (Some("Unsorted"), 0)] {
+            let snapshot = snapshot(active, unsorted);
+
+            let entries = context_menu(&snapshot, &keys(), exists);
+
+            for item in items(&entries) {
+                let to_active = matches!(
+                    item.action,
+                    MenuAction::SendWindowTo(id) if ContextKey::Named(id) == snapshot.active
+                );
+                assert_eq!(
+                    exists(&item.action) && !to_active,
+                    item.enabled,
+                    "{active:?}: {}",
+                    item.title
+                );
+                if matches!(item.action, MenuAction::Switch(_) | MenuAction::NewContext(_)) {
+                    assert!(exists(&item.action), "{active:?}: {}", item.title);
+                }
+            }
+            let (enabled, send) = submenu(&entries);
+            assert_eq!(send.iter().any(|item| item.enabled), enabled, "{active:?}");
+        }
+    }
+
+    /// Menu bar. The items send the commands that key bindings in the
+    /// config give: each context by its id, Unsorted by its reserved name,
+    /// Everything as `show_everything`, and a new context by its name. Send
+    /// Window to and Open Switcher send `move_window_to_context` with the
+    /// context's id and `open_context_switcher`, once those commands exist.
+    #[test]
+    fn the_items_send_the_commands_that_key_bindings_give() {
+        let snapshot = snapshot(Some("Comms"), 2);
+        let [comms, relax, build] = ["Comms", "Relax", "Build"].map(|name| id(&snapshot, name));
+
+        let entries = context_menu(&snapshot, &keys(), all);
+
+        let sent: Vec<(&str, Value)> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                MenuEntry::Item(item) if item.action != MenuAction::OpenSwitcher => {
+                    Some((item.title.as_str(), json(item.action.command())))
+                }
+                _ => None,
+            })
+            .collect();
+        let by_id =
+            |id: ContextId| bound(&format!("{{ switch_context = {{ id = {} }} }}", id.get()));
+        assert_eq!(
+            vec![
+                ("Comms", by_id(comms)),
+                ("Relax", by_id(relax)),
+                ("Build", by_id(build)),
+                ("Unsorted", bound(r#"{ switch_context = "Unsorted" }"#)),
+                ("Show Everything", bound(r#""show_everything""#)),
+                (
+                    "New Context from Current Windows…",
+                    bound(r#"{ create_context = "Context 4" }"#)
+                ),
+            ],
+            sent
+        );
+        for (action, expected) in [
+            (
+                MenuAction::SendWindowTo(relax),
+                serde_json::json!({ "move_window_to_context": { "id": relax } }),
+            ),
+            (
+                MenuAction::OpenSwitcher,
+                serde_json::json!("open_context_switcher"),
+            ),
+        ] {
+            if let Some(command) = action.command() {
+                assert_eq!(expected, serde_json::to_value(command).unwrap());
+            }
+        }
+    }
+
+    /// Menu bar, R23. A context whose windows are all closed is still
+    /// listed and can still take the focused window, whether its record
+    /// waits to learn if its app quit or is empty after the app quit.
+    #[test]
+    fn contexts_whose_windows_are_closed_are_still_listed() {
+        let window = |pid: i32, title: &str| WindowDesc {
+            wid: WindowId::new(pid, 1),
+            bundle_id: Some(format!("app.{pid}")),
+            app_name: Some(format!("App {pid}")),
+            title: title.to_string(),
+            window_server_id: None,
+        };
+        let mut contexts = Contexts::new();
+        let [comms, relax, build] =
+            ["Comms", "Relax", "Build"].map(|name| contexts.create(name).unwrap());
+        contexts.add_window(comms, &window(1, "Mail")).unwrap();
+        contexts.add_window(relax, &window(2, "Music")).unwrap();
+        contexts.add_window(build, &window(3, "Terminal")).unwrap();
+        contexts.window_closed(WindowId::new(1, 1));
+        contexts.window_closed(WindowId::new(2, 1));
+        contexts.app_terminated(2);
+        contexts.switch_to(ContextKey::Named(build)).unwrap();
+        let snapshot = on_screen(&contexts, 0);
+        let open: Vec<usize> = snapshot.contexts.iter().map(|context| context.windows).collect();
+        assert_eq!(vec![0, 0, 1], open);
+
+        let entries = context_menu(&snapshot, &keys(), all);
+
+        assert_eq!(
+            vec![
+                "Comms",
+                "Relax",
+                "Build",
+                "Show Everything",
+                "-",
+                "New Context from Current Windows…",
+                "Send Window to",
+                "Open Switcher…",
+                "-"
+            ],
+            titles(&entries)
+        );
+        let (enabled, send) = submenu(&entries);
+        let offered: Vec<(&str, bool)> =
+            send.iter().map(|item| (item.title.as_str(), item.enabled)).collect();
+        assert!(enabled);
+        assert_eq!(vec![("Comms", true), ("Relax", true), ("Build", false)], offered);
+    }
+
+    /// R4. A context may have a name like one of the section's items, and
+    /// its item still switches to that context. Names that fold to
+    /// "Everything" or "Unsorted" are refused, so no context's item stands
+    /// for a built-in entry.
+    #[test]
+    fn a_context_named_like_an_item_switches_to_that_context() {
+        let mut contexts = Contexts::new();
+        for name in ["ÉVERYTHING", " unsorted "] {
+            assert!(contexts.create(name).is_err(), "{name}");
+        }
+        let show = contexts.create("Show Everything").unwrap();
+        let unsorted_work = contexts.create("Unsorted work").unwrap();
+        contexts.switch_to(ContextKey::Everything).unwrap();
+
+        let entries = context_menu(&on_screen(&contexts, 1), &keys(), all);
+
+        let switches: Vec<(&str, &MenuAction, bool)> = items(&entries)
+            .into_iter()
+            .filter(|item| matches!(item.action, MenuAction::Switch(_)))
+            .map(|item| (item.title.as_str(), &item.action, item.checked))
+            .collect();
+        assert_eq!(
+            vec![
+                (
+                    "Show Everything",
+                    &MenuAction::Switch(ContextKey::Named(show)),
+                    false
+                ),
+                (
+                    "Unsorted work",
+                    &MenuAction::Switch(ContextKey::Named(unsorted_work)),
+                    false
+                ),
+                ("Unsorted", &MenuAction::Switch(ContextKey::Unsorted), false),
+                (
+                    "Show Everything",
+                    &MenuAction::Switch(ContextKey::Everything),
+                    true
+                ),
+            ],
+            switches
+        );
     }
 }
