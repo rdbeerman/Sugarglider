@@ -43,6 +43,7 @@ export default defineConfig({
             { label: "Getting Started", slug: "guides/getting-started" },
             { label: "Keyboard-centric setup", slug: "guides/keyboard-centric-setup" },
             { label: "Layout Examples", slug: "guides/layout-examples" },
+            { label: "Contexts (experimental)", slug: "guides/contexts" },
           ],
         },
         {

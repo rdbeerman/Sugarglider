@@ -1,0 +1,123 @@
+---
+title: Contexts (experimental)
+description: Named sets of windows with their own tiling layouts
+---
+
+Contexts are an experimental feature: named sets of windows that you switch between. Each context keeps its own tiling layout. Switching to a context shows its windows in that layout and hides every other window by parking it in a screen corner, with one pixel left on screen. Sugarglider closes nothing, and a window can belong to several contexts.
+
+:::caution[Experimental]
+Contexts are off by default. The switcher panel, per-screen scope, and part of the command line are still being built, so this page marks what works today and what is planned. Expect the details to change.
+:::
+
+## Turn it on
+
+Turn on **Contexts (experimental)** in the Preferences window, or set the flag in your config file:
+
+```toml
+[settings.experimental]
+contexts.enable = true
+```
+
+Run `sugarglider config update` to load the edited file, or `sugarglider config update --watch` to reload on every save. With the flag off, Sugarglider behaves as it did before contexts.
+
+## Create a context
+
+Make a context from the windows that show on the visible Spaces.
+
+- Menu bar: **New Context from Current Windows…**
+- Command line: `sugarglider context create "Client work"`
+
+The new context becomes the active one, and its layout starts as the current layout. Parked windows are left out. A pinned window gets no record in the new context, because it already belongs to every context.
+
+## Switch contexts
+
+Switch with a key binding, the menu bar, or the command line. The default config leaves the context bindings commented out, so add the ones you want under `[keys]`:
+
+```toml
+[keys]
+"Ctrl + Alt + 0" = "show_everything"
+"Ctrl + Alt + 1" = { switch_context = 1 }
+"Ctrl + Alt + 2" = { switch_context = 2 }
+# ... through 9
+"Ctrl + Alt + Tab" = "previous_context"
+```
+
+- `switch_context` takes a context number from 1 to 9 or a name. Part of a name works: "cli" finds "Client work".
+- `show_everything` shows every window again.
+- `previous_context` returns to the context you used before the current one.
+
+The status item shows the active context, shortened if the name is long. Its menu lists your contexts, with the key equivalent you bound to a context when you bound one, followed by **Show Everything**, **New Context from Current Windows…**, **Send Window to**, and **Open Switcher…**.
+
+The command line switches by number or by name:
+
+```bash
+sugarglider context switch cli
+sugarglider context switch 2
+sugarglider context switch --name 2024
+```
+
+Use `--name` when a context's name is made of digits, so the command doesn't read it as a number. On failure the command prints the reason and exits with status 1.
+
+## Add, move, and pin windows
+
+| Action | How |
+|---|---|
+| Add the focused window to a context | Key binding `add_window_to_context`, or `sugarglider context add` |
+| Move the focused window to another context | Key binding `move_window_to_context`, or the menu's **Send Window to** |
+| Remove the focused window from the active context | Key binding `remove_window_from_context` |
+| Pin or unpin the focused window | Key binding `toggle_window_pinned` |
+
+An added window stays where it is until the next switch. Moving and removing take effect at once, and a window that no longer belongs to the context you are in is parked. Focus moves to a window that stays.
+
+A **pinned** window belongs to every context, including contexts you create later. It also shows under Unsorted, but it doesn't count as an unsorted window.
+
+## Everything and Unsorted
+
+Two built-in entries sit next to your contexts.
+
+**Unsorted** holds the windows that are in no named context. It appears only while it has windows. You can't rename, number, or delete it.
+
+**Everything** shows every window in the normal layout, as if contexts were off. It is active until you create your first context. To return to it, press your `show_everything` binding, choose **Show Everything** in the menu, or run:
+
+```bash
+sugarglider context everything
+```
+
+Quitting Sugarglider puts every parked window back too.
+
+## The command line
+
+These subcommands work today:
+
+```
+sugarglider context list [--json]
+sugarglider context current [--json]
+sugarglider context create <name>
+sugarglider context switch <query>
+sugarglider context add <query>
+sugarglider context everything
+```
+
+`list` prints one line per entry, with a star on the active one. `--json` prints the snapshot as JSON, and `current` prints the active context's name.
+
+## Safety
+
+Switching never closes a window. Before Sugarglider parks a window, it writes the window's frame to `~/.glide/parked.json`. If Sugarglider quits or crashes, the next launch reads that file and puts the windows back. The contexts and their members live in `~/.glide/contexts.json`. Both files contain window titles.
+
+## Per-screen scope (planned)
+
+Global scope is the only scope today, so a switch changes every screen. Per-screen scope is planned, and it will work like this:
+
+- Each screen will have its own active context, and a switch will change only the focused screen.
+- A window shared by two contexts will appear on one screen only, and will go to the screen that switched most recently.
+- The screen it leaves will close the visible gap while the window is away, and will keep the window's saved position for its return.
+
+## What's not here yet
+
+- The switcher panel is not built yet. It will be a search panel for contexts, and the menu's **Open Switcher…** item stays disabled until it ships.
+- Per-screen scope and a Preferences picker for it.
+- The rest of the command line: `move`, `remove`, `rename`, `delete`, and `previous`.
+
+:::note[The switcher hotkey and macOS]
+The suggested switcher binding is ⌃⌥Space, which macOS also uses for "Select next source in Input menu". Sugarglider's event tap takes a bound key before macOS sees it, and it swallows a bound key even when contexts are off. The default config leaves the context bindings commented out for this reason.
+:::
