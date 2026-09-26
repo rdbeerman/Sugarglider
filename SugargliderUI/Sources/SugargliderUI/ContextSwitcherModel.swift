@@ -36,9 +36,11 @@ enum SwitcherKey: Equatable, Sendable {
     18: 1, 19: 2, 20: 3, 21: 4, 23: 5, 22: 6, 26: 7, 28: 8, 25: 9,
   ]
 
-  /// The key codes of the ANSI letters, for layouts that don't type Latin
-  /// letters.
-  private static let letterKeyCodes: [UInt16: Character] = [45: "n", 14: "e", 15: "r", 35: "p"]
+  /// The key codes of the ANSI letters that the switcher and its text
+  /// fields use with Command, for layouts that don't type Latin letters.
+  private static let letterKeyCodes: [UInt16: Character] = [
+    45: "n", 14: "e", 15: "r", 35: "p", 0: "a", 8: "c", 9: "v", 7: "x", 6: "z",
+  ]
 
   /// Maps a key-down event. `characters` is the event's
   /// `charactersIgnoringModifiers`.
@@ -97,7 +99,7 @@ enum SwitcherKey: Equatable, Sendable {
   /// The lowercase ASCII letter a key types. A letter outside ASCII, as a
   /// Cyrillic layout types, counts as the ANSI letter of its key.
   /// Punctuation, digits, and symbols are no letter, whatever the key.
-  private static func letter(keyCode: UInt16, characters: String?) -> Character? {
+  static func letter(keyCode: UInt16, characters: String?) -> Character? {
     guard let characters, characters.count == 1,
       let character = characters.lowercased().first, character.isLetter
     else { return nil }

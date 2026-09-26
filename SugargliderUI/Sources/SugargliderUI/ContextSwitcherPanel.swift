@@ -54,14 +54,49 @@ final class ContextSwitcherPanel: NSPanel {
     return handleKeyDown(event)
   }
 
-  /// Gives a key-down event to `keyHandler`. While the text field composes
-  /// text, every key belongs to the input method, so ↩ commits the
+  /// Gives a key-down event to `keyHandler`, and sends the standard edit
+  /// shortcuts that it doesn't use to the text field. While the text field
+  /// composes text, every key belongs to the input method, so ↩ commits the
   /// composition instead of acting on the list.
   func handleKeyDown(_ event: NSEvent) -> Bool {
-    guard !isComposingText, let keyHandler, let key = SwitcherKey(event: event) else {
-      return false
+    guard !isComposingText else { return false }
+    if let keyHandler, let key = SwitcherKey(event: event), keyHandler(key) {
+      return true
     }
-    return keyHandler(key)
+    if let action = Self.editAction(
+      keyCode: event.keyCode,
+      modifiers: event.modifierFlags,
+      characters: event.charactersIgnoringModifiers
+    ) {
+      return firstResponder?.tryToPerform(action, with: nil) ?? false
+    }
+    return false
+  }
+
+  /// The action of ⌘X, ⌘C, ⌘V, ⌘A, ⌘Z, or ⇧⌘Z. Sugarglider has no Edit menu
+  /// whose items would send them.
+  static func editAction(
+    keyCode: UInt16,
+    modifiers: NSEvent.ModifierFlags,
+    characters: String?
+  ) -> Selector? {
+    let modifiers = modifiers.intersection([.command, .shift, .option, .control])
+    switch (SwitcherKey.letter(keyCode: keyCode, characters: characters), modifiers) {
+    case ("x", [.command]):
+      return #selector(NSText.cut(_:))
+    case ("c", [.command]):
+      return #selector(NSText.copy(_:))
+    case ("v", [.command]):
+      return #selector(NSText.paste(_:))
+    case ("a", [.command]):
+      return #selector(NSText.selectAll(_:))
+    case ("z", [.command]):
+      return Selector(("undo:"))
+    case ("z", [.command, .shift]):
+      return Selector(("redo:"))
+    default:
+      return nil
+    }
   }
 
   /// Whether the focused text field holds marked text from an input method.

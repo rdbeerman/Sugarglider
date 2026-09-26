@@ -86,6 +86,55 @@ final class ContextSwitcherPanelTests: XCTestCase {
   /// A key the switcher doesn't use goes to the field.
   func testKeysOutsideTheTableGoToTheField() throws {
     XCTAssertFalse(panel.handleKeyDown(try keyDown(0, [], "a")))
+    XCTAssertFalse(panel.handleKeyDown(try keyDown(11, [.command], "b")))
     XCTAssertEqual(handled, [])
+  }
+
+  /// S3: the standard edit shortcuts map to their actions, also on a
+  /// layout that doesn't type Latin letters.
+  func testEditShortcutsMapToTheStandardEditActions() {
+    func action(
+      _ keyCode: UInt16, _ modifiers: NSEvent.ModifierFlags, _ characters: String
+    ) -> Selector? {
+      ContextSwitcherPanel.editAction(
+        keyCode: keyCode, modifiers: modifiers, characters: characters)
+    }
+    XCTAssertEqual(action(7, [.command], "x"), #selector(NSText.cut(_:)))
+    XCTAssertEqual(action(8, [.command], "c"), #selector(NSText.copy(_:)))
+    XCTAssertEqual(action(9, [.command], "v"), #selector(NSText.paste(_:)))
+    XCTAssertEqual(action(0, [.command], "a"), #selector(NSText.selectAll(_:)))
+    XCTAssertEqual(action(6, [.command], "z"), Selector(("undo:")))
+    XCTAssertEqual(action(6, [.command, .shift], "Z"), Selector(("redo:")))
+    XCTAssertEqual(action(8, [.command], "с"), #selector(NSText.copy(_:)))
+    XCTAssertEqual(action(47, [.command], "v"), #selector(NSText.paste(_:)))
+    XCTAssertNil(action(8, [.command, .option], "c"))
+    XCTAssertNil(action(8, [.control], "c"))
+    XCTAssertNil(action(8, [], "c"))
+    XCTAssertNil(action(6, [.command], ";"))
+  }
+
+  /// S3: ⌘A, ⌘Z, and ⇧⌘Z act on the focused text field. The panel has no
+  /// Edit menu to send them. Cut, copy, and paste aren't sent here: they
+  /// would use the user's real pasteboard.
+  func testEditShortcutsActOnTheFocusedTextField() throws {
+    panel.keyHandler = { _ in false }
+    field.allowsUndo = true
+    field.string = "Client"
+    field.setSelectedRange(NSRange(location: 6, length: 0))
+    field.insertText(" work", replacementRange: NSRange(location: NSNotFound, length: 0))
+    XCTAssertEqual(field.string, "Client work")
+
+    XCTAssertTrue(panel.handleKeyDown(try keyDown(6, [.command], "z")))
+    XCTAssertEqual(field.string, "Client")
+    XCTAssertTrue(panel.handleKeyDown(try keyDown(6, [.command, .shift], "Z")))
+    XCTAssertEqual(field.string, "Client work")
+    XCTAssertTrue(panel.handleKeyDown(try keyDown(0, [.command], "a")))
+    XCTAssertEqual(field.selectedRange(), NSRange(location: 0, length: 11))
+  }
+
+  /// An edit shortcut that the switcher uses itself stays the switcher's.
+  func testTheSwitcherKeepsTheKeysItUses() throws {
+    XCTAssertTrue(panel.handleKeyDown(try keyDown(45, [.command], "n")))
+    XCTAssertEqual(handled, [.commandN])
   }
 }
