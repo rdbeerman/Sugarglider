@@ -43,24 +43,23 @@ impl MenuKeyEquivalent {
     /// Convert a livesplit_hotkey::Hotkey to menu key equivalent format.
     pub fn from_hotkey(hotkey: &livesplit_hotkey::Hotkey) -> Option<Self> {
         let s = hotkey.to_string();
+        let (modifier_names, key_part) = match s.rsplit_once(" + ") {
+            Some((modifiers, key)) => (modifiers, key),
+            None => ("", s.as_str()),
+        };
         let mut modifiers = NSEventModifierFlags::empty();
 
-        // Check for modifiers
-        if s.contains("Ctrl") {
-            modifiers |= NSEventModifierFlags::Control;
+        // Check for modifiers, each exactly as the hotkey writes it. The
+        // config writes the Command modifier as Meta.
+        for modifier in modifier_names.split(" + ").filter(|name| !name.is_empty()) {
+            modifiers |= match modifier {
+                "Ctrl" => NSEventModifierFlags::Control,
+                "Alt" | "Option" => NSEventModifierFlags::Option,
+                "Shift" => NSEventModifierFlags::Shift,
+                "Meta" => NSEventModifierFlags::Command,
+                _ => return None,
+            };
         }
-        if s.contains("Alt") {
-            modifiers |= NSEventModifierFlags::Option;
-        }
-        if s.contains("Shift") {
-            modifiers |= NSEventModifierFlags::Shift;
-        }
-        if s.contains("Cmd") || s.contains("Super") {
-            modifiers |= NSEventModifierFlags::Command;
-        }
-
-        // Extract the key name (last part after " + ")
-        let key_part = s.rsplit(" + ").next()?;
 
         // Convert key name to single character for NSMenuItem
         let key = key_part

@@ -943,7 +943,6 @@ mod tests {
     /// Menu bar. A binding with ⌘, which the config writes as `Meta`, shows
     /// ⌘ on its item, for a number and for Show Everything.
     #[test]
-    #[ignore = "upstream bug: Meta not recognized, predates contexts"]
     fn a_command_key_binding_shows_the_command_modifier() {
         let bindings = vec![
             (hotkey("Meta + Digit1"), switch_to_number(1)),
