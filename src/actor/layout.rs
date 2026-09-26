@@ -5663,6 +5663,67 @@ mod tests {
         assert_eq!(c_small, switched_frames(&mut mgr, space, small, c, &all));
     }
 
+    /// L9. Floating a window under C takes it out of C's layouts on every
+    /// Space and at every size, before the windows are sent again. D and
+    /// Everything keep their nodes for it.
+    #[test]
+    fn floating_under_a_context_removes_the_window_from_its_layouts_on_every_space() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let small = rect(0, 0, 120, 120);
+        let wide = rect(0, 0, 240, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let on1 = [w(1), w(2), w(3)];
+        let [c, d] = named_contexts(["C", "D"]);
+        let everything = ContextKey::Everything;
+        let side_by_side = vec![
+            (w(1), rect(0, 0, 40, 120)),
+            (w(2), rect(40, 0, 40, 120)),
+            (w(3), rect(80, 0, 40, 120)),
+        ];
+
+        // w2 starts on space 2, where C's layout gets it. It then moves to
+        // space 1, and only the layout space 2 shows loses it.
+        switch(&mut mgr, space2, small.size, everything, &[w(2), w(4)]);
+        switch(&mut mgr, space2, small.size, c, &[w(2), w(4)]);
+        switch(&mut mgr, space2, small.size, everything, &[w(4)]);
+        assert_eq!(
+            vec![(w(2), rect(0, 0, 60, 120)), (w(4), rect(60, 0, 60, 120))],
+            shown_frames(&mut mgr, space2, small, c),
+        );
+        show(&mut mgr, space2, small.size, everything);
+
+        switch(&mut mgr, space1, small.size, everything, &on1);
+        switch(&mut mgr, space1, small.size, d, &on1);
+        switch(&mut mgr, space1, small.size, everything, &on1);
+        switch(&mut mgr, space1, small.size, c, &on1);
+        move_window(&mut mgr, space1, w(1), Direction::Up);
+        switch(&mut mgr, space1, wide.size, c, &on1);
+        move_window(&mut mgr, space1, w(3), Direction::Up);
+        switch(&mut mgr, space1, small.size, c, &on1);
+        assert_eq!(2, mgr.context_layouts[&(space1, c)].layouts().len());
+
+        _ = mgr.handle_event(WindowFocused(vec![space1], w(2)));
+        _ = mgr.handle_command(Some(space1), &[space1], ToggleWindowFloating);
+        assert_eq!(
+            vec![(w(1), rect(0, 0, 120, 60)), (w(3), rect(0, 60, 120, 60))],
+            mgr.layout_sorted(space1, small),
+        );
+        assert_eq!(
+            vec![(w(1), rect(0, 0, 240, 60)), (w(3), rect(0, 60, 240, 60))],
+            shown_frames(&mut mgr, space1, wide, c),
+        );
+        assert_eq!(
+            vec![(w(4), rect(0, 0, 120, 120))],
+            shown_frames(&mut mgr, space2, small, c),
+        );
+        assert_eq!(side_by_side, shown_frames(&mut mgr, space1, small, d));
+        assert_eq!(side_by_side, shown_frames(&mut mgr, space1, small, everything));
+    }
+
     /// L9. Floating and unfloating a window under Everything leaves its place
     /// in a context's layout alone.
     #[test]
