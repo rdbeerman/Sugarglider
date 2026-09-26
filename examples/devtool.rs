@@ -21,8 +21,8 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGDisplayBounds, CGMainDisplayID, CGWindowID, CGWindowListCopyWindowInfo, CGWindowListOption,
-    kCGNullWindowID,
+    CGDirectDisplayID, CGDisplayBounds, CGError, CGGetActiveDisplayList, CGMainDisplayID,
+    CGWindowID, CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID,
 };
 use objc2_foundation::{MainThreadMarker, NSString};
 use sugarglider::actor::{self, reactor};
@@ -411,10 +411,29 @@ fn park(pid: pid_t, window_server_id: CGWindowID, mtm: MainThreadMarker) -> anyh
         .context("Could not read the screen configuration")?;
     let screens: Vec<CGRect> = screens.iter().map(|screen| screen.visible_frame).collect();
     let screen = best_screen_for_window(&screens, &frame).context("Window is on no screen")?;
-    let origin = parking_origin(frame.size, &screens, screen);
+    let target = screens[screen];
+    let others: Vec<CGRect> = display_bounds()?
+        .into_iter()
+        .filter(|bounds| !bounds.contains(target.mid()))
+        .collect();
+    let origin = parking_origin(frame.size, target, &others);
     let parked = CGRect { origin, size: frame.size };
-    println!("Parking on screen {screen} {:?} at {parked:?}", screens[screen]);
+    println!("Parking on screen {screen} {target:?} at {parked:?}");
     write_frame(pid, &window, parked)
+}
+
+/// The full bounds of every active display, in the same top-left coordinates
+/// as window frames.
+fn display_bounds() -> anyhow::Result<Vec<CGRect>> {
+    const MAX_DISPLAYS: usize = 64;
+    let mut ids: [CGDirectDisplayID; MAX_DISPLAYS] = [0; MAX_DISPLAYS];
+    let mut count = 0;
+    // SAFETY: `ids` has room for `MAX_DISPLAYS` display ids.
+    let err = unsafe { CGGetActiveDisplayList(MAX_DISPLAYS as u32, ids.as_mut_ptr(), &mut count) };
+    if err != CGError::Success {
+        bail!("Could not list the displays: {err:?}");
+    }
+    Ok(ids[..count as usize].iter().map(|&id| CGDisplayBounds(id)).collect())
 }
 
 /// The screen the window overlaps the most, the way the reactor picks it.
