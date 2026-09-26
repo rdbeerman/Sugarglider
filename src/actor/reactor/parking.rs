@@ -31,6 +31,13 @@ fn is_back(reported: CGRect, target: CGRect) -> bool {
     .all(|difference| difference.abs() <= BACK_TOLERANCE)
 }
 
+/// Whether the bundle id in a journal entry and the bundle id of the app that
+/// has the entry's pid now name the same app. A missing bundle id on either
+/// side matches nothing.
+fn same_app(journal: &Option<String>, running: &Option<String>) -> bool {
+    matches!((journal, running), (Some(journal), Some(running)) if journal == running)
+}
+
 impl Reactor {
     /// Parks each window in a corner of the screen it is on.
     ///
@@ -183,7 +190,7 @@ impl Reactor {
         let bundle_id = app.info.bundle_id.clone();
         let mut writes = vec![];
         for entry in entries {
-            if entry.bundle_id.is_some() && bundle_id.is_some() && entry.bundle_id != bundle_id {
+            if !same_app(&entry.bundle_id, &bundle_id) {
                 info!(
                     pid,
                     journal = ?entry.bundle_id,
@@ -1307,5 +1314,48 @@ mod tests {
         assert!(file_names(s.dir.path()).is_empty());
         assert!(s.reactor.parked.is_empty());
         assert!(s.reactor.journal.entries().is_empty());
+    }
+
+    /// Removes the bundle id from the app that `events` launch.
+    fn without_bundle_id(mut events: Vec<Event>) -> Vec<Event> {
+        for event in &mut events {
+            if let Event::ApplicationLaunched { info, .. } = event {
+                info.bundle_id = None;
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn r34_a_missing_bundle_id_on_either_side_is_another_app() {
+        let journal_frame = rect(100., 100., 300., 300.);
+        let corner = rect(999., 999., 1000., 1000.);
+        for (journal_has_id, app_has_id) in [(false, true), (true, false), (false, false)] {
+            let mut journal_entry = entry(1, 11, journal_frame);
+            if !journal_has_id {
+                journal_entry.bundle_id = None;
+            }
+            let mut s = Setup::launching(vec![journal_entry, entry(2, 21, journal_frame)]);
+            let launch = s.apps.make_app(1, vec![window_at(11, corner)]);
+            let launch = if app_has_id {
+                launch
+            } else {
+                without_bundle_id(launch)
+            };
+
+            s.reactor.handle_events(launch);
+
+            let case = (journal_has_id, app_has_id);
+            assert_eq!(
+                vec![screen()],
+                frame_writes(&s.apps.requests(), WindowId::new(1, 1)),
+                "{case:?}"
+            );
+            assert_eq!(
+                vec![(2, 21, journal_frame)],
+                summary(s.journal_on_disk()),
+                "{case:?}"
+            );
+        }
     }
 }
