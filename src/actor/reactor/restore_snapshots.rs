@@ -38,6 +38,7 @@ fn canonical_serialized() -> String {
     let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
     reactor.handle_event(Event::ScreenParametersChanged {
         frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+        bounds: vec![],
         spaces: vec![Some(SpaceId::new(1))],
         scale_factors: vec![2.0],
         converter: CoordinateConverter::default(),
