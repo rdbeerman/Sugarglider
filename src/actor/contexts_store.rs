@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::actor::parked_journal::unreadable_path;
 use crate::model::contexts::{CONTEXTS_FILE_VERSION, ContextId, Contexts};
@@ -130,9 +130,60 @@ pub fn empty_contexts_after(after: Option<ContextId>) -> Contexts {
     .expect("an empty contexts file loads")
 }
 
-/// Names the current boot of the Mac by the time it booted, from
-/// `kern.boottime`. `None` if that can't be read.
+/// Names the current boot of the Mac by its boot session UUID, from
+/// `kern.bootsessionuuid`. When that can't be read, the time the Mac booted
+/// names it, from `kern.boottime`. `None` if neither can be read.
 pub fn boot_id() -> Option<String> {
+    boot_session_uuid().or_else(boot_time)
+}
+
+/// The UUID of the current boot session, from `kern.bootsessionuuid`.
+fn boot_session_uuid() -> Option<String> {
+    let name = c"kern.bootsessionuuid";
+    let mut size = 0;
+    // SAFETY: A null buffer asks only for the size of the value.
+    let result = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || size == 0 {
+        warn!(
+            "Could not read the boot session UUID: {}",
+            io::Error::last_os_error()
+        );
+        return None;
+    }
+    let mut value = vec![0u8; size];
+    // SAFETY: `value` has room for `size` bytes.
+    let result = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
+        warn!(
+            "Could not read the boot session UUID: {}",
+            io::Error::last_os_error()
+        );
+        return None;
+    }
+    value.truncate(size);
+    let end = value.iter().position(|&byte| byte == 0).unwrap_or(value.len());
+    let uuid = std::str::from_utf8(&value[..end]).ok()?.trim();
+    (!uuid.is_empty()).then(|| uuid.to_string())
+}
+
+/// The time the Mac booted, from `kern.boottime`.
+fn boot_time() -> Option<String> {
     #[repr(C)]
     struct Timeval {
         tv_sec: i64,
@@ -177,7 +228,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
-    use super::{ContextsStore, Loaded, boot_id, empty_contexts_after};
+    use super::{
+        ContextsStore, Loaded, boot_id, boot_session_uuid, boot_time, empty_contexts_after,
+    };
     use crate::actor::app::WindowId;
     use crate::actor::parked_journal::FailingWrites;
     use crate::model::contexts::{ContextKey, Contexts, WindowDesc};
@@ -382,5 +435,17 @@ mod tests {
         let first = boot_id();
         assert!(first.is_some());
         assert_eq!(first, boot_id());
+    }
+
+    /// R22. The boot session UUID names the boot, and the boot time is there
+    /// to fall back on.
+    #[test]
+    fn the_boot_id_is_the_boot_session_uuid() {
+        let uuid = boot_session_uuid().unwrap();
+        assert_eq!(36, uuid.len(), "{uuid}");
+        assert_eq!(4, uuid.matches('-').count(), "{uuid}");
+        assert!(uuid.chars().all(|c| c == '-' || c.is_ascii_hexdigit()), "{uuid}");
+        assert_eq!(Some(uuid), boot_id());
+        assert!(boot_time().is_some_and(|time| time.contains('.')));
     }
 }
