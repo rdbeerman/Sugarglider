@@ -2690,6 +2690,31 @@ impl LayoutManager {
         );
     }
 
+    /// Deletes every layout of the context, on every Space and screen size.
+    pub fn remove_context_layouts(&mut self, id: ContextId) {
+        self.retain_context_layouts(|other| other != id);
+    }
+
+    /// Deletes every layout of each named context for which `keep` returns
+    /// false. Unsorted's layouts stay.
+    pub fn retain_context_layouts(&mut self, mut keep: impl FnMut(ContextId) -> bool) {
+        let removed: Vec<_> = self
+            .context_layouts
+            .keys()
+            .copied()
+            .filter(|&(_, key)| matches!(key, ContextKey::Named(id) if !keep(id)))
+            .collect();
+        for key in removed {
+            let Some(mapping) = self.context_layouts.remove(&key) else {
+                continue;
+            };
+            for layout in mapping.layouts() {
+                self.tree.remove_layout(layout);
+                self.viewports.remove(&layout);
+            }
+        }
+    }
+
     fn try_layout(&self, space: SpaceId) -> Option<LayoutId> {
         self.active_mapping(space)?.active_layout().into()
     }
@@ -5074,6 +5099,90 @@ mod tests {
             ],
             mgr.layout_sorted(space, screen2),
         );
+    }
+
+    fn context_id(key: ContextKey) -> ContextId {
+        match key {
+            ContextKey::Named(id) => id,
+            _ => panic!("{key:?} has no id"),
+        }
+    }
+
+    /// R6, L2.
+    #[test]
+    fn deleting_a_context_removes_all_its_layouts() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let screen1 = rect(0, 0, 120, 120);
+        let screen2 = rect(0, 0, 1200, 1200);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c, d] = named_contexts(["C", "D"]);
+
+        // D has a layout on space 1. C has two on space 1 and one on space 2.
+        switch(&mut mgr, space1, screen1.size, ContextKey::Everything, &all);
+        switch(&mut mgr, space2, screen1.size, ContextKey::Everything, &[]);
+        switch(&mut mgr, space1, screen1.size, d, &all);
+        _ = mgr.handle_event(WindowFocused(vec![space1], w(1)));
+        _ = mgr.handle_command(Some(space1), &[space1], MoveNode(Direction::Up));
+        let d_frames = mgr.layout_sorted(space1, screen1);
+        switch(&mut mgr, space2, screen1.size, c, &[]);
+        switch(&mut mgr, space1, screen1.size, c, &all);
+        _ = mgr.handle_command(Some(space1), &[space1], MoveNode(Direction::Down));
+        switch(&mut mgr, space1, screen2.size, c, &all);
+        _ = mgr.handle_command(Some(space1), &[space1], MoveNode(Direction::Up));
+        switch(&mut mgr, space1, screen1.size, c, &all);
+        assert_eq!(2, mgr.context_layouts[&(space1, c)].layouts().len());
+        let layouts_before = mgr.tree.layouts().len();
+
+        mgr.remove_context_layouts(context_id(c));
+        let mut keys = mgr.context_layouts.keys().copied().collect::<Vec<_>>();
+        keys.sort_by_key(|&(space, _)| space);
+        assert_eq!(vec![(space1, d)], keys);
+        assert_eq!(layouts_before - 3, mgr.tree.layouts().len());
+
+        // C was active on space 1, so the space shows Everything's layout.
+        let everything = mgr.layout_mapping[&space1].active_layout();
+        assert_eq!(1, count_errors(|| assert_eq!(everything, mgr.layout(space1))));
+
+        switch(&mut mgr, space1, screen1.size, d, &all);
+        assert_eq!(d_frames, mgr.layout_sorted(space1, screen1));
+        switch(&mut mgr, space1, screen1.size, ContextKey::Everything, &all);
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 40, 120)),
+                (w(2), rect(40, 0, 40, 120)),
+                (w(3), rect(80, 0, 40, 120)),
+            ],
+            mgr.layout_sorted(space1, screen1),
+        );
+    }
+
+    /// L2.
+    #[test]
+    fn loading_drops_the_layouts_of_unknown_contexts() {
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c, d] = named_contexts(["C", "D"]);
+
+        switch(&mut mgr, space, screen.size, ContextKey::Everything, &all);
+        switch(&mut mgr, space, screen.size, ContextKey::Unsorted, &all);
+        switch(&mut mgr, space, screen.size, c, &all);
+        switch(&mut mgr, space, screen.size, d, &all);
+
+        let mut restored: LayoutManager = ron::from_str(&mgr.serialize_to_string()).unwrap();
+        assert_eq!(4, restored.tree.layouts().len());
+        restored.retain_context_layouts(|id| id == context_id(c));
+        let mut keys = restored.context_layouts.keys().copied().collect::<Vec<_>>();
+        keys.sort_by_key(|&(_, key)| key != ContextKey::Unsorted);
+        assert_eq!(vec![(space, ContextKey::Unsorted), (space, c)], keys);
+        assert_eq!(3, restored.tree.layouts().len());
     }
 
     /// Context layouts are saved in `layout.ron`, but the active context is not.
