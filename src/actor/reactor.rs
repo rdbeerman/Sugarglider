@@ -733,6 +733,10 @@ impl Reactor {
                     // over, even if we never saw the MouseUp event.
                     self.resizing_window = None;
                 }
+                if !requested.0 && !self.own_frame_reaches_layout(wid) {
+                    debug!(?wid, ?new_frame, "Ignoring a frame change of a parked window");
+                    return;
+                }
                 let window = self.windows.get_mut(&wid).unwrap();
                 if last_seen != window.last_sent_txid {
                     // Ignore events that happened before the last time we
@@ -1188,6 +1192,9 @@ impl Reactor {
             }
             Event::MouseMovedOverWindow(wsid, key_focus_pid) => {
                 let Some(&wid) = self.window_ids.get(&wsid) else { return };
+                if !self.own_frame_reaches_layout(wid) {
+                    return;
+                }
                 let Some(window) = self.windows.get(&wid) else { return };
                 let Some(to_space) = self.best_space_for_window(&window.frame_monotonic) else {
                     // The space is disabled.
@@ -1335,10 +1342,13 @@ impl Reactor {
 
     fn update_complete_window_server_info(&mut self, on_screen: WindowsOnScreen) {
         for info in on_screen.info.iter().filter(|i| i.layer == 0) {
-            let Some(wid) = self.window_ids.get(&info.id) else {
+            let Some(&wid) = self.window_ids.get(&info.id) else {
                 continue;
             };
-            let Some(window) = self.windows.get_mut(wid) else {
+            if !self.own_frame_reaches_layout(wid) {
+                continue;
+            }
+            let Some(window) = self.windows.get_mut(&wid) else {
                 continue;
             };
             // Assume this update comes from after the last write. Typically the
@@ -1479,12 +1489,12 @@ impl Reactor {
             let Some(space) = self.best_space_for_window(&window.frame_monotonic) else {
                 continue;
             };
-            let Some(layout_info) = self.layout_window_info(wid) else {
+            let Some(mut layout_info) = self.layout_window_info(wid) else {
                 continue;
             };
             // Tabs in the same window group will have the same visual frame.
             // Parked windows share a corner without being tabs.
-            if !self.parked.contains_key(&wid) {
+            if self.own_frame_reaches_layout(wid) {
                 let frame_key = Self::frame_key(&window.frame_monotonic);
                 // If we've already seen a window with this frame, skip this one
                 // unless it's the main window (active tab).
@@ -1496,12 +1506,14 @@ impl Reactor {
                     // and add this one instead.
                     if let Some(windows) = app_windows.get_mut(&space) {
                         windows.retain(|(other, info)| {
-                            self.parked.contains_key(other)
+                            !self.own_frame_reaches_layout(*other)
                                 || Self::frame_key(&info.frame) != frame_key
                         });
                     }
                 }
                 seen_frames.insert(frame_key);
+            } else if let Some(&before_parking) = self.parked.get(&wid) {
+                layout_info.frame = before_parking;
             }
             app_windows.entry(space).or_default().push((wid, layout_info));
         }
@@ -1584,6 +1596,14 @@ impl Reactor {
         // For now we track all windows in the reactor and let the LayoutManager
         // decide what to keep.
         true
+    }
+
+    /// Whether the frame a window reports, and the mouse moving over it, reach
+    /// the layout and `frame_monotonic`. For a parked window they don't: its
+    /// known frame stays the parking corner, whatever its app reports, and the
+    /// layout sees it with the frame it had before it was parked.
+    fn own_frame_reaches_layout(&self, wid: WindowId) -> bool {
+        !self.parked.contains_key(&wid)
     }
 
     /// Returns the frame key (rounded to integers) for a window frame.

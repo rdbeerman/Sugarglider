@@ -305,16 +305,18 @@ mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use tempfile::TempDir;
     use test_log::test;
+    use tokio::sync::mpsc;
 
     use super::super::testing::*;
     use super::super::{Command, Event, FrameAttempt, MAX_FRAME_ATTEMPTS, Reactor, Requested};
-    use crate::actor::app::{Request, WindowId, pid_t};
+    use crate::actor::app::{Quiet, Request, WindowId, pid_t};
     use crate::actor::layout::{LayoutCommand, LayoutEvent, LayoutManager};
     use crate::actor::parked_journal::{JournalEntry, ParkedJournal};
     use crate::sys::app::{Process, WindowInfo};
+    use crate::sys::event::MouseState;
     use crate::sys::geometry::CGRectExt;
     use crate::sys::screen::{CoordinateConverter, SpaceId};
-    use crate::sys::window_server::WindowServerId;
+    use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
@@ -1666,5 +1668,161 @@ mod tests {
         assert!(s.apps.requests().is_empty());
         assert!(s.reactor.parked.is_empty());
         assert!(file_names(s.dir.path()).is_empty());
+    }
+
+    /// Makes window 1 of `s` float at the frame it had before it was tiled,
+    /// `(100, 100, 50, 50)`.
+    fn float_window_1(s: &mut Setup) {
+        s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        s.reactor.send_layout_event(LayoutEvent::WindowFocused(vec![space()], wid(1)));
+        s.reactor.handle_event(Event::Command(Command::Layout(
+            LayoutCommand::ToggleWindowFloating,
+        )));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(rect(100., 100., 50., 50.), s.frame(wid(1)));
+    }
+
+    /// Reports that the app moved or resized the window to `frame` on its own.
+    fn app_moves(s: &mut Setup, wid: WindowId, frame: CGRect, mouse: Option<MouseState>) {
+        let txid = s.reactor.windows[&wid].last_sent_txid;
+        s.reactor.handle_event(Event::WindowFrameChanged(
+            wid,
+            frame,
+            txid,
+            Requested(false),
+            mouse,
+        ));
+        s.apps.windows.get_mut(&wid).unwrap().frame = frame;
+    }
+
+    #[test]
+    fn h2_a_parked_window_that_its_app_resizes_changes_no_tile() {
+        let mut s = Setup::new(3);
+        let tiles = s.tiles();
+        let others = [wid(1), wid(3)].map(|wid| s.frame(wid));
+        s.reactor.park_windows(&[wid(2)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let corner = s.reactor.windows[&wid(2)].frame_monotonic;
+
+        let wider = rect(corner.origin.x, corner.origin.y, 500., 1000.);
+        app_moves(&mut s, wid(2), wider, None);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(tiles, s.tiles());
+        assert_eq!(others, [wid(1), wid(3)].map(|wid| s.frame(wid)));
+        assert_eq!(corner, s.reactor.windows[&wid(2)].frame_monotonic);
+    }
+
+    #[test]
+    fn h2_a_parked_window_that_its_app_moves_changes_no_layout_state() {
+        let mut s = Setup::new(3);
+        let tiles = s.tiles();
+        s.reactor.park_windows(&[wid(2)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        // Dragged with the mouse, moved to another size, then moved off
+        // every screen.
+        app_moves(
+            &mut s,
+            wid(2),
+            rect(10., 10., 200., 200.),
+            Some(MouseState::Down),
+        );
+        app_moves(&mut s, wid(2), rect(5000., 10., 200., 200.), None);
+
+        assert!(!s.reactor.in_drag);
+        assert_eq!(None, s.reactor.resizing_window);
+        assert!(s.apps.requests().is_empty());
+        s.refresh_visible_windows();
+        assert_eq!(tiles, s.tiles());
+    }
+
+    #[test]
+    fn h4_a_parked_window_that_its_app_moves_back_is_still_put_back() {
+        let mut s = Setup::new(2);
+        let tile = s.frame(wid(1));
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        app_moves(&mut s, wid(1), tile, None);
+
+        s.reactor.unpark_windows(&[wid(1)]);
+
+        let requests = s.apps.requests();
+        assert_eq!(vec![tile], frame_writes(&requests, wid(1)));
+        // An app reports the frame after every write, even one that doesn't
+        // move the window. The test apps report only a change.
+        let txid = s.reactor.windows[&wid(1)].last_sent_txid;
+        s.reactor.handle_event(Event::WindowFrameChanged(
+            wid(1),
+            tile,
+            txid,
+            Requested(true),
+            None,
+        ));
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    #[test]
+    fn h2_a_parked_floating_window_that_its_app_moves_keeps_its_restore_frame() {
+        let mut s = Setup::new(2);
+        float_window_1(&mut s);
+        let floating = rect(100., 100., 50., 50.);
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        app_moves(&mut s, wid(1), rect(500., 500., 50., 50.), None);
+
+        assert_eq!(Some(floating), s.reactor.layout.floating_restore_frame(wid(1)));
+        s.reactor.unpark_windows(&[wid(1)]);
+        assert_eq!(vec![floating], frame_writes(&s.apps.requests(), wid(1)));
+    }
+
+    #[test]
+    fn h2_the_mouse_over_a_parked_window_does_not_focus_it() {
+        let mut s = Setup::new(3);
+        s.reactor.handle_event(Event::ApplicationActivated(1, Quiet::No));
+        s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
+        assert_eq!(Some(wid(1)), s.reactor.main_window());
+        let (raise_manager_tx, mut raise_manager_rx) = mpsc::unbounded_channel();
+        s.reactor.raise_manager_tx = raise_manager_tx;
+        let over = |idx| Event::MouseMovedOverWindow(WindowServerId::new(idx), None);
+        s.reactor.handle_event(over(2));
+        assert!(raise_manager_rx.try_recv().is_ok(), "a window that isn't parked");
+        s.reactor.park_windows(&[wid(3)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        s.reactor.handle_event(over(3));
+
+        assert!(raise_manager_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn h4_a_window_server_snapshot_leaves_a_parked_window_in_its_corner() {
+        let mut s = Setup::new(2);
+        let tiles = [wid(1), wid(2)].map(|wid| s.frame(wid));
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let corner = s.reactor.windows[&wid(1)].frame_monotonic;
+
+        // The snapshot was taken before the park write landed.
+        let snapshot = [1, 2]
+            .into_iter()
+            .zip(tiles)
+            .map(|(wsid, frame)| WindowServerInfo {
+                id: WindowServerId::new(wsid),
+                pid: 1,
+                layer: 0,
+                frame,
+            })
+            .collect();
+        s.reactor.handle_event(Event::SpaceChanged(
+            vec![Some(space())],
+            WindowsOnScreen::new(snapshot),
+        ));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(corner, s.reactor.windows[&wid(1)].frame_monotonic);
+        s.reactor.unpark_windows(&[wid(1)]);
+        assert_eq!(vec![tiles[0]], frame_writes(&s.apps.requests(), wid(1)));
     }
 }
