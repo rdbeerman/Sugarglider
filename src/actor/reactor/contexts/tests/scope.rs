@@ -165,6 +165,145 @@ fn r11_changing_scope_spreads_and_keeps_the_shown_contexts() {
     );
 }
 
+/// On a cold change to global scope, the focused screen at startup supplies
+/// the global context. The saved per-screen map must be cleared before the
+/// next switch is written, or a second launch loses that switch.
+#[test]
+fn a_cold_change_to_global_uses_the_focused_screen_and_persists_switches() {
+    for (focused, expected) in [(0, "A"), (1, "B")] {
+        let mut s = per_screen_setup();
+        let a = s.create("A", &[wid(1)]);
+        let b = s.create("B", &[WindowId::new(2, 2)]);
+        let c = s.create("C", &[wid(2)]);
+        s.focus_screen(0);
+        s.switch(a);
+        s.focus_screen(1);
+        s.switch(b);
+        assert_eq!(b, s.saved_active_on(2));
+
+        let mut config = Config::default();
+        config.settings.default_disable = false;
+        config.settings.animate = false;
+        config.settings.experimental.contexts.enable = true;
+        let Setup { dir, .. } = s;
+        let mut restarted = Setup {
+            reactor: Reactor::new_for_test(LayoutManager::new_for_test()),
+            apps: Apps::new(),
+            dir,
+        };
+        restarted.reactor.journal =
+            ParkedJournal::open(restarted.dir.path().join("parked.json"), SystemTime::now());
+        restarted.reactor.handle_event(Event::ConfigChanged(Arc::new(config)));
+        let store = ContextsStore::new(restarted.dir.path().join("contexts.json"));
+        restarted.reactor.open_contexts(store, Some("boot".into()), SystemTime::now());
+        restarted.reactor.handle_event(screens(
+            vec![screen(), right()],
+            vec![Some(space()), Some(right_space())],
+        ));
+        let pid = 3;
+        let focused_window = WindowId::new(pid, 1);
+        let x = if focused == 0 { 100. } else { 1400. };
+        let window = WindowInfo {
+            sys_id: Some(WindowServerId::new(31)),
+            frame: rect(x, 100., 50., 50.),
+            ..make_window(1)
+        };
+        restarted.reactor.handle_events(restarted.apps.make_app(pid, vec![window]));
+        restarted.apps.simulate_until_quiet(&mut restarted.reactor);
+        restarted.reactor.handle_event(Event::ApplicationGloballyActivated(pid));
+        restarted.reactor.handle_event(Event::ApplicationActivated(pid, Quiet::Yes));
+        restarted.reactor.handle_event(Event::ApplicationMainWindowChanged(
+            pid,
+            Some(focused_window),
+            Quiet::Yes,
+        ));
+        assert_eq!(Some(focused_window), restarted.reactor.main_window());
+        restarted.reactor.handle_event(Event::StartupComplete);
+        restarted.apps.simulate_until_quiet(&mut restarted.reactor);
+
+        let selected = restarted.reactor.contexts.by_name(expected).unwrap().id;
+        assert_eq!(ContextKey::Named(selected), restarted.reactor.contexts.active());
+        assert_eq!(ContextKey::Named(selected), restarted.saved_active());
+        assert_eq!(3, restarted.reactor.contexts.contexts().len());
+
+        restarted.switch(c);
+        assert_eq!(c, restarted.saved_active());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(restarted.dir.path().join("contexts.json")).unwrap())
+                .unwrap();
+        assert!(saved["active"].get("per_screen").is_none());
+
+        let store = ContextsStore::new(restarted.dir.path().join("contexts.json"));
+        restarted.reactor.open_contexts(store, Some("boot".into()), SystemTime::now());
+        assert_eq!(c, restarted.reactor.contexts.active());
+    }
+}
+
+/// If startup completes before screens appear, the first screen event must
+/// apply the chosen context after it reconciles the saved per-screen map.
+#[test]
+fn a_late_screen_event_applies_the_focused_cold_global_context() {
+    let mut s = per_screen_setup();
+    let a = s.create("A", &[wid(1)]);
+    let b = s.create("B", &[WindowId::new(2, 2)]);
+    s.focus_screen(0);
+    s.switch(a);
+    s.focus_screen(1);
+    s.switch(b);
+
+    let mut config = Config::default();
+    config.settings.default_disable = false;
+    config.settings.animate = false;
+    config.settings.experimental.contexts.enable = true;
+    let Setup { dir, .. } = s;
+    let mut restarted = Setup {
+        reactor: Reactor::new_for_test(LayoutManager::new_for_test()),
+        apps: Apps::new(),
+        dir,
+    };
+    restarted.reactor.journal =
+        ParkedJournal::open(restarted.dir.path().join("parked.json"), SystemTime::now());
+    restarted.reactor.handle_event(Event::ConfigChanged(Arc::new(config)));
+    let store = ContextsStore::new(restarted.dir.path().join("contexts.json"));
+    restarted.reactor.open_contexts(store, Some("boot".into()), SystemTime::now());
+    restarted.reactor.handle_event(Event::StartupComplete);
+    assert!(restarted.reactor.contexts.has_screen_actives());
+
+    let pid = 3;
+    let focused_window = WindowId::new(pid, 1);
+    let window = WindowInfo {
+        sys_id: Some(WindowServerId::new(31)),
+        frame: rect(1400., 100., 50., 50.),
+        ..make_window(1)
+    };
+    restarted.reactor.handle_events(restarted.apps.make_app(pid, vec![window]));
+    restarted.apps.simulate_until_quiet(&mut restarted.reactor);
+    restarted.reactor.handle_event(Event::ApplicationGloballyActivated(pid));
+    restarted.reactor.handle_event(Event::ApplicationActivated(pid, Quiet::Yes));
+    restarted.reactor.handle_event(Event::ApplicationMainWindowChanged(
+        pid,
+        Some(focused_window),
+        Quiet::Yes,
+    ));
+    assert_eq!(Some(focused_window), restarted.reactor.main_window());
+
+    restarted.reactor.handle_event(screens(
+        vec![screen(), right()],
+        vec![Some(space()), Some(right_space())],
+    ));
+    restarted.apps.simulate_until_quiet(&mut restarted.reactor);
+
+    assert_eq!(b, restarted.reactor.contexts.active());
+    assert_eq!(b, restarted.reactor.shown_context(space()));
+    assert_eq!(b, restarted.reactor.shown_context(right_space()));
+    assert_eq!(b, restarted.saved_active());
+    assert_eq!(b, restarted.reactor.layout.active_context_for_test(space()));
+    assert_eq!(
+        b,
+        restarted.reactor.layout.active_context_for_test(right_space())
+    );
+}
+
 /// R26. In `per_screen` scope, focus from outside switches the screen the
 /// window was last shown on, not the focused screen.
 #[test]

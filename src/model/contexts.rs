@@ -265,6 +265,10 @@ impl Contexts {
         self.screens.get(&screen).map_or(ContextKey::Everything, |state| state.active)
     }
 
+    pub fn has_screen_actives(&self) -> bool {
+        !self.screens.is_empty()
+    }
+
     /// The context that was active before the current one.
     pub fn previous(&self) -> Option<ContextKey> {
         self.previous

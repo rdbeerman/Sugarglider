@@ -606,6 +606,7 @@ impl Reactor {
         if switches && self.screens.iter().all(|screen| screen.space.is_none()) {
             return Err(NO_MANAGED_SPACE.to_string());
         }
+        self.reconcile_cold_scope();
         let result = match command {
             ContextCommand::OpenContextSwitcher => self.open_context_switcher(),
             ContextCommand::SwitchContext(reference) => {
@@ -913,6 +914,9 @@ impl Reactor {
     pub(super) fn scope_changed(&mut self, from: Scope) {
         match (from, self.scope()) {
             (Scope::Global, Scope::PerScreen) => {
+                if self.contexts.has_screen_actives() {
+                    return;
+                }
                 let key = self.contexts.active();
                 let screens: Vec<ScreenId> = self.screens.iter().map(|screen| screen.id).collect();
                 info!(?key, screens = screens.len(), "Changing to per-screen scope");
@@ -1070,6 +1074,30 @@ impl Reactor {
             }
         }
         self.rejoin_every_window();
+        if self.startup_complete {
+            self.reconcile_cold_scope();
+        }
+    }
+
+    /// A cold read happens before the screen and focused window are known.
+    /// Once they are known, use that screen's saved context as the global one
+    /// and clear the per-screen map before another command can save it.
+    pub(super) fn reconcile_cold_scope(&mut self) -> bool {
+        if self.scope() != Scope::Global
+            || !self.contexts.has_screen_actives()
+            || self.screens.is_empty()
+        {
+            return false;
+        }
+        let screen = self.screens[self.focused_screen_index()].id;
+        let key = self.contexts.active_on(screen);
+        info!(?screen, ?key, "Restoring the focused screen's context as global");
+        self.contexts.forget_screen_actives();
+        if let Err(err) = self.contexts.switch_to(key) {
+            error!(?key, "Could not restore the focused screen's context: {err}");
+        }
+        self.save_contexts();
+        true
     }
 
     /// Reads the contexts when a config reload turns contexts on, and records
@@ -1088,6 +1116,9 @@ impl Reactor {
         self.contexts_unread = false;
         self.layout.retain_context_layouts(|id| self.contexts.get(id).is_some());
         self.rejoin_every_window();
+        if self.startup_complete {
+            self.reconcile_cold_scope();
+        }
         if self.contexts_in_use() {
             self.apply_again_focusing_parked_main();
         }

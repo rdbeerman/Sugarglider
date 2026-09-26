@@ -938,6 +938,8 @@ impl Reactor {
                 self.on_windows_discovered(pid, visible_windows, vec![]);
             }
             Event::StartupComplete => {
+                self.update_active_screen();
+                self.reconcile_cold_scope();
                 self.send_layout_event(LayoutEvent::AppsRunningUpdated(
                     self.apps.keys().copied().collect(),
                 ));
@@ -1363,6 +1365,9 @@ impl Reactor {
                 }
                 self.repark_moved_windows();
                 self.update_active_screen();
+                if self.startup_complete && self.reconcile_cold_scope() && self.contexts_in_use() {
+                    self.apply_again_focusing_parked_main();
+                }
                 // FIXME: Update visible windows if space changed.
                 // Forward the event to group_indicators. We serialize these
                 // through the reactor instead of delivering directly from

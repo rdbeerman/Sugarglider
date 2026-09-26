@@ -2961,6 +2961,10 @@ impl LayoutManager {
         Self::new(default_config())
     }
 
+    pub(crate) fn active_context_for_test(&self, space: SpaceId) -> ContextKey {
+        self.active_context(space)
+    }
+
     /// Whether a layout of the Space for `key`, of any screen size, has a
     /// node for the window.
     pub(crate) fn has_node_in(&self, space: SpaceId, key: ContextKey, wid: WindowId) -> bool {
