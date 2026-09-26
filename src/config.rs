@@ -799,7 +799,16 @@ mod tests {
     use super::*;
     use crate::actor::layout::LayoutCommand;
     use crate::actor::reactor::Command as ReactorCommand;
-    use crate::actor::wm_controller::WmCmd;
+    use crate::actor::wm_controller::{ExecCmd, WmCmd};
+    use crate::model::Direction;
+    use crate::ui::preferences_json::PreferencesJson;
+
+    /// The JSON that `ConfigBridge` in `SugargliderUI` sends to
+    /// `sugarglider_update_config` and `sugarglider_save_config_to_file`.
+    /// `PreferencesConfigTests.swift` checks that Swift still encodes it this
+    /// way.
+    const PREFERENCES_FROM_SWIFT: &str =
+        include_str!("../tests/fixtures/preferences-from-swift.json");
 
     #[test]
     fn default_config_is_valid() {
@@ -1432,5 +1441,48 @@ mod tests {
                 hk.command_id
             );
         }
+    }
+
+    /// The Swift `HotkeyBinding` has no sort order, so the key bindings in
+    /// the Preferences window's JSON have none.
+    #[test]
+    fn preferences_from_the_swift_ui_save_with_their_key_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(&path, "[keys]\n\"Alt + T\" = { exec = \"open -a Terminal\" }\n").unwrap();
+
+        let prefs: PreferencesJson = serde_json::from_str(PREFERENCES_FROM_SWIFT).unwrap();
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let config = Config::load(Some(&path)).unwrap();
+        assert!(!config.settings.animate);
+        assert!(config.settings.focus_follows_mouse);
+        assert_eq!(8.0, config.settings.outer_gap);
+        assert_eq!(4.0, config.settings.inner_gap);
+        let app_names: Vec<_> = config
+            .window_rules
+            .iter()
+            .map(|rule| rule.conditions.app_name.as_deref())
+            .collect();
+        assert_eq!(vec![Some("Finder"), Some("Calculator")], app_names);
+        let bound_to = |key: &str| {
+            let hotkey = Hotkey::from_str(key).unwrap();
+            let binding = config.keys.iter().find(|(hk, _)| *hk == hotkey);
+            binding.map(|(_, cmd)| cmd).unwrap_or_else(|| panic!("{key} is not bound"))
+        };
+        assert!(matches!(
+            bound_to("Alt + KeyZ"),
+            WmCommand::Wm(WmCmd::ToggleGlobalEnabled)
+        ));
+        assert!(matches!(
+            bound_to("Ctrl + Alt + Shift + KeyH"),
+            WmCommand::ReactorCommand(ReactorCommand::Layout(LayoutCommand::MoveFocus(
+                Direction::Left
+            )))
+        ));
+        assert!(matches!(
+            bound_to("Alt + KeyT"),
+            WmCommand::Wm(WmCmd::Exec(ExecCmd::String(cmd))) if cmd == "open -a Terminal"
+        ));
     }
 }

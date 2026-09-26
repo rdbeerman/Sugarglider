@@ -62,7 +62,9 @@ pub struct HotkeyBindingJson {
     pub category: String,
     /// The default hotkey for this command (if any)
     pub default_key: Option<String>,
-    /// Sort order within the category (lower = earlier)
+    /// Sort order within the category (lower = earlier). The Swift UI doesn't
+    /// send it back.
+    #[serde(default)]
     pub sort_order: u32,
 }
 
