@@ -46,11 +46,6 @@ impl Reactor {
         self.config.settings.experimental.contexts.enable
     }
 
-    /// Whether contexts are on and at least one context exists.
-    pub(super) fn contexts_exist(&self) -> bool {
-        self.contexts_enabled() && !self.contexts.contexts().is_empty()
-    }
-
     /// Whether applying contexts can change anything. Without contexts and
     /// parked windows, Spaces are shown exactly as without the feature.
     pub(super) fn contexts_in_use(&self) -> bool {
@@ -4327,13 +4322,60 @@ mod tests {
             Requested(false),
             None,
         ));
-        s.reactor.handle_event(Event::MouseMovedOverWindow(WindowServerId::new(21), None));
+        s.reactor
+            .handle_event(Event::MouseMovedOverWindow(WindowServerId::new(21), None));
         s.apps.simulate_until_quiet(&mut s.reactor);
 
         assert_eq!(vec![(wid(1), screen())], s.tiles_on(space(), screen()));
         assert_eq!(vec![(wid(2), right())], s.tiles_on(space2, right()));
         assert_eq!(frame, s.frame(moved));
         assert!(raise_manager_rx.try_recv().is_err());
+    }
+
+    /// L10. A window that the user moves to another display under a context
+    /// leaves every layout of the Space it left, for every screen size and
+    /// every context, and joins the context's layout on the other Space.
+    #[test]
+    fn l10_a_window_moved_to_another_display_leaves_every_layout_of_its_old_space() {
+        let mut s = two_displays_two_apps();
+        let space2 = SpaceId::new(2);
+        let all = four_windows();
+        let c = s.create("C", &all);
+        s.switch(c);
+        assert!(s.parked().is_empty());
+        let shorter = rect(0., 0., 1200., 800.);
+        for left in [shorter, screen()] {
+            let event = displays(&s, vec![left, right()], vec![Some(space()), Some(space2)], &all);
+            s.reactor.handle_event(event);
+            s.apps.simulate_until_quiet(&mut s.reactor);
+        }
+        for key in [c, ContextKey::Everything] {
+            assert!(s.reactor.layout.has_node_in(space(), key, wid(1)), "{key:?}");
+        }
+
+        let frame = rect(1500., 100., 600., 1000.);
+        s.apps.windows.get_mut(&wid(1)).unwrap().frame = frame;
+        let txid = s.reactor.windows[&wid(1)].last_sent_txid;
+        s.reactor.handle_event(Event::WindowFrameChanged(
+            wid(1),
+            frame,
+            txid,
+            Requested(false),
+            None,
+        ));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        for key in [c, ContextKey::Everything] {
+            assert!(!s.reactor.layout.has_node_in(space(), key, wid(1)), "{key:?}");
+        }
+        assert!(s.reactor.layout.has_node_in(space2, c, wid(1)));
+        assert_eq!(
+            vec![WindowId::new(2, 1)],
+            s.tiles_on(space(), screen())
+                .into_iter()
+                .map(|(wid, _)| wid)
+                .collect::<Vec<_>>()
+        );
     }
 
     /// R32, R31. Showing Everything puts the windows back, and a quit comes
