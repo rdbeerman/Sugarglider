@@ -3,7 +3,9 @@
 
 //! Interfaces to macOS APIs for interacting with other applications.
 
+use std::ffi::c_int;
 use std::fmt::{Debug, Formatter};
+use std::io;
 use std::ptr::NonNull;
 
 use accessibility::{AXAttribute, AXAttributeValue, AXError, AXUIElement, AXUIElementAttributes};
@@ -77,6 +79,48 @@ impl From<&NSRunningApplication> for AppInfo {
             localized_name: app.localized_name().as_deref().map(ToString::to_string),
         }
     }
+}
+
+/// The process that has a process id.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Process {
+    /// No process has the id.
+    Gone,
+    /// A process has the id. `bundle_id` is the bundle id of its app, if it is
+    /// an app that has one.
+    Running { bundle_id: Option<String> },
+}
+
+impl Process {
+    pub fn with_pid(pid: pid_t) -> Process {
+        if !process_exists(pid) {
+            return Process::Gone;
+        }
+        let bundle_id = NSRunningApplication::with_process_id(pid)
+            .and_then(|app| app.bundle_id())
+            .map(|id| id.to_string());
+        Process::Running { bundle_id }
+    }
+}
+
+/// The error `kill` reports when no process has the id.
+const ESRCH: c_int = 3;
+
+fn process_exists(pid: pid_t) -> bool {
+    // Zero and negative ids name process groups, not one process.
+    if pid <= 0 {
+        return false;
+    }
+    // Signal 0 checks for the process without sending it anything.
+    if unsafe { kill(pid, 0) } == 0 {
+        return true;
+    }
+    // Any other error, such as EPERM, means the process exists.
+    io::Error::last_os_error().raw_os_error() != Some(ESRCH)
+}
+
+unsafe extern "C" {
+    fn kill(pid: pid_t, signal: c_int) -> c_int;
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -299,4 +343,34 @@ unsafe extern "C" {
 
     // Deprecated in macOS 10.9.
     fn GetProcessInformation(psn: *const ProcessSerialNumber, info: *mut ProcessInfoRec) -> OSErr;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use super::{Process, pid_t, process_exists};
+
+    #[test]
+    fn this_process_exists() {
+        assert!(process_exists(std::process::id() as pid_t));
+        assert!(matches!(
+            Process::with_pid(std::process::id() as pid_t),
+            Process::Running { .. }
+        ));
+    }
+
+    #[test]
+    fn a_process_that_ended_is_gone() {
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id() as pid_t;
+        child.wait().unwrap();
+        assert_eq!(Process::Gone, Process::with_pid(pid));
+    }
+
+    #[test]
+    fn ids_of_process_groups_are_no_process() {
+        assert!(!process_exists(0));
+        assert!(!process_exists(-1));
+    }
 }

@@ -14,7 +14,11 @@ use super::animation::Animation;
 use crate::actor::app::{WindowId, pid_t};
 use crate::actor::parked_journal::JournalEntry;
 use crate::model::parking_origin;
+use crate::sys::app::Process;
 use crate::sys::window_server::WindowServerId;
+
+/// Finds the process that has a pid now.
+pub(super) type ProcessLookup = Box<dyn Fn(pid_t) -> Process + Send>;
 
 /// How far, in points, the frame a window reports may be from the frame
 /// written to put it back, for the window to count as back.
@@ -219,10 +223,26 @@ impl Reactor {
         }
     }
 
-    /// Drops the journal entries of apps that are not running.
-    pub(super) fn drop_journal_entries_of_absent_apps(&mut self) {
-        let apps = &self.apps;
-        self.journal.retain_apps(|pid| apps.contains_key(&pid));
+    /// Drops the journal entries whose process has ended, or whose pid belongs
+    /// to another app now.
+    pub(super) fn drop_journal_entries_of_ended_apps(&mut self) {
+        let lookup = &self.process_lookup;
+        self.journal.retain(|entry| {
+            let process = lookup(entry.pid);
+            let keep = match &process {
+                Process::Gone => false,
+                Process::Running { bundle_id } => same_app(&entry.bundle_id, bundle_id),
+            };
+            if !keep {
+                info!(
+                    pid = entry.pid,
+                    journal = ?entry.bundle_id,
+                    ?process,
+                    "Dropping a journal entry of an app that is not running"
+                );
+            }
+            keep
+        });
     }
 }
 
@@ -239,10 +259,10 @@ mod tests {
 
     use super::super::testing::*;
     use super::super::{Event, FrameAttempt, MAX_FRAME_ATTEMPTS, Reactor, Requested};
-    use crate::actor::app::{Request, WindowId};
+    use crate::actor::app::{Request, WindowId, pid_t};
     use crate::actor::layout::LayoutManager;
     use crate::actor::parked_journal::{JournalEntry, ParkedJournal};
-    use crate::sys::app::WindowInfo;
+    use crate::sys::app::{Process, WindowInfo};
     use crate::sys::geometry::CGRectExt;
     use crate::sys::screen::{CoordinateConverter, SpaceId};
     use crate::sys::window_server::WindowServerId;
@@ -366,6 +386,11 @@ mod tests {
             for event in self.apps.simulate_events_for_requests(requests) {
                 self.reactor.handle_event(event);
             }
+        }
+
+        /// Makes `lookup` tell which process has each pid now.
+        fn set_processes(&mut self, lookup: impl Fn(pid_t) -> Process + Send + 'static) {
+            self.reactor.process_lookup = Box::new(lookup);
         }
 
         fn parked_windows(&self) -> Vec<WindowId> {
@@ -710,6 +735,11 @@ mod tests {
             entry(2, 21, elsewhere),
             entry(3, 31, left),
         ]);
+        // The app with pid 3 quit while Sugarglider was not running.
+        s.set_processes(|pid| match pid {
+            3 => Process::Gone,
+            _ => test_app_process(pid),
+        });
 
         s.reactor
             .handle_events(s.apps.make_app(1, vec![window_at(11, parked), window_at(12, parked)]));
@@ -1243,7 +1273,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bug: StartupComplete drops the entries of a running app that registers late"]
     fn r34_an_app_whose_thread_registers_after_startup_complete_keeps_its_entries() {
         let elsewhere = rect(100., 100., 300., 300.);
         let mut s = Setup::launching(vec![entry(1, 11, screen()), entry(2, 21, elsewhere)]);
@@ -1357,5 +1386,68 @@ mod tests {
                 "{case:?}"
             );
         }
+    }
+
+    #[test]
+    fn r34_an_app_that_registers_after_startup_complete_is_put_back() {
+        let elsewhere = rect(100., 100., 300., 300.);
+        let mut s = Setup::launching(vec![entry(1, 11, elsewhere)]);
+
+        s.reactor.handle_event(Event::StartupComplete);
+        assert_eq!(vec![(1, 11, elsewhere)], summary(s.journal_on_disk()));
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![window_at(11, rect(999., 999., 1000., 1000.))]));
+
+        let requests = s.apps.requests();
+        let writes = frame_writes(&requests, WindowId::new(1, 1));
+        assert_eq!(Some(&elsewhere), writes.first(), "{writes:?}");
+        assert_eq!(vec![(1, 11, elsewhere)], summary(s.journal_on_disk()));
+        s.handle_requests(requests);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert!(s.journal_on_disk().is_empty());
+    }
+
+    #[test]
+    fn r34_the_entries_of_an_app_that_never_registers_stay_while_it_runs() {
+        let elsewhere = rect(100., 100., 300., 300.);
+        let mut s = Setup::launching(vec![entry(1, 11, screen()), entry(2, 21, elsewhere)]);
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![window_at(11, rect(999., 999., 1000., 1000.))]));
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        // App 2 is running, but its app thread never reaches the reactor.
+        s.reactor.handle_event(Event::StartupComplete);
+        s.refresh_visible_windows();
+
+        assert_eq!(vec![(2, 21, elsewhere)], summary(s.journal_on_disk()));
+    }
+
+    #[test]
+    fn r34_startup_complete_drops_entries_by_the_process_that_has_their_pid() {
+        let frame = rect(100., 100., 300., 300.);
+        let mut s = Setup::launching(vec![
+            entry(1, 11, frame),
+            entry(2, 21, frame),
+            entry(3, 31, frame),
+            entry(4, 41, frame),
+            entry(5, 51, frame),
+        ]);
+        s.set_processes(|pid| match pid {
+            // Registered below, but its process has ended since.
+            1 => Process::Gone,
+            // Running, but never registered.
+            2 => test_app_process(pid),
+            3 => Process::Gone,
+            4 => Process::Running {
+                bundle_id: Some("com.example.other".into()),
+            },
+            _ => Process::Running { bundle_id: None },
+        });
+        s.reactor
+            .handle_events(s.apps.make_app(1, vec![window_at(11, rect(999., 999., 300., 300.))]));
+
+        s.reactor.handle_event(Event::StartupComplete);
+
+        assert_eq!(vec![(2, 21, frame)], summary(s.journal_on_disk()));
     }
 }

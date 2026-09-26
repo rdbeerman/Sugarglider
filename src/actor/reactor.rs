@@ -25,6 +25,7 @@ use std::{mem, thread};
 use animation::{Animation, AnimationManager, Message as AnimationMessage};
 use main_window::MainWindowTracker;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use parking::ProcessLookup;
 use redact::Secret;
 pub use replay::{Record, replay};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,7 @@ use crate::collections::{HashMap, HashSet};
 use crate::config::Config;
 use crate::log::{self, MetricsCommand};
 use crate::model::NodeId;
+use crate::sys::app::Process;
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
 use crate::sys::geometry::{CGRectDef, CGRectExt, SameAs, round_to_physical};
@@ -296,6 +298,9 @@ pub struct Reactor {
     parked: HashMap<WindowId, CGRect>,
     /// The frames of parked windows, on disk before the windows move.
     journal: ParkedJournal,
+    /// Finds the process that has a pid now, to tell which journal entries
+    /// belong to apps that are still running.
+    process_lookup: ProcessLookup,
 }
 
 /// How many times in a row we write the same frame to a window before giving
@@ -506,6 +511,7 @@ impl Reactor {
             hidden_windows: HashSet::default(),
             parked: HashMap::default(),
             journal,
+            process_lookup: Box::new(Process::with_pid),
         }
     }
 
@@ -597,7 +603,7 @@ impl Reactor {
                     self.apps.keys().copied().collect(),
                 ));
                 self.startup_complete = true;
-                self.drop_journal_entries_of_absent_apps();
+                self.drop_journal_entries_of_ended_apps();
                 // Don't force layout on startup - windows may already be in
                 // correct positions from a previous run. Layout will be
                 // enforced when something actually changes.

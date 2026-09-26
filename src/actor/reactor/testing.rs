@@ -16,7 +16,7 @@ use crate::actor::layout::LayoutManager;
 use crate::actor::parked_journal::ParkedJournal;
 use crate::actor::reactor;
 use crate::config::Config;
-use crate::sys::app::{AppInfo, WindowInfo};
+use crate::sys::app::{AppInfo, Process, WindowInfo};
 use crate::sys::geometry::SameAs;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
 
@@ -27,13 +27,15 @@ impl Reactor {
         config.settings.animate = false;
         let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
         let (group_indicators_tx, _) = crate::actor::channel();
-        Reactor::new(
+        let mut reactor = Reactor::new(
             Arc::new(config),
             layout,
             record,
             group_indicators_tx,
             ParkedJournal::in_memory(),
-        )
+        );
+        reactor.process_lookup = Box::new(test_app_process);
+        reactor
     }
 
     pub fn new_for_test_with_animation(
@@ -52,6 +54,7 @@ impl Reactor {
             group_indicators_tx,
             ParkedJournal::in_memory(),
         );
+        reactor.process_lookup = Box::new(test_app_process);
         let (tx, rx) = unbounded_channel();
         reactor.animation_tx = Some(tx);
         (reactor, rx)
@@ -81,6 +84,13 @@ impl Drop for Reactor {
                 panic!("replay failed: {e}");
             }
         }
+    }
+}
+
+/// The process of the test app that `Apps::make_app` launches with `pid`.
+pub fn test_app_process(pid: pid_t) -> Process {
+    Process::Running {
+        bundle_id: Some(format!("com.testapp{pid}")),
     }
 }
 

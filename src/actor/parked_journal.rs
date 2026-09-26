@@ -167,9 +167,10 @@ impl ParkedJournal {
         self.remove_where(|entry| entry.pid == pid)
     }
 
-    /// Removes the entries of apps for which `running` returns false.
-    pub fn retain_apps(&mut self, running: impl Fn(pid_t) -> bool) -> bool {
-        self.remove_where(|entry| !running(entry.pid))
+    /// Removes the entries for which `keep` returns false. Returns whether it
+    /// removed any.
+    pub fn retain(&mut self, keep: impl Fn(&JournalEntry) -> bool) -> bool {
+        self.remove_where(|entry| !keep(entry))
     }
 
     /// The entries read at startup for the app whose windows have not been put
@@ -392,8 +393,8 @@ mod tests {
         journal.record(vec![entry(1, 10), entry(2, 20)]).unwrap();
         let mut journal = ParkedJournal::open(journal_path(&dir), now());
 
-        assert!(journal.retain_apps(|pid| pid == 1));
-        assert!(!journal.retain_apps(|pid| pid == 1));
+        assert!(journal.retain(|entry| entry.pid == 1));
+        assert!(!journal.retain(|entry| entry.pid == 1));
         assert_eq!(&[entry(1, 10)], journal.entries());
         assert_eq!(vec![entry(1, 10)], journal.unrestored(1));
         assert!(journal.unrestored(2).is_empty());
@@ -408,7 +409,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut journal = ParkedJournal::open(journal_path(&dir), now());
         assert!(!journal.remove_app(1));
-        assert!(!journal.retain_apps(|_| false));
+        assert!(!journal.retain(|_| false));
         assert!(file_names(dir.path()).is_empty());
     }
 
