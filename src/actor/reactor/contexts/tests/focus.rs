@@ -38,6 +38,7 @@ fn raise_requests(raises: &mut Raises) -> Vec<(u64, Option<WindowId>)> {
 /// timeout would, so that focus from outside counts again.
 fn end_raises(s: &mut Setup) {
     let sequence_id = s.reactor.raise_sequence;
+    s.reactor.handle_event(Event::RaiseFocusSent { sequence_id });
     s.reactor.handle_event(Event::RaiseTimeout { sequence_id });
 }
 
@@ -155,7 +156,8 @@ fn r24_the_switch_goes_to_the_most_recently_used_context_of_the_window() {
 
 /// R25. After the switch that focus from outside started, an activation of
 /// another app, as parking the focused window can cause, doesn't switch
-/// until the switch's raise sequence ends. A later one does.
+/// until the switch's raise sequence ends. The activation that arrived
+/// during the wait applies then, and the next one switches.
 #[test]
 fn r25_an_activation_before_the_switchs_raise_ends_does_not_switch() {
     for end in ["completed", "failed", "timed out"] {
@@ -172,6 +174,8 @@ fn r25_an_activation_before_the_switchs_raise_ends_does_not_switch() {
         assert_eq!(d, s.reactor.contexts.active(), "{end}");
         assert!(raise_requests(&mut raises).is_empty(), "{end}");
 
+        // The focusing raise goes out, and its own end follows.
+        s.reactor.handle_event(Event::RaiseFocusSent { sequence_id });
         s.reactor.handle_event(match end {
             "completed" => Event::RaiseCompleted { window_id: other, sequence_id },
             "failed" => Event::RaiseRequestFailed {
@@ -181,10 +185,12 @@ fn r25_an_activation_before_the_switchs_raise_ends_does_not_switch() {
             },
             _ => Event::RaiseTimeout { sequence_id },
         });
+
+        // The activation that arrived during the wait applies now.
+        assert_eq!(c, s.reactor.contexts.active(), "{end}");
+        end_raises(&mut s);
         activate(&mut s, 2, other, Order::GloballyFirst);
         assert_eq!(d, s.reactor.contexts.active(), "{end}");
-        activate(&mut s, 1, wid(1), Order::GloballyFirst);
-        assert_eq!(c, s.reactor.contexts.active(), "{end}");
     }
 }
 

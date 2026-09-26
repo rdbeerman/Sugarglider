@@ -173,7 +173,9 @@ fn a_replay_of_membership_and_focus_changes_writes_the_frames_of_the_run() {
         ContextCommand::MoveWindowToContext(ContextRef::Name("D".into())),
     )));
     settle(&mut s, &mut writes);
+    // The focusing raise goes out, and its own end follows.
     let sequence_id = s.reactor.raise_sequence;
+    s.reactor.handle_event(Event::RaiseFocusSent { sequence_id });
     s.reactor.handle_event(Event::RaiseTimeout { sequence_id });
 
     s.reactor.handle_event(Event::ApplicationGloballyActivated(2));
@@ -183,6 +185,7 @@ fn a_replay_of_membership_and_focus_changes_writes_the_frames_of_the_run() {
     assert_eq!(d, s.reactor.contexts.active());
     settle(&mut s, &mut writes);
     let sequence_id = s.reactor.raise_sequence;
+    s.reactor.handle_event(Event::RaiseFocusSent { sequence_id });
     s.reactor.handle_event(Event::RaiseTimeout { sequence_id });
 
     s.apps.windows.remove(&doc);

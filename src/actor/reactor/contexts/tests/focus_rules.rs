@@ -46,6 +46,7 @@ fn focused(raises: &mut Raises) -> Vec<Option<WindowId>> {
 /// timeout would, so that focus from outside counts again.
 fn end_raises(s: &mut Setup) {
     let sequence_id = s.reactor.raise_sequence;
+    s.reactor.handle_event(Event::RaiseFocusSent { sequence_id });
     s.reactor.handle_event(Event::RaiseTimeout { sequence_id });
 }
 
@@ -541,6 +542,222 @@ fn r25_a_second_switch_waits_for_its_own_raise() {
     });
     activate(&mut s, 2, other, Order::GloballyLast);
     assert_eq!(d, s.reactor.contexts.active());
+}
+
+/// R25. The failures and timeouts of the batches that come before the
+/// switch's focusing raise don't end the wait for the switch. The failure of
+/// the focusing raise itself does.
+#[test]
+fn r25_the_batches_before_the_focusing_raise_dont_end_the_wait() {
+    let TwoApps { mut s, c, d, other } = two_apps();
+    let mut raises = capture_raises(&mut s);
+    activate(&mut s, 2, other, Order::GloballyFirst);
+    assert_eq!(d, s.reactor.contexts.active());
+    let [(sequence_id, _)] = raise_requests(&mut raises)[..] else {
+        panic!()
+    };
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    s.reactor.handle_event(Event::RaiseRequestFailed {
+        windows: vec![other],
+        sequence_id,
+        quiet: Quiet::Yes,
+    });
+    s.reactor.handle_event(Event::RaiseTimeout { sequence_id });
+    activate(&mut s, 1, wid(1), Order::GloballyLast);
+    assert_eq!(d, s.reactor.contexts.active(), "the focusing raise hasn't gone out");
+
+    s.reactor.handle_event(Event::RaiseFocusSent { sequence_id });
+    s.reactor.handle_event(Event::RaiseRequestFailed {
+        windows: vec![other],
+        sequence_id,
+        quiet: Quiet::No,
+    });
+    activate(&mut s, 1, wid(1), Order::GloballyFirst);
+    assert_eq!(c, s.reactor.contexts.active());
+}
+
+/// R25. An identical raise request replaces the queued one with a newer id,
+/// so the wait for the focusing raise ends on a raise of the switch's window
+/// that carries an id at least as new as the switch's.
+#[test]
+fn r25_a_raise_with_a_newer_identifier_ends_the_wait() {
+    let TwoApps { mut s, c, d, other } = two_apps();
+    let mut raises = capture_raises(&mut s);
+    activate(&mut s, 2, other, Order::GloballyFirst);
+    assert_eq!(d, s.reactor.contexts.active());
+    let [(first, _)] = raise_requests(&mut raises)[..] else {
+        panic!()
+    };
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    s.reactor.handle_event(Event::RaiseFocusSent { sequence_id: first + 1 });
+    s.reactor
+        .handle_event(Event::RaiseCompleted { window_id: other, sequence_id: first + 1 });
+    activate(&mut s, 1, wid(1), Order::GloballyFirst);
+
+    assert_eq!(c, s.reactor.contexts.active());
+}
+
+/// R25. A second switch extends the wait of the first: after the second
+/// switch's raise ends, the echo the first switch still waits for keeps
+/// holding focus back, and the focus that arrived meanwhile applies when the
+/// echo arrives.
+#[test]
+fn r25_a_second_switch_extends_the_wait_of_the_first() {
+    let mut s = Setup::new(3);
+    let c = s.create("C", &[wid(1)]);
+    let d = s.create("D", &[wid(2)]);
+    focus_quietly(&mut s, wid(1));
+    let mut raises = capture_raises(&mut s);
+
+    // C's window has the focus already, so this switch raises nothing and
+    // waits for the echoes of the windows it parks.
+    s.command(c);
+    assert!(focused(&mut raises).iter().all(Option::is_none));
+    let first = s.apps.requests();
+    assert_eq!(1, frame_writes(&first, wid(2)).len());
+    assert_eq!(1, frame_writes(&first, wid(3)).len());
+
+    // The second switch raises its window, and keeps waiting for the echoes
+    // of the first.
+    s.command(d);
+    let [(sequence_id, Some(focus))] = raise_requests(&mut raises)[..] else {
+        panic!()
+    };
+    assert_eq!(wid(2), focus);
+    let second = s.apps.requests();
+    s.reactor.handle_event(Event::RaiseFocusSent { sequence_id });
+    s.reactor.handle_event(Event::RaiseCompleted { window_id: focus, sequence_id });
+    s.reactor
+        .handle_event(Event::ApplicationMainWindowChanged(1, Some(wid(3)), Quiet::No));
+    assert_eq!(d, s.reactor.contexts.active(), "window 3's echo is still to come");
+
+    answer(&mut s, first);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    answer(&mut s, second);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+}
+
+/// R24, R38. Focus on a window of another context before startup completes
+/// changes nothing: switching during registration would fight R38. Once
+/// startup completes, the same focus switches.
+#[test]
+fn r24_focus_during_registration_does_not_switch() {
+    let mut s = Setup::on(vec![screen()], vec![Some(space())]);
+    s.reactor.handle_events(s.apps.make_app(1, make_windows(1)));
+    let d = ContextKey::Named(s.reactor.contexts.create("D").unwrap());
+    let old = WindowId::new(9, 1);
+    let desc = WindowDesc {
+        wid: old,
+        bundle_id: Some("com.testapp2".into()),
+        app_name: Some("TestApp2".into()),
+        title: "Window1".into(),
+        window_server_id: Some(WindowServerId::new(21)),
+    };
+    s.reactor.contexts.add_window(id_of(d), &desc).unwrap();
+    s.reactor.contexts.window_closed(old);
+    s.reactor.contexts.app_terminated(old.pid);
+    s.apps.windows.insert(
+        WindowId::new(2, 1),
+        WindowState {
+            frame: rect(700., 100., 50., 50.),
+            ..Default::default()
+        },
+    );
+    s.reactor.handle_events(s.apps.make_app(2, vec![window_at(21, 700.)]));
+    let doc = WindowId::new(2, 1);
+    report_visible(&mut s, &[wid(1), doc]);
+    assert!(s.reactor.contexts.is_member(d, doc));
+    let c = s.create("C", &[wid(1)]);
+    s.switch(c);
+    end_raises(&mut s);
+    let _raises = capture_raises(&mut s);
+
+    activate(&mut s, 2, doc, Order::GloballyFirst);
+    assert_eq!(c, s.reactor.contexts.active(), "focus during registration");
+
+    s.reactor.handle_event(Event::StartupComplete);
+    s.apps.simulate_until_quiet(&mut s.reactor);
+    end_raises(&mut s);
+    activate(&mut s, 2, doc, Order::GloballyLast);
+    assert_eq!(d, s.reactor.contexts.active());
+}
+
+/// R24, R38. Focus names a window the reactor hasn't seen yet, and waits.
+/// When the window appears without being the main window any more, the focus
+/// does nothing.
+#[test]
+fn r24_focus_that_waits_does_nothing_when_the_window_is_no_longer_the_main_window() {
+    let TwoApps { mut s, c, .. } = two_apps();
+    let e = s.create("E", &[]);
+    let _raises = capture_raises(&mut s);
+    let old = WindowId::new(9, 1);
+    let desc = WindowDesc {
+        wid: old,
+        bundle_id: Some("com.testapp3".into()),
+        app_name: Some("TestApp3".into()),
+        title: "Window1".into(),
+        window_server_id: Some(WindowServerId::new(31)),
+    };
+    s.reactor.contexts.add_window(id_of(e), &desc).unwrap();
+    s.reactor.contexts.window_closed(old);
+    s.reactor.contexts.app_terminated(old.pid);
+    let launched = WindowId::new(3, 1);
+    let window = window_at(31, 300.);
+    s.apps.windows.insert(
+        launched,
+        WindowState {
+            frame: window.frame,
+            ..Default::default()
+        },
+    );
+    s.reactor.handle_events(s.apps.make_app_with_opts(3, vec![], None, true));
+    s.reactor.handle_event(Event::ApplicationGloballyActivated(3));
+    s.reactor
+        .handle_event(Event::ApplicationMainWindowChanged(3, Some(launched), Quiet::No));
+    // The app changes its main window again, quietly, before the reactor
+    // sees the first one.
+    s.reactor.handle_event(Event::ApplicationMainWindowChanged(
+        3,
+        Some(WindowId::new(3, 2)),
+        Quiet::Yes,
+    ));
+
+    s.reactor.handle_event(Event::WindowCreated(launched, window, MouseState::Up));
+    let on_screen = on_screen(&s, &[wid(1), launched]);
+    s.reactor
+        .handle_event(Event::WindowsOnScreenUpdated { pid: Some(3), on_screen });
+
+    assert!(s.reactor.contexts.is_member(e, launched));
+    assert_eq!(c, s.reactor.contexts.active());
+}
+
+/// R25. A focus that arrived during the wait applies when the wait ends only
+/// while its window still has the focus: the user may have moved on.
+#[test]
+fn r25_focus_that_arrived_during_the_wait_applies_only_while_it_still_has_focus() {
+    let TwoApps { mut s, c, d, other } = two_apps();
+    let mut raises = capture_raises(&mut s);
+    activate(&mut s, 2, other, Order::GloballyFirst);
+    assert_eq!(d, s.reactor.contexts.active());
+    let [(sequence_id, _)] = raise_requests(&mut raises)[..] else {
+        panic!()
+    };
+    s.apps.simulate_until_quiet(&mut s.reactor);
+
+    // The user activates app 1 during the wait, and moves on to app 2.
+    activate(&mut s, 1, wid(1), Order::GloballyFirst);
+    s.reactor.handle_event(Event::ApplicationGloballyDeactivated(1));
+    s.reactor.handle_event(Event::ApplicationDeactivated(1));
+
+    s.reactor.handle_event(Event::RaiseFocusSent { sequence_id });
+    s.reactor.handle_event(Event::RaiseCompleted { window_id: other, sequence_id });
+
+    assert_eq!(d, s.reactor.contexts.active(), "window 1 no longer has the focus");
+    assert!(raise_requests(&mut raises).is_empty());
+    assert_ne!(c, s.reactor.contexts.active());
 }
 
 /// R40. The user activates app 1, whose main window 2 is parked. Its member

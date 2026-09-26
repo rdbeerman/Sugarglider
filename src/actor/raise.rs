@@ -65,6 +65,9 @@ pub struct RaiseManager {
     /// Queued sequences waiting to be processed
     queued_sequences: VecDeque<RaiseRequest>,
     mouse_tx: Option<mouse::Sender>,
+    /// The reactor's events, to report when a sequence's focusing raise is
+    /// sent. Tests leave it unset.
+    events_tx: Option<reactor::Sender>,
 }
 
 /// Tracks an executing sequence of raises.
@@ -93,6 +96,7 @@ impl RaiseManager {
     ) {
         let mut raise_manager = RaiseManager::new();
         raise_manager.mouse_tx = mouse_tx;
+        raise_manager.events_tx = Some(events_tx.clone());
         let mut timeout_timer = Timer::manual();
 
         let sequence_timeout = |sequence: &ActiveSequence| {
@@ -144,6 +148,7 @@ impl RaiseManager {
             active_sequence: None,
             queued_sequences: VecDeque::new(),
             mouse_tx: None,
+            events_tx: None,
         }
     }
 
@@ -329,6 +334,13 @@ impl RaiseManager {
                     // Add focus window to pending raises so we wait for completion.
                     sequence.pending_raises.extend(wids);
                     trace!("Focus window request sent and added to pending raises");
+                    // The reactor waits for the focus raise's own end from here,
+                    // not from the earlier batches of the sequence.
+                    if let Some(events_tx) = &self.events_tx {
+                        events_tx.send(reactor::Event::RaiseFocusSent {
+                            sequence_id: sequence.sequence_id,
+                        });
+                    }
                 } else {
                     warn!("Failed to send focus window request");
                 }

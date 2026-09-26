@@ -221,6 +221,13 @@ pub enum Event {
         sequence_id: u64,
     },
 
+    /// The raise manager sent the raise that focuses a sequence's window.
+    /// The batches before it raise windows quietly; only from here can the
+    /// sequence's failures and timeouts end a switch's wait.
+    RaiseFocusSent {
+        sequence_id: u64,
+    },
+
     LeftMouseDown(
         #[serde(with = "crate::sys::geometry::CGPointDef")] objc2_core_foundation::CGPoint,
         /// The window at the click point, if any. Used to detect clicks on
@@ -1523,6 +1530,7 @@ impl Reactor {
                 _ = self.raise_manager_tx.send((Span::current(), msg));
                 self.raise_ended(sequence_id, None);
             }
+            Event::RaiseFocusSent { sequence_id } => self.raise_started(sequence_id),
             Event::ScrollWheel { delta_x, delta_y, alt_held } => {
                 if !self.config.settings.experimental.scroll.enable {
                     return;

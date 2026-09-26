@@ -112,6 +112,7 @@ impl MainWindowTracker {
             | Event::RaiseCompleted { .. }
             | Event::RaiseRequestFailed { .. }
             | Event::RaiseTimeout { .. }
+            | Event::RaiseFocusSent { .. }
             | Event::ScrollWheel { .. }
             | Event::LeftMouseDown(..)
             | Event::LeftMouseDragged(_)

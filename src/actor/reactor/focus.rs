@@ -22,20 +22,36 @@ const FINDER: &str = "com.apple.finder";
 /// never arrive, for example because an app didn't answer a write.
 const GUARD_DEADLINE: Duration = Duration::from_secs(2);
 
-/// What a switch waits for before focus from outside counts again. Until then,
-/// activations and main window changes can be the switch's own.
+/// What a switch waits for before focus from outside counts again. Until the
+/// wait ends, activations and main window changes can be the switch's own.
 #[derive(Debug, Default)]
 pub(super) struct SwitchGuard {
     /// The raise sequence that focuses the switch's window, and the window.
-    raise: Option<(u64, WindowId)>,
+    /// The wait for it starts when the raise manager reports that it sent the
+    /// focusing raise: the failure or timeout of a batch before that raise
+    /// doesn't end it.
+    raise: Option<RaiseWait>,
     /// When the switch raised nothing: the windows it parked whose echo of the
     /// parking write hasn't arrived.
     echoes: HashSet<WindowId>,
     /// Finder, when the switch activated it because no window could take focus,
-    /// until its activation arrives.
+    /// until its activation arrives or fails.
     pub(super) finder: Option<pid_t>,
+    /// The last window that took focus while the guard held, to look at again
+    /// when the guard ends. The window the switch focused itself doesn't
+    /// count.
+    pending_focus: Option<WindowId>,
     /// When the switch started to wait.
     pub(super) since: Option<Instant>,
+}
+
+/// A switch's focusing raise, until its end arrives.
+#[derive(Debug)]
+struct RaiseWait {
+    sequence_id: u64,
+    focus: WindowId,
+    /// Whether the raise manager has sent the focusing raise.
+    sent: bool,
 }
 
 impl SwitchGuard {
@@ -66,6 +82,11 @@ impl Reactor {
             return;
         }
         if self.switch_guard.holds() {
+            // Look at the focus again when the switch ends, unless it is the
+            // window the switch itself focused.
+            if self.switch_guard.raise.as_ref().is_none_or(|raise| raise.focus != wid) {
+                self.switch_guard.pending_focus = Some(wid);
+            }
             debug!(?wid, guard = ?self.switch_guard, "Ignoring focus while a switch is in progress");
             return;
         }
@@ -187,26 +208,30 @@ impl Reactor {
         self.guard_switch(sequence.zip(raised), parked, finder);
     }
 
-    /// Starts waiting for the end of a switch: its raise sequence, which
-    /// focuses `raise`'s window, or, when it raised nothing, the echo of every
-    /// window it parked. With `finder`, the wait also lasts until Finder's
-    /// activation arrives.
+    /// Starts waiting for the end of a switch: its focusing raise, or, when it
+    /// raised nothing, the echo of every window it parked. With `finder`, the
+    /// wait also lasts until Finder's activation arrives or fails. A wait that
+    /// is already on stays on and is extended, so what the earlier switch
+    /// still waited for still ends the wait.
     fn guard_switch(
         &mut self,
         raise: Option<(u64, WindowId)>,
         parked: &[WindowId],
         finder: Option<pid_t>,
     ) {
-        let echoes = match raise {
-            Some(_) => HashSet::default(),
-            None => parked.iter().copied().collect(),
-        };
-        self.switch_guard = SwitchGuard {
-            raise,
-            echoes,
-            finder,
-            since: Some(Instant::now()),
-        };
+        let guard = &mut self.switch_guard;
+        match raise {
+            Some((sequence_id, focus)) => {
+                guard.raise = Some(RaiseWait { sequence_id, focus, sent: false });
+            }
+            None => guard.echoes.extend(parked),
+        }
+        if finder.is_some() {
+            guard.finder = finder;
+        }
+        if guard.since.is_none() && guard.holds() {
+            guard.since = Some(Instant::now());
+        }
         debug!(guard = ?self.switch_guard, "Waiting for the switch to end");
     }
 
@@ -223,28 +248,53 @@ impl Reactor {
                 ?guard,
                 "The switch didn't end in time; focus from outside counts again"
             );
-            self.switch_guard = SwitchGuard::default();
+            let guard = &mut self.switch_guard;
+            guard.raise = None;
+            guard.echoes.clear();
+            guard.finder = None;
+            guard.since = None;
+            self.finish_guard();
+        }
+    }
+
+    /// The raise manager sent the focusing raise of `sequence_id`. An
+    /// identical request replaces the queued one with a newer id, so a
+    /// sequence at least as new as the switch's is the switch's own raise.
+    pub(super) fn raise_started(&mut self, sequence_id: u64) {
+        let Some(raise) = &mut self.switch_guard.raise else {
+            return;
+        };
+        if sequence_id >= raise.sequence_id {
+            raise.sent = true;
+            debug!(?sequence_id, "The switch's focusing raise is sent");
         }
     }
 
     /// A raise sequence reported a completed raise of `window`, or with `None`,
     /// that it failed or timed out. A sequence at least as new as the switch's
     /// ends the wait for it, because a request identical to the queued one
-    /// replaces it.
+    /// replaces it. Until the focusing raise is sent, only a completed raise
+    /// of the switch's window ends the wait: the failures and timeouts of the
+    /// batches before the focusing raise don't.
     pub(super) fn raise_ended(&mut self, sequence_id: u64, window: Option<WindowId>) {
-        if let Some((sequence, focus)) = self.switch_guard.raise
-            && sequence_id >= sequence
-            && window.is_none_or(|window| window == focus)
-        {
+        let Some(raise) = &self.switch_guard.raise else { return };
+        if sequence_id < raise.sequence_id {
+            return;
+        }
+        let focuses_the_switch = match window {
+            Some(window) => window == raise.focus,
+            None => raise.sent,
+        };
+        if focuses_the_switch {
             self.switch_guard.raise = None;
-            self.log_guard_end();
+            self.finish_guard();
         }
     }
 
     /// The echo of the last frame write to the window arrived.
     pub(super) fn frame_write_echoed(&mut self, wid: WindowId) {
         if self.switch_guard.echoes.remove(&wid) {
-            self.log_guard_end();
+            self.finish_guard();
         }
     }
 
@@ -255,7 +305,7 @@ impl Reactor {
             return false;
         }
         self.switch_guard.finder = None;
-        self.log_guard_end();
+        self.finish_guard();
         true
     }
 
@@ -263,9 +313,9 @@ impl Reactor {
     pub(super) fn guarded_window_gone(&mut self, wid: WindowId) {
         let guard = &mut self.switch_guard;
         let echoed = guard.echoes.remove(&wid);
-        let raised = guard.raise.take_if(|(_, focus)| *focus == wid).is_some();
+        let raised = guard.raise.take_if(|raise| raise.focus == wid).is_some();
         if echoed || raised {
-            self.log_guard_end();
+            self.finish_guard();
         }
     }
 
@@ -274,16 +324,27 @@ impl Reactor {
         let guard = &mut self.switch_guard;
         let before = guard.echoes.len();
         guard.echoes.retain(|wid| wid.pid != pid);
-        let raised = guard.raise.take_if(|(_, focus)| focus.pid == pid).is_some();
+        let raised = guard.raise.take_if(|raise| raise.focus.pid == pid).is_some();
         let finder = guard.finder.take_if(|finder| *finder == pid).is_some();
         if raised || finder || guard.echoes.len() != before {
-            self.log_guard_end();
+            self.finish_guard();
         }
     }
 
-    fn log_guard_end(&self) {
-        if !self.switch_guard.holds() {
-            debug!("The switch has ended; focus from outside counts again");
+    /// The guard holds nothing any more. Focus that arrived while it held and
+    /// is still the main window is looked at again now, as R24 does.
+    fn finish_guard(&mut self) {
+        if self.switch_guard.holds() {
+            return;
+        }
+        self.switch_guard.since = None;
+        debug!("The switch has ended; focus from outside counts again");
+        let Some(pending) = self.switch_guard.pending_focus.take() else {
+            return;
+        };
+        if self.main_window() == Some(pending) {
+            debug!(?pending, "Applying focus that arrived during the switch");
+            self.focus_changed(pending, FocusSource::MainWindowChange);
         }
     }
 

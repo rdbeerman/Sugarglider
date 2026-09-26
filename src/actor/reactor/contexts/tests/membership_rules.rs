@@ -1377,6 +1377,7 @@ fn r20_r36_a_new_focused_window_at_a_minimized_windows_frame_joins_the_active_co
     report_visible(&mut s, &[wid(1)]);
     s.switch(c);
     assert!(s.parked().is_empty());
+    s.reactor.handle_event(Event::RaiseFocusSent { sequence_id: s.reactor.raise_sequence });
     s.reactor.handle_event(Event::RaiseTimeout { sequence_id: s.reactor.raise_sequence });
     s.reactor.handle_event(Event::ApplicationGloballyActivated(1));
     s.reactor.handle_event(Event::ApplicationActivated(1, Quiet::No));
