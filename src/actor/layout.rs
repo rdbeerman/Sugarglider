@@ -5343,6 +5343,40 @@ mod tests {
         );
     }
 
+    /// How `layout.ron` stores the layouts of a named context and of
+    /// Unsorted. Older files must keep loading, so this must not change.
+    #[test]
+    fn context_layouts_keep_their_saved_format() {
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2)];
+        let [c] = named_contexts(["C"]);
+
+        switch(&mut mgr, space, screen.size, ContextKey::Everything, &all);
+        switch(&mut mgr, space, screen.size, ContextKey::Unsorted, &[w(2)]);
+        switch(&mut mgr, space, screen.size, c, &[w(1)]);
+
+        let saved = mgr.serialize_to_string();
+        let start = saved.find("context_layouts:").unwrap();
+        let end = start + saved[start..].find(",floating_windows:").unwrap();
+        let expected = "context_layouts:{\
+            ((1),Unsorted):(\
+                active_size:(width:120,height:120),active_layout:(idx:2,version:1),\
+                active_save_state:Unretained,memory:{},layouts:{(idx:2,version:1):1}\
+            ),\
+            ((1),Named(1)):(\
+                active_size:(width:120,height:120),active_layout:(idx:3,version:1),\
+                active_save_state:Unretained,memory:{},layouts:{(idx:3,version:1):1}\
+            )\
+        }";
+        assert_eq!(expected, &saved[start..end]);
+
+        let restored: LayoutManager = ron::from_str(&saved).unwrap();
+        assert_eq!(context_keys(&mgr), context_keys(&restored));
+    }
+
     /// Shows `key` on the Space without sending its windows again.
     fn show(mgr: &mut LayoutManager, space: SpaceId, size: CGSize, key: ContextKey) {
         let context = ActiveContext { key, members: BTreeSet::new() };
