@@ -97,8 +97,9 @@ pub struct WindowDesc {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Context {
     pub id: ContextId,
-    pub name: String,
     #[serde(default)]
+    pub name: String,
+    #[serde(default, deserialize_with = "saved_number")]
     pub number: Option<u8>,
     #[serde(default)]
     pub members: Vec<MemberRecord>,
@@ -241,13 +242,75 @@ impl Contexts {
         Ok(name.to_string())
     }
 
+    /// A name for a loaded context that follows R4: the trimmed name, with a
+    /// number added when it is reserved or taken. An empty name becomes
+    /// "Context" with a number.
+    fn repaired_name(&self, name: &str) -> String {
+        if let Ok(name) = self.checked_name(name, None) {
+            return name;
+        }
+        let (base, first) = match name.trim() {
+            "" => ("Context", 1),
+            trimmed => (trimmed, 2),
+        };
+        (first..)
+            .map(|n: u64| format!("{base} {n}"))
+            .find(|candidate| self.checked_name(candidate, None).is_ok())
+            .expect("fewer contexts than numbers")
+    }
+
+    /// Takes an id that no context has. Ids count up from `next_id`, so
+    /// they aren't reused until they run out at `u32::MAX`. After that, the
+    /// lowest free id is taken.
+    fn take_id(&mut self) -> ContextId {
+        if let Some(next) = self.next_id.checked_add(1) {
+            let id = ContextId(self.next_id);
+            self.next_id = next;
+            return id;
+        }
+        (1..=u32::MAX)
+            .map(ContextId)
+            .find(|id| self.get(*id).is_none())
+            .expect("fewer than u32::MAX contexts")
+    }
+
+    /// Takes the next use number. When the numbers run out, the uses are
+    /// first numbered again from 1, in the same order.
+    fn take_use(&mut self) -> u64 {
+        if self.use_seq == u64::MAX {
+            let mut used: Vec<u64> = self
+                .contexts
+                .iter()
+                .map(|c| c.last_used)
+                .chain([self.unsorted_last_used, self.everything_last_used])
+                .filter(|n| *n > 0)
+                .collect();
+            used.sort_unstable();
+            used.dedup();
+            let renumber = |n: u64| {
+                if n == 0 {
+                    0
+                } else {
+                    used.partition_point(|u| *u < n) as u64 + 1
+                }
+            };
+            for context in &mut self.contexts {
+                context.last_used = renumber(context.last_used);
+            }
+            self.unsorted_last_used = renumber(self.unsorted_last_used);
+            self.everything_last_used = renumber(self.everything_last_used);
+            self.use_seq = used.len() as u64;
+        }
+        self.use_seq += 1;
+        self.use_seq
+    }
+
     /// Creates an empty context. It gets the lowest free number from 1 to 9,
     /// or none when all are taken.
     pub fn create(&mut self, name: &str) -> Result<ContextId, ContextError> {
         let name = self.checked_name(name, None)?;
         let number = (1..=9).find(|n| self.by_number(*n).is_none());
-        let id = ContextId(self.next_id);
-        self.next_id += 1;
+        let id = self.take_id();
         self.contexts.push(Context {
             id,
             name,
@@ -365,8 +428,7 @@ impl Contexts {
         if let ContextKey::Named(id) = key {
             self.get_mut(id)?;
         }
-        self.use_seq += 1;
-        let seq = self.use_seq;
+        let seq = self.take_use();
         match key {
             ContextKey::Everything => self.everything_last_used = seq,
             ContextKey::Unsorted => self.unsorted_last_used = seq,
@@ -1118,7 +1180,9 @@ pub const CONTEXTS_FILE_VERSION: u32 = 1;
 #[derive(Serialize, Deserialize)]
 struct ContextsFile {
     version: u32,
+    #[serde(default)]
     next_id: u32,
+    #[serde(default)]
     use_seq: u64,
     #[serde(default)]
     contexts: Vec<Context>,
@@ -1174,6 +1238,29 @@ impl From<Contexts> for ContextsFile {
     }
 }
 
+/// Reads a context number. A value that isn't an integer from 0 to 255
+/// loads as no number.
+fn saved_number<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SavedNumber {
+        Integer(i64),
+        Other(IgnoredAny),
+    }
+    Ok(match Option::<SavedNumber>::deserialize(deserializer)? {
+        Some(SavedNumber::Integer(n)) => u8::try_from(n).ok(),
+        Some(SavedNumber::Other(_)) | None => None,
+    })
+}
+
+/// Loads `contexts.json`, repairing values that break the rules. A number
+/// outside 1 to 9, or one that an earlier context has, is dropped. A
+/// context whose id an earlier context has gets a fresh id and keeps its
+/// members. An empty, reserved, or taken name gets a number (R4). Only
+/// another version, or a file that isn't this shape, fails to load.
 impl TryFrom<ContextsFile> for Contexts {
     type Error = String;
 
@@ -1181,24 +1268,29 @@ impl TryFrom<ContextsFile> for Contexts {
         if file.version != CONTEXTS_FILE_VERSION {
             return Err(format!("unsupported contexts.json version {}", file.version));
         }
+        let max_id = file.contexts.iter().map(|c| c.id.0).max().unwrap_or(0);
+        let max_used = file.contexts.iter().map(|c| c.last_used).max().unwrap_or(0);
         let mut contexts = Contexts {
-            next_id: file.next_id,
-            use_seq: file.use_seq,
+            contexts: file.contexts,
+            next_id: file.next_id.max(max_id.saturating_add(1)).max(1),
+            use_seq: file.use_seq.max(max_used),
             pinned: file.pinned,
             ..Contexts::default()
         };
-        for mut context in file.contexts {
-            if contexts.get(context.id).is_some() {
-                continue;
+        for i in 0..contexts.contexts.len() {
+            let id = contexts.contexts[i].id;
+            if contexts.contexts[..i].iter().any(|c| c.id == id) {
+                contexts.contexts[i].id = contexts.take_id();
             }
+        }
+        for mut context in std::mem::take(&mut contexts.contexts) {
+            context.name = contexts.repaired_name(&context.name);
             if context
                 .number
                 .is_some_and(|n| !(1..=9).contains(&n) || contexts.by_number(n).is_some())
             {
                 context.number = None;
             }
-            contexts.next_id = contexts.next_id.max(context.id.0 + 1);
-            contexts.use_seq = contexts.use_seq.max(context.last_used);
             contexts.contexts.push(context);
         }
         contexts.active = match file.active {
@@ -2409,14 +2501,20 @@ mod tests {
                 { "id": 4, "name": "A", "number": 2, "last_used": 9, "members": [] },
                 { "id": 5, "name": "B", "number": 2, "last_used": 0, "members": [] },
                 { "id": 6, "name": "C", "number": 12, "last_used": 0, "members": [] },
-                { "id": 6, "name": "Duplicate", "number": null, "last_used": 0, "members": [] }
+                { "id": 6, "name": "Duplicate", "number": null, "last_used": 0,
+                  "members": [{ "bundle_id": "com.example.App", "title": "Kept" }] }
             ],
             "pinned": []
         });
         let mut cx: Contexts = serde_json::from_value(doc).unwrap();
         let numbers: Vec<_> = cx.contexts().iter().map(|c| c.number).collect();
-        assert_eq!(numbers, vec![Some(2), None, None]);
-        assert_eq!(cx.create("D").unwrap(), ContextId(7));
+        assert_eq!(numbers, vec![Some(2), None, None, None]);
+        // The duplicate id gets a fresh id and keeps its members.
+        let duplicate = cx.by_name("Duplicate").unwrap();
+        assert_eq!(duplicate.id, ContextId(7));
+        assert_eq!(records(&cx, ContextId(7)), vec![("Kept", RecordLink::Empty)]);
+        assert_eq!(cx.get(ContextId(6)).unwrap().name, "C");
+        assert_eq!(cx.create("D").unwrap(), ContextId(8));
         cx.switch_to(ContextKey::Named(ContextId(5))).unwrap();
         assert!(
             cx.last_used(ContextKey::Named(ContextId(5)))
@@ -2596,7 +2694,6 @@ mod tests {
     /// reserved, or a case variant of another. Refusing the file is also
     /// acceptable.
     #[test]
-    #[ignore = "bug: contexts.json loads empty, reserved, and case-duplicate names"]
     fn r4_loaded_names_are_unique_and_not_reserved() {
         let doc = serde_json::json!({
             "version": 1,
@@ -4120,7 +4217,6 @@ mod tests {
     /// Extreme ids and use numbers in `contexts.json` don't panic. The file
     /// is refused, or it loads with fresh unique ids and a working use order.
     #[test]
-    #[ignore = "bug: an id of u32::MAX or a last_used of u64::MAX in contexts.json overflows"]
     fn contexts_json_with_extreme_counters_never_overflows() {
         let doc = serde_json::json!({
             "version": 1,
@@ -4137,5 +4233,131 @@ mod tests {
         assert_ne!(fresh, ContextId(u32::MAX));
         cx.switch_to(named(fresh)).unwrap();
         assert!(cx.last_used(named(fresh)) > cx.last_used(named(ContextId(u32::MAX))));
+    }
+
+    /// R5: `contexts.json` loads with numbers that aren't a context number,
+    /// and drops them.
+    #[test]
+    fn contexts_json_drops_numbers_of_any_other_value() {
+        let numbers = [
+            serde_json::json!(300),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("3"),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(9),
+        ];
+        let doc = serde_json::json!({
+            "version": 1,
+            "contexts": numbers.iter().enumerate().map(|(i, number)| {
+                serde_json::json!({ "id": i + 1, "name": format!("C{i}"), "number": number })
+            }).collect::<Vec<_>>()
+        });
+        let cx: Contexts = serde_json::from_value(doc).unwrap();
+        assert_eq!(
+            cx.contexts().iter().map(|c| c.number).collect::<Vec<_>>(),
+            vec![None, None, None, None, None, Some(9)]
+        );
+    }
+
+    /// R4: in a loaded `contexts.json`, an empty, reserved, or taken name
+    /// gets a number, and the first context with a name keeps it.
+    #[test]
+    fn contexts_json_numbers_empty_reserved_and_taken_names() {
+        let names = [
+            " Work ",
+            "Comms",
+            "comms",
+            "Everything",
+            " unsorted ",
+            " ",
+            "",
+            "Café",
+            "Cafe",
+        ];
+        let doc = serde_json::json!({
+            "version": 1,
+            "contexts": names.iter().enumerate().map(|(i, name)| {
+                serde_json::json!({ "id": i + 1, "name": name })
+            }).collect::<Vec<_>>()
+        });
+        let cx: Contexts = serde_json::from_value(doc).unwrap();
+        assert_eq!(
+            context_names(&cx),
+            vec![
+                "Work",
+                "Comms",
+                "comms 2",
+                "Everything 2",
+                "unsorted 2",
+                "Context 1",
+                "Context 2",
+                "Café",
+                "Cafe 2",
+            ]
+        );
+    }
+
+    /// `contexts.json` without `next_id` and `use_seq` takes them from its
+    /// contexts.
+    #[test]
+    fn contexts_json_without_counters_takes_them_from_its_contexts() {
+        let doc = serde_json::json!({
+            "version": 1,
+            "contexts": [{ "id": 4, "name": "A", "last_used": 6 }]
+        });
+        let mut cx: Contexts = serde_json::from_value(doc).unwrap();
+        let b = cx.create("B").unwrap();
+        assert_eq!(b, ContextId(5));
+        cx.switch_to(named(b)).unwrap();
+        assert_eq!(cx.last_used(named(b)), 7);
+    }
+
+    /// Context ids stay unique after they run out at `u32::MAX`. A new
+    /// context then takes the lowest free id.
+    #[test]
+    fn context_ids_stay_unique_after_they_run_out() {
+        let doc = serde_json::json!({
+            "version": 1,
+            "next_id": u32::MAX,
+            "use_seq": 0,
+            "contexts": [
+                { "id": 1, "name": "A" },
+                { "id": u32::MAX, "name": "B" },
+                { "id": u32::MAX, "name": "C" }
+            ]
+        });
+        let mut cx: Contexts = serde_json::from_value(doc).unwrap();
+        assert_eq!(cx.create("D").unwrap(), ContextId(3));
+        let ids = |cx: &Contexts| cx.contexts().iter().map(|c| c.id.get()).collect::<Vec<_>>();
+        assert_eq!(ids(&cx), vec![1, u32::MAX, 2, 3]);
+        cx.delete(ContextId(2)).unwrap();
+        assert_eq!(cx.create("E").unwrap(), ContextId(2));
+        assert_eq!(ids(&cx), vec![1, u32::MAX, 3, 2]);
+    }
+
+    /// R19: when the use numbers run out, they are numbered again from 1 in
+    /// the same order, and the next switch is still the most recent use.
+    #[test]
+    fn r19_use_order_survives_running_out_of_use_numbers() {
+        let doc = serde_json::json!({
+            "version": 1,
+            "next_id": 4,
+            "use_seq": u64::MAX,
+            "contexts": [
+                { "id": 1, "name": "A", "last_used": u64::MAX - 1 },
+                { "id": 2, "name": "B", "last_used": u64::MAX },
+                { "id": 3, "name": "C", "last_used": 0 }
+            ]
+        });
+        let mut cx: Contexts = serde_json::from_value(doc).unwrap();
+        cx.switch_to(ContextKey::Unsorted).unwrap();
+        cx.switch_to(named(ContextId(3))).unwrap();
+        assert_eq!([1, 2, 3].map(|id| cx.last_used(named(ContextId(id)))), [1, 2, 4]);
+        assert_eq!(cx.last_used(ContextKey::Unsorted), 3);
+        assert_eq!(
+            ranked_names("", &cx, true),
+            vec!["C", "Unsorted", "B", "A", "Everything"]
+        );
     }
 }
