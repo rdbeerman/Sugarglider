@@ -1,8 +1,13 @@
 // Copyright The Glide Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#[path = "glide/context.rs"]
+mod context;
+
 use std::borrow::Borrow;
+use std::io;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -39,6 +44,9 @@ enum Command {
     Pause,
     /// Resume window management after pausing.
     Resume,
+    /// Switch between contexts, the named window sets. Experimental.
+    #[command(subcommand)]
+    Context(context::CmdContext),
 }
 
 /// Manage Glide as a system service.
@@ -97,7 +105,7 @@ struct CmdUpdate {
     watch: bool,
 }
 
-fn main() -> Result<(), anyhow::Error> {
+fn main() -> Result<ExitCode, anyhow::Error> {
     let opt: Opt = Parser::parse();
 
     // Not all commands require a client, so defer it.
@@ -123,6 +131,11 @@ fn main() -> Result<(), anyhow::Error> {
                 Response::Pong(data) => eprintln!("Got response {data}"),
                 _ => bail!("Unexpected response"),
             }
+        }
+        Command::Context(command) => {
+            let connect = || Client::new().ok();
+            let status = context::run(&command, connect, &mut io::stdout(), &mut io::stderr());
+            return Ok(ExitCode::from(status));
         }
         Command::Pause => set_enabled(make_client()?, false)?,
         Command::Resume => set_enabled(make_client()?, true)?,
@@ -185,7 +198,7 @@ fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn set_enabled(client: Client, enabled: bool) -> Result<(), anyhow::Error> {
@@ -251,6 +264,12 @@ enum ClientError {
     SerializationError(#[source] anyhow::Error),
     #[error("Sending message failed")]
     SendError(#[source] SendError),
+}
+
+impl context::Transport for Client {
+    fn request(&mut self, message: &[u8]) -> Result<Vec<u8>, SendError> {
+        self.port.send_message(0, message, TIMEOUT)
+    }
 }
 
 impl Client {

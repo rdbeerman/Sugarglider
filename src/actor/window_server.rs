@@ -219,6 +219,7 @@ impl WindowServer {
         self.sm_tx.send(space_manager::Event::ScreenParametersChanged {
             screens: screens.iter().map(|s| s.id).collect(),
             frames: screens.iter().map(|s| s.visible_frame).collect(),
+            bounds: screens.iter().map(|s| s.bounds).collect(),
             converter,
             spaces,
             scale_factors: screens.iter().map(|s| s.scale_factor).collect(),

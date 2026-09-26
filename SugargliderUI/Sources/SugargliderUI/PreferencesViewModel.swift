@@ -26,14 +26,31 @@ public enum AppBehavior: String, CaseIterable {
 
 public struct AppRule: Identifiable {
     public let id = UUID()
-    public var appName: String
-    public var bundleId: String
+    /// The app name condition. `nil` means the rule has none, which is
+    /// different from an empty string, which the file may spell.
+    public var appName: String?
+    /// The bundle id condition, as `appName`.
+    public var bundleId: String?
     public var behavior: AppBehavior
+    /// Window-rule conditions the App Rules pane doesn't show. Stored and
+    /// saved unchanged.
+    public var titleRegex: String?
+    public var titleSubstring: String?
+    public var axRole: String?
+    public var axSubrole: String?
 
-    public init(appName: String, bundleId: String, behavior: AppBehavior) {
+    public init(
+        appName: String?, bundleId: String?, behavior: AppBehavior,
+        titleRegex: String? = nil, titleSubstring: String? = nil,
+        axRole: String? = nil, axSubrole: String? = nil
+    ) {
         self.appName = appName
         self.bundleId = bundleId
         self.behavior = behavior
+        self.titleRegex = titleRegex
+        self.titleSubstring = titleSubstring
+        self.axRole = axRole
+        self.axSubrole = axSubrole
     }
 }
 
@@ -59,15 +76,25 @@ public class PreferencesViewModel: ObservableObject {
     @Published public var defaultSplitDirection: SplitDirection = .auto
     @Published public var defaultColumnWidth: Double = 400
 
+    // Experimental
+    @Published public var contextsEnable: Bool = false
+    /// Which screens a context switch changes: "global" or "per_screen".
+    @Published public var contextsScope: String = "global"
+
     // Hotkeys (read-only, loaded from config)
     @Published public var hotkeys: [HotkeyBinding] = []
 
-    /// Hotkeys grouped by category for display
+    /// Hotkeys grouped by category for display. A category missing from the
+    /// order follows the others, so that no binding is hidden.
     public var hotkeysByCategory: [(category: String, bindings: [HotkeyBinding])] {
         let grouped = Dictionary(grouping: hotkeys) { $0.category }
         // Define category order
-        let categoryOrder = ["System", "Focus", "Move", "Resize", "Layout", "Floating", "Scroll Layout", "Developer", "Utilities"]
-        return categoryOrder.compactMap { category in
+        let categoryOrder = [
+            "System", "Focus", "Move", "Resize", "Layout", "Floating", "Scroll Layout", "Contexts",
+            "Developer", "Utilities",
+        ]
+        let otherCategories = grouped.keys.filter { !categoryOrder.contains($0) }.sorted()
+        return (categoryOrder + otherCategories).compactMap { category in
             guard let bindings = grouped[category], !bindings.isEmpty else { return nil }
             return (category: category, bindings: bindings)
         }
@@ -79,22 +106,36 @@ public class PreferencesViewModel: ObservableObject {
     // Error state for UI feedback
     @Published public var lastError: String? = nil
 
+    private let backend: PreferencesBackend
     private var cancellables = Set<AnyCancellable>()
     private var isLoading = false
+    /// Set when the initial load failed. Saving stays off until a load
+    /// succeeds, so the defaults the window shows can't replace the running
+    /// config.
+    private var loadFailed = false
 
-    public init() {
+    public convenience init() {
+        self.init(backend: ConfigBridge.shared)
+    }
+
+    init(backend: PreferencesBackend) {
+        self.backend = backend
         loadFromConfig()
         setupAutoSave()
         loadLaunchAtLogin()
     }
 
     public func addAppRule() {
-        appRules.append(AppRule(appName: "New App", bundleId: "", behavior: .tile))
+        appRules.append(AppRule(appName: "New App", bundleId: nil, behavior: .tile))
     }
 
     /// Update a hotkey binding and save to config
-    public func updateHotkey(commandId: String, newKey: String) {
-        guard let index = hotkeys.firstIndex(where: { $0.commandId == commandId }) else {
+    public func updateHotkey(id: HotkeyBinding.ID, newKey: String) {
+        guard let index = hotkeys.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        if let other = rowUsing(newKey, besides: id) {
+            lastError = "\(newKey) is already assigned to \"\(other.description)\". The key was not changed."
             return
         }
 
@@ -106,9 +147,13 @@ public class PreferencesViewModel: ObservableObject {
     }
 
     /// Reset a hotkey to its default value
-    public func resetHotkeyToDefault(commandId: String) {
-        guard let index = hotkeys.firstIndex(where: { $0.commandId == commandId }),
+    public func resetHotkeyToDefault(id: HotkeyBinding.ID) {
+        guard let index = hotkeys.firstIndex(where: { $0.id == id }),
               let defaultKey = hotkeys[index].defaultKey else {
+            return
+        }
+        if let other = rowUsing(defaultKey, besides: id) {
+            lastError = "\(defaultKey) is already assigned to \"\(other.description)\". The key was not changed."
             return
         }
 
@@ -119,6 +164,13 @@ public class PreferencesViewModel: ObservableObject {
         saveToConfig()
     }
 
+    /// The other row that already uses `key`, if any. The window refuses a
+    /// key that another row uses, because two rows with one hotkey abort the
+    /// window manager when it registers them.
+    private func rowUsing(_ key: String, besides id: HotkeyBinding.ID) -> HotkeyBinding? {
+        hotkeys.first { $0.id != id && $0.key == key }
+    }
+
     // MARK: - Config Loading
 
     private func loadFromConfig() {
@@ -126,11 +178,13 @@ public class PreferencesViewModel: ObservableObject {
         defer { isLoading = false }
 
         do {
-            let config = try ConfigBridge.shared.loadConfig()
+            let config = try backend.loadConfig()
+            loadFailed = false
             applyConfig(config)
         } catch {
+            loadFailed = true
+            lastError = error.localizedDescription
             print("Failed to load config: \(error)")
-            // Use defaults - they're already set
         }
     }
 
@@ -147,6 +201,9 @@ public class PreferencesViewModel: ObservableObject {
         // Map layout kind: "scroll" -> .column, "tree" -> .tree
         defaultLayout = config.defaultLayoutKind == "scroll" ? .column : .tree
 
+        contextsEnable = config.contextsEnable
+        contextsScope = config.contextsScope ?? "global"
+
         // Load hotkeys
         hotkeys = config.hotkeys
 
@@ -159,9 +216,13 @@ public class PreferencesViewModel: ObservableObject {
             default: behavior = .tile
             }
             return AppRule(
-                appName: rule.appName ?? "",
-                bundleId: rule.bundleId ?? "",
-                behavior: behavior
+                appName: rule.appName,
+                bundleId: rule.bundleId,
+                behavior: behavior,
+                titleRegex: rule.titleRegex,
+                titleSubstring: rule.titleSubstring,
+                axRole: rule.axRole,
+                axSubrole: rule.axSubrole
             )
         }
     }
@@ -180,6 +241,8 @@ public class PreferencesViewModel: ObservableObject {
             $dragDropEnable.map { _ in () }.eraseToAnyPublisher(),
             $dragDropLivePreview.map { _ in () }.eraseToAnyPublisher(),
             $defaultLayout.map { _ in () }.eraseToAnyPublisher(),
+            $contextsEnable.map { _ in () }.eraseToAnyPublisher(),
+            $contextsScope.map { _ in () }.eraseToAnyPublisher(),
             $appRules.map { _ in () }.eraseToAnyPublisher(),
         ]
 
@@ -196,13 +259,19 @@ public class PreferencesViewModel: ObservableObject {
     // MARK: - Config Saving
 
     public func saveToConfig() {
+        guard !loadFailed else {
+            // The window's values are defaults and its key list is empty,
+            // because the initial load failed. Saving either would replace
+            // the running config and the file with them.
+            return
+        }
         let config = buildConfig()
 
         do {
-            // Update running window manager immediately
-            try ConfigBridge.shared.updateConfig(config)
-            // Persist to file
-            try ConfigBridge.shared.saveConfigToFile(config)
+            // Write the file first. The running app changes only after the
+            // write succeeds, so a failed save can't leave the two apart.
+            try backend.saveConfigToFile(config)
+            try backend.updateConfig(config)
             lastError = nil
         } catch {
             lastError = error.localizedDescription
@@ -222,11 +291,17 @@ public class PreferencesViewModel: ObservableObject {
             dragDropLivePreview: dragDropLivePreview,
             // Map layout mode: .column -> "scroll", .tree -> "tree"
             defaultLayoutKind: defaultLayout == .column ? "scroll" : "tree",
+            contextsEnable: contextsEnable,
+            contextsScope: contextsScope,
             windowRules: appRules.map { rule in
                 WindowRuleJson(
-                    appName: rule.appName.isEmpty ? nil : rule.appName,
-                    bundleId: rule.bundleId.isEmpty ? nil : rule.bundleId,
-                    behavior: rule.behavior.rawValue.lowercased()
+                    appName: rule.appName,
+                    bundleId: rule.bundleId,
+                    behavior: rule.behavior.rawValue.lowercased(),
+                    titleRegex: rule.titleRegex,
+                    titleSubstring: rule.titleSubstring,
+                    axRole: rule.axRole,
+                    axSubrole: rule.axSubrole
                 )
             },
             hotkeys: hotkeys

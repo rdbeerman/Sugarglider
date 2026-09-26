@@ -1,7 +1,7 @@
 // Copyright The Glide Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::{iter, mem};
 
 use objc2_core_foundation::{CGRect, CGSize};
@@ -10,7 +10,7 @@ use tracing::warn;
 
 use super::selection::Selection;
 use super::size::{ContainerKind, Direction, Masses, Size};
-use super::tree::{self, Tree};
+use super::tree::{self, StashPosition, Tree};
 use super::window::Window;
 use crate::actor::app::{WindowId, pid_t};
 use crate::config::Config;
@@ -34,6 +34,24 @@ pub struct LayoutTree {
     layout_roots: slotmap::SlotMap<LayoutId, OwnedNode>,
     #[serde(default)]
     layout_kinds: slotmap::SecondaryMap<LayoutId, LayoutKind>,
+    /// Nodes taken out of a layout so its gap closes, kept for the window's
+    /// return. A window that left a layout for another screen comes back to
+    /// the place it held there.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    stashed: HashMap<(LayoutId, WindowId), StashedNode>,
+}
+
+/// A node kept out of its layout, with the place it will return to.
+#[derive(Serialize, Deserialize)]
+struct StashedNode {
+    node: OwnedNode,
+    /// The weight the node had in its parent.
+    weight: f32,
+    /// The parent it was under, and its neighbors, which may be gone by the
+    /// time the window returns.
+    parent: NodeId,
+    prev: Option<NodeId>,
+    next: Option<NodeId>,
 }
 
 slotmap::new_key_type! {
@@ -46,6 +64,7 @@ impl LayoutTree {
             tree: Tree::with_observer(Components::default()),
             layout_roots: Default::default(),
             layout_kinds: Default::default(),
+            stashed: Default::default(),
         }
     }
 
@@ -71,6 +90,7 @@ impl LayoutTree {
     }
 
     pub fn remove_layout(&mut self, layout: LayoutId) {
+        self.drop_stashes(|other, _| other == layout);
         self.layout_roots.remove(layout).unwrap().remove(&mut self.tree);
         self.layout_kinds.remove(layout);
     }
@@ -119,6 +139,9 @@ impl LayoutTree {
         new_column: bool,
         visible_columns: u32,
     ) -> NodeId {
+        if let Some(node) = self.unstash_window(layout, wid) {
+            return node;
+        }
         let root = self.root(layout);
         let selection = self.selection(layout);
         let weight = 1.0 / visible_columns.max(1) as f32;
@@ -208,6 +231,9 @@ impl LayoutTree {
     }
 
     pub fn add_window_under(&mut self, layout: LayoutId, parent: NodeId, wid: WindowId) -> NodeId {
+        if let Some(node) = self.unstash_window(layout, wid) {
+            return node;
+        }
         debug_assert_eq!(
             parent.ancestors(self.map()).last(),
             Some(self.root(layout)),
@@ -219,6 +245,9 @@ impl LayoutTree {
     }
 
     pub fn add_window_after(&mut self, layout: LayoutId, sibling: NodeId, wid: WindowId) -> NodeId {
+        if let Some(node) = self.unstash_window(layout, wid) {
+            return node;
+        }
         if sibling.parent(self.map()).is_none() {
             // Don't attempt to add next to the root node.
             return self.add_window_under(layout, sibling, wid);
@@ -289,18 +318,21 @@ impl LayoutTree {
     }
 
     pub fn remove_window_from(&mut self, layout: LayoutId, wid: WindowId) {
+        self.drop_stashes(|other, other_wid| other == layout && other_wid == wid);
         if let Some(node) = self.window_node(layout, wid) {
             node.detach(&mut self.tree).remove();
         }
     }
 
     pub fn remove_window(&mut self, wid: WindowId) {
+        self.drop_stashes(|_, other| other == wid);
         for node in self.tree.data.window.take_nodes_for(wid) {
             node.detach(&mut self.tree).remove();
         }
     }
 
     pub fn remove_windows_for_app(&mut self, pid: pid_t) {
+        self.drop_stashes(|_, wid| wid.pid == pid);
         for (_, node) in self.tree.data.window.take_nodes_for_app(pid) {
             node.detach(&mut self.tree).remove();
         }
@@ -365,6 +397,94 @@ impl LayoutTree {
             .window
             .nodes_for(wid)
             .find(|node| node.ancestors(self.map()).last() == Some(root))
+    }
+
+    /// Takes the window's node out of `layout`, so that the layout closes its
+    /// gap, but keeps the node and its place. The window returns there when
+    /// it is added to the layout again. Returns false when the layout has no
+    /// node for the window.
+    ///
+    /// When the node is the only child of its parent, the parent is taken
+    /// out too, and so on up to the root, so that the window returns inside
+    /// the same arrangement. The layouts of a whole Space are stashed when a
+    /// window moves to another screen (R8, R9).
+    pub fn stash_window(&mut self, layout: LayoutId, wid: WindowId) -> bool {
+        let Some(node) = self.window_node(layout, wid) else {
+            return false;
+        };
+        let root = self.root(layout);
+        // The highest ancestor that would be culled with the node.
+        let mut top = node;
+        while let Some(parent) = top.parent(self.map()) {
+            if parent == root
+                || parent.first_child(self.map()) != Some(top)
+                || parent.last_child(self.map()) != Some(top)
+            {
+                break;
+            }
+            top = parent;
+        }
+        let parent = top.parent(self.map());
+        let prev = top.prev_sibling(self.map());
+        let next = top.next_sibling(self.map());
+        let Some(parent) = parent else { return false };
+        let weight = self.tree.data.size.weight(top);
+        let node = OwnedNode::stash(&mut self.tree, top, "stashed window");
+        self.stashed.insert(
+            (layout, wid),
+            StashedNode {
+                node,
+                weight,
+                parent,
+                prev,
+                next,
+            },
+        );
+        true
+    }
+
+    /// Whether the window holds a place in `layout` while it is away.
+    pub fn window_is_stashed(&self, layout: LayoutId, wid: WindowId) -> bool {
+        self.stashed.contains_key(&(layout, wid))
+    }
+
+    /// Puts the window's stashed node back into `layout`, at the place it
+    /// held when it left, as far as that place still exists. Does nothing
+    /// when the window has no stash in the layout.
+    pub fn unstash_window(&mut self, layout: LayoutId, wid: WindowId) -> Option<NodeId> {
+        let stashed = self.stashed.remove(&(layout, wid))?;
+        let root = self.root(layout);
+        let alive = |node: NodeId| {
+            self.tree.map.contains(node) && node.ancestors(self.map()).last() == Some(root)
+        };
+        let position = if let Some(prev) = stashed.prev.filter(|&prev| alive(prev)) {
+            StashPosition::After(prev)
+        } else if let Some(next) = stashed.next.filter(|&next| alive(next)) {
+            StashPosition::Before(next)
+        } else if alive(stashed.parent) {
+            StashPosition::LastChild(stashed.parent)
+        } else {
+            StashPosition::LastChild(root)
+        };
+        let mut node = stashed.node;
+        let id = node.reattach(&mut self.tree, position);
+        self.tree.data.size.set_weight(id, stashed.weight, &self.tree.map);
+        Some(id)
+    }
+
+    /// Drops the stashes that `filter` names, removing their nodes for good.
+    fn drop_stashes(&mut self, mut filter: impl FnMut(LayoutId, WindowId) -> bool) {
+        let keys: Vec<(LayoutId, WindowId)> = self
+            .stashed
+            .keys()
+            .copied()
+            .filter(|&(layout, wid)| filter(layout, wid))
+            .collect();
+        for key in keys {
+            if let Some(mut stashed) = self.stashed.remove(&key) {
+                stashed.node.remove(&mut self.tree);
+            }
+        }
     }
 
     /// Whether the window is in any layout.
@@ -1243,6 +1363,10 @@ impl Drop for LayoutTree {
         for (_, node) in self.layout_roots.drain() {
             // It's okay to skip removing these, since we're dropping the map too.
             mem::forget(node);
+        }
+        for (_, stashed) in self.stashed.drain() {
+            // The stashed nodes go with the map too.
+            mem::forget(stashed.node);
         }
     }
 }

@@ -1,0 +1,45 @@
+{
+  "animate": false,
+  "contextsEnable": true,
+  "defaultLayoutKind": "tree",
+  "dragDropEnable": true,
+  "dragDropLivePreview": false,
+  "focusFollowsMouse": true,
+  "hotkeys": [
+    {
+      "category": "System",
+      "command": "\"toggle_global_enabled\"",
+      "defaultKey": "⌥Z",
+      "description": "Toggle tiling globally",
+      "key": "⌥Z"
+    },
+    {
+      "category": "Focus",
+      "command": "{\"move_focus\":\"left\"}",
+      "defaultKey": "⌃⌥⇧←",
+      "description": "Focus left",
+      "key": "⌃⌥⇧H"
+    },
+    {
+      "category": "Utilities",
+      "command": "{\"exec\":\"open -a Terminal\"}",
+      "description": "Execute command",
+      "key": "⌥T"
+    }
+  ],
+  "innerGap": 4,
+  "mouseFollowsFocus": false,
+  "outerGap": 8,
+  "statusIconEnable": true,
+  "windowRules": [
+    {
+      "appName": "Finder",
+      "behavior": "float",
+      "bundleId": "com.apple.finder"
+    },
+    {
+      "appName": "Calculator",
+      "behavior": "float"
+    }
+  ]
+}

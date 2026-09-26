@@ -26,6 +26,10 @@ test = false
 name = "sugarglider"
 path = "src/bin/glide.rs"
 
+[[example]]
+name = "devtool"
+test = true
+
 # We don't have a need for unwinding, and aborting means we don't have to worry
 # about propagating panics to the main CFRunLoop thread.
 #
@@ -52,6 +56,7 @@ swift-ui = []
 exec_cmd = []
 
 [dependencies]
+arc-swap = "1.9.2"
 accessibility = { version = "0.4.0", git = "https://github.com/tmandry/accessibility", branch = "objc2-migration" }
 accessibility-sys = { version = "0.3.0", git = "https://github.com/tmandry/accessibility", branch = "objc2-migration" }
 anyhow = "1.0.83"
@@ -144,7 +149,7 @@ static_assertions = "1.1.0"
 tokio = { version = "1.35.1", features = ["macros", "sync"] }
 tokio-stream = "0.1.16"
 tokio-util = "0.7.15"
-toml = "0.9.2"
+toml = { version = "0.9.2", features = ["preserve_order"] }
 toml_edit = "0.22"
 tracing = "0.1.40"
 tracing-appender = { version = "0.2.4" }

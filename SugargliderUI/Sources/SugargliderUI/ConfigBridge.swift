@@ -23,6 +23,12 @@ public struct PreferencesConfig: Codable {
     // Layout settings
     public var defaultLayoutKind: String
 
+    // Experimental features
+    public var contextsEnable: Bool
+    /// Which screens a context switch changes: "global" or "per_screen".
+    /// Optional for Preferences payloads that omit the key.
+    public var contextsScope: String?
+
     // Window rules
     public var windowRules: [WindowRuleJson]
 
@@ -39,6 +45,8 @@ public struct PreferencesConfig: Codable {
         dragDropEnable: Bool = true,
         dragDropLivePreview: Bool = true,
         defaultLayoutKind: String = "tree",
+        contextsEnable: Bool = false,
+        contextsScope: String? = nil,
         windowRules: [WindowRuleJson] = [],
         hotkeys: [HotkeyBinding] = []
     ) {
@@ -51,6 +59,8 @@ public struct PreferencesConfig: Codable {
         self.dragDropEnable = dragDropEnable
         self.dragDropLivePreview = dragDropLivePreview
         self.defaultLayoutKind = defaultLayoutKind
+        self.contextsEnable = contextsEnable
+        self.contextsScope = contextsScope
         self.windowRules = windowRules
         self.hotkeys = hotkeys
     }
@@ -58,13 +68,15 @@ public struct PreferencesConfig: Codable {
 
 /// Hotkey binding from the configuration.
 public struct HotkeyBinding: Codable, Identifiable, Equatable {
-    public var id: String { "\(key)-\(commandId)" }
+    /// Identifies the binding while the Preferences window is open. Two
+    /// bindings can have the same command, key, and description.
+    public var id = UUID()
 
     /// The formatted hotkey string (e.g., "⌥H")
     public var key: String
 
-    /// The command identifier for internal use
-    public var commandId: String
+    /// The bound command, as Rust encodes it. Sent back unchanged.
+    public var command: String
 
     /// Human-readable description of what the command does
     public var description: String
@@ -81,12 +93,20 @@ public struct HotkeyBinding: Codable, Identifiable, Equatable {
         return key != defaultKey
     }
 
-    public init(key: String, commandId: String, description: String, category: String, defaultKey: String? = nil) {
+    public init(key: String, command: String, description: String, category: String, defaultKey: String? = nil) {
         self.key = key
-        self.commandId = commandId
+        self.command = command
         self.description = description
         self.category = category
         self.defaultKey = defaultKey
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case key
+        case command
+        case description
+        case category
+        case defaultKey
     }
 }
 
@@ -96,21 +116,50 @@ public struct WindowRuleJson: Codable, Identifiable {
     public var appName: String?
     public var bundleId: String?
     public var behavior: String
+    /// Conditions that the App Rules pane doesn't show. Stored and sent back
+    /// unchanged, so a save keeps them.
+    public var titleRegex: String?
+    public var titleSubstring: String?
+    public var axRole: String?
+    public var axSubrole: String?
 
-    public init(appName: String? = nil, bundleId: String? = nil, behavior: String = "tile") {
+    public init(
+        appName: String? = nil, bundleId: String? = nil, behavior: String = "tile",
+        titleRegex: String? = nil, titleSubstring: String? = nil,
+        axRole: String? = nil, axSubrole: String? = nil
+    ) {
         self.appName = appName
         self.bundleId = bundleId
         self.behavior = behavior
+        self.titleRegex = titleRegex
+        self.titleSubstring = titleSubstring
+        self.axRole = axRole
+        self.axSubrole = axSubrole
     }
 
     enum CodingKeys: String, CodingKey {
         case appName
         case bundleId
         case behavior
+        case titleRegex
+        case titleSubstring
+        case axRole
+        case axSubrole
     }
 }
 
 // MARK: - Config Bridge
+
+/// What the Preferences window needs from Rust.
+@MainActor
+protocol PreferencesBackend: AnyObject {
+    /// Loads the configuration of the running window manager.
+    func loadConfig() throws -> PreferencesConfig
+    /// Applies the configuration to the running window manager.
+    func updateConfig(_ config: PreferencesConfig) throws
+    /// Saves the configuration to the config file.
+    func saveConfigToFile(_ config: PreferencesConfig) throws
+}
 
 /// Error types for config operations.
 public enum ConfigBridgeError: LocalizedError {
@@ -124,7 +173,8 @@ public enum ConfigBridgeError: LocalizedError {
         switch self {
         case .loadFailed(let msg): return "Failed to load config: \(msg)"
         case .updateFailed(let msg): return "Failed to update config: \(msg)"
-        case .saveFailed(let msg): return "Failed to save config: \(msg)"
+        // Rust's message says that saving failed.
+        case .saveFailed(let msg): return msg
         case .encodingFailed(let msg): return "Failed to encode config: \(msg)"
         case .decodingFailed(let msg): return "Failed to decode config: \(msg)"
         }
@@ -133,7 +183,7 @@ public enum ConfigBridgeError: LocalizedError {
 
 /// Bridge for communicating config changes with the Rust backend.
 @MainActor
-public final class ConfigBridge {
+public final class ConfigBridge: PreferencesBackend {
     public static let shared = ConfigBridge()
 
     private init() {}

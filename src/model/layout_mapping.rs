@@ -36,6 +36,12 @@ impl SpaceLayoutMapping {
             LayoutKind::Tree => tree.create_layout(),
             LayoutKind::Scroll => tree.create_scroll_layout(),
         };
+        Self::from_layout(size, layout)
+    }
+
+    /// Creates a mapping that owns `layout`, a layout that no other mapping
+    /// uses, with a reference count of 1.
+    pub fn from_layout(size: CGSize, layout: LayoutId) -> Self {
         SpaceLayoutMapping {
             active_size: size.into(),
             active_save_state: SaveState::Unretained,
@@ -208,6 +214,26 @@ mod tests {
         mapping.activate_size(SIZE_3, &mut tree);
         assert_eq!(mapping.active_layout(), layout1);
         assert_eq!(tree.layouts().len(), 1);
+    }
+
+    #[test]
+    fn from_layout_owns_the_given_layout() {
+        let mut tree = LayoutTree::new();
+        let layout = tree.create_layout();
+        let mut mapping = SpaceLayoutMapping::from_layout(SIZE_1, layout);
+        assert_eq!(mapping.active_layout(), layout);
+        assert_eq!(mapping.layouts[&layout], 1);
+
+        // The layout is not shared, so modifying it doesn't clone it.
+        assert_eq!(mapping.prepare_modify(&mut tree), layout);
+        assert_eq!(tree.layouts().len(), 1);
+
+        // It is remembered for its size like any other layout.
+        mapping.activate_size(SIZE_2, &mut tree);
+        let layout2 = mapping.prepare_modify(&mut tree);
+        assert_ne!(layout2, layout);
+        mapping.activate_size(SIZE_1, &mut tree);
+        assert_eq!(mapping.active_layout(), layout);
     }
 
     #[test]

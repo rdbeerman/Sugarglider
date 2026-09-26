@@ -15,6 +15,7 @@ use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use indexmap::IndexMap;
 use livesplit_hotkey::Hotkey;
 use macro_rules_attribute::derive;
 use partial::{PartialConfig, ValidationError};
@@ -24,6 +25,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::actor::wm_controller::WmCommand;
 use crate::model::LayoutKind;
+use crate::model::contexts::Scope;
+use crate::ui::preferences_json::{WindowRuleJson, command_json};
 
 pub fn data_dir() -> PathBuf {
     dirs::home_dir().unwrap().join(".glide")
@@ -31,6 +34,14 @@ pub fn data_dir() -> PathBuf {
 
 pub fn restore_file() -> PathBuf {
     data_dir().join("layout.ron")
+}
+
+pub fn parked_journal_file() -> PathBuf {
+    data_dir().join("parked.json")
+}
+
+pub fn contexts_file() -> PathBuf {
+    data_dir().join("contexts.json")
 }
 
 pub fn config_path() -> PathBuf {
@@ -68,7 +79,9 @@ pub struct Config {
 struct ConfigPartial {
     settings: SettingsPartial,
     window_rules: Option<Vec<WindowRule>>,
-    keys: Option<FxHashMap<String, WmCommandOrDisable>>,
+    /// The `[keys]` table in the order the file writes it, so that two
+    /// spellings of one hotkey can resolve to the last one.
+    keys: Option<IndexMap<String, WmCommandOrDisable>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -198,6 +211,20 @@ pub struct Experimental {
     pub status_icon: StatusIconExperimental,
     #[derive_args(ScrollConfigPartial)]
     pub scroll: ScrollConfig,
+    #[derive_args(ContextsConfigPartial)]
+    pub contexts: ContextsConfig,
+}
+
+#[derive(PartialConfig!)]
+#[derive_args(ContextsConfigPartial)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ContextsConfig {
+    /// Named window sets that the user switches between.
+    pub enable: bool,
+    /// "global": a switch changes every screen. "per_screen": only the
+    /// focused screen, and the target's members come along (R7, R8, R11).
+    pub scope: Scope,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
@@ -396,19 +423,22 @@ impl ConfigPartial {
     }
 
     fn validate(self) -> Result<Config, SpannedError> {
-        let mut keys = Vec::new();
+        let mut keys: Vec<(Hotkey, WmCommand)> = Vec::new();
         for (key, cmd) in self.keys.unwrap_or_default() {
             let cmd = match cmd {
                 WmCommandOrDisable::WmCommand(wm_command) => wm_command,
                 WmCommandOrDisable::Disable(_) => continue,
             };
-            let Ok(key) = Hotkey::from_str(&key) else {
+            let Ok(hotkey) = Hotkey::from_str(&key) else {
                 return Err(SpannedError {
                     message: format!("Could not parse hotkey: {key}"),
                     span: None,
                 });
             };
-            keys.push((key, cmd));
+            // "Alt + T" and "Alt + KeyT" name the same hotkey; the last
+            // entry wins, as in a TOML table.
+            keys.retain(|(bound, _)| *bound != hotkey);
+            keys.push((hotkey, cmd));
         }
         Ok(Config {
             settings: self.settings.validate()?,
@@ -425,7 +455,13 @@ impl ConfigPartial {
         } else {
             Default::default()
         };
-        keys.extend(high.keys.unwrap_or_default());
+        for (key, cmd) in high.keys.unwrap_or_default() {
+            // "Alt + T" and "Alt + KeyT" name the same hotkey.
+            if let Ok(hotkey) = Hotkey::from_str(&key) {
+                keys.retain(|low_key, _| Hotkey::from_str(low_key) != Ok(hotkey));
+            }
+            keys.insert(key, cmd);
+        }
         Self {
             settings: SettingsPartial::merge(low.settings, high.settings),
             window_rules: high.window_rules.or(low.window_rules),
@@ -458,7 +494,10 @@ impl Config {
             }
         };
         file.read_to_string(&mut buf)?;
-        Self::parse(&buf).map_err(|e| anyhow::anyhow!("{}", format_toml_error(e, &buf, &path)))
+        Self::parse(&buf).map_err(|e| {
+            let renderer = annotate_snippets::Renderer::styled();
+            anyhow::anyhow!("{}", format_toml_error(e, &buf, &path, renderer))
+        })
     }
 
     pub fn default() -> Config {
@@ -472,8 +511,13 @@ impl Config {
     }
 }
 
-fn format_toml_error(error: SpannedError, input: &str, path: &Path) -> String {
-    use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
+fn format_toml_error(
+    error: SpannedError,
+    input: &str,
+    path: &Path,
+    renderer: annotate_snippets::Renderer,
+) -> String {
+    use annotate_snippets::{AnnotationKind, Level, Snippet};
 
     let message = error.message;
     let Some(span) = error.span else {
@@ -486,7 +530,6 @@ fn format_toml_error(error: SpannedError, input: &str, path: &Path) -> String {
 
     let report = Level::ERROR.primary_title("could not parse config").element(snippet);
 
-    let renderer = Renderer::styled();
     format!("{}", renderer.render(&[report]))
 }
 
@@ -518,25 +561,46 @@ impl From<ValidationError> for SpannedError {
 ///
 /// This function reads the existing config file (if present), updates the
 /// relevant settings, and writes it back. It preserves user comments and
-/// formatting where possible.
+/// formatting where possible. A config file with an error is left unchanged,
+/// and the error says what is wrong.
 pub fn write_preferences_to_file(
     prefs: &crate::ui::preferences_json::PreferencesJson,
 ) -> anyhow::Result<PathBuf> {
+    let path = config_path();
+    write_preferences_to_path(prefs, &path)?;
+    Ok(path)
+}
+
+/// Write preferences to the config file at `path`, as
+/// [`write_preferences_to_file`] does.
+fn write_preferences_to_path(
+    prefs: &crate::ui::preferences_json::PreferencesJson,
+    path: &Path,
+) -> anyhow::Result<()> {
     use std::fs;
     use std::io::Write;
 
+    use annotate_snippets::Renderer;
     use toml_edit::{DocumentMut, value};
 
-    let path = config_path();
-
-    // Load existing config or create empty document
-    let existing = if path.exists() {
-        fs::read_to_string(&path)?
-    } else {
-        String::new()
+    let existing = match fs::read_to_string(path) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
     };
-
-    let mut doc: DocumentMut = existing.parse().unwrap_or_default();
+    let has_error = |error: String| {
+        anyhow::anyhow!(
+            "{} has an error, so it was not changed.\n\n{error}",
+            path.display()
+        )
+    };
+    // toml_edit reads TOML 1.0 and the config reader TOML 1.1, so a file can
+    // pass one and fail the other.
+    let current_config = Config::parse(&existing)
+        .map_err(|e| has_error(format_toml_error(e, &existing, path, Renderer::plain())))?;
+    let mut doc = existing
+        .parse::<DocumentMut>()
+        .map_err(|e| has_error(e.to_string().trim_end().to_owned()))?;
 
     // Ensure [settings] table exists
     if !doc.contains_key("settings") {
@@ -557,103 +621,95 @@ pub fn write_preferences_to_file(
     }
     doc["settings"]["status_icon"]["enable"] = value(prefs.status_icon_enable);
 
-    // Update window_rules as an array of tables
-    let mut rules_array = toml_edit::ArrayOfTables::new();
-    for rule in &prefs.window_rules {
-        let mut table = toml_edit::Table::new();
+    // Ensure [settings.drag_drop] table exists. Indexing a missing key would
+    // create an inline table.
+    if let Some(settings) = doc["settings"].as_table_mut() {
+        let mut drag_drop = toml_edit::Table::new();
+        drag_drop.set_dotted(settings.is_dotted());
+        settings.entry("drag_drop").or_insert(toml_edit::Item::Table(drag_drop));
+    }
+    doc["settings"]["drag_drop"]["enable"] = value(prefs.drag_drop_enable);
+    doc["settings"]["drag_drop"]["live_preview"] = value(prefs.drag_drop_live_preview);
 
-        // Build the 'if' conditions table
-        let mut conditions = toml_edit::Table::new();
-        if let Some(ref app_id) = rule.bundle_id {
-            if !app_id.is_empty() {
+    // Ensure [settings.experimental.contexts] table exists. Indexing a missing
+    // key would create an inline table.
+    if let Some(settings) = doc["settings"].as_table_mut() {
+        let experimental = settings.entry("experimental").or_insert_with(|| {
+            let mut experimental = toml_edit::Table::new();
+            experimental.set_implicit(true);
+            toml_edit::Item::Table(experimental)
+        });
+        if let Some(experimental) = experimental.as_table_mut() {
+            let mut contexts = toml_edit::Table::new();
+            contexts.set_dotted(experimental.is_dotted());
+            experimental.entry("contexts").or_insert(toml_edit::Item::Table(contexts));
+        }
+    }
+    doc["settings"]["experimental"]["contexts"]["enable"] = value(prefs.contexts_enable);
+    if let Some(scope) = prefs.contexts_scope {
+        let scope = match scope {
+            Scope::Global => "global",
+            Scope::PerScreen => "per_screen",
+        };
+        doc["settings"]["experimental"]["contexts"]["scope"] = value(scope);
+    }
+
+    // Update window_rules only when the window changed them. The window
+    // carries every condition through, but the comments and the rest of a
+    // rule's table are not in the JSON, so an unchanged list leaves the
+    // document's rules as they are.
+    let window_rules: Vec<WindowRule> =
+        prefs.window_rules.iter().filter_map(WindowRuleJson::to_rule).collect();
+    if window_rules != current_config.window_rules {
+        let mut rules_array = toml_edit::ArrayOfTables::new();
+        for rule in &window_rules {
+            let mut table = toml_edit::Table::new();
+
+            // Build the 'if' conditions table
+            let mut conditions = toml_edit::Table::new();
+            // An empty string is a condition too, so it is written as it
+            // stands: dropping it would widen the rule.
+            if let Some(ref app_id) = rule.conditions.app_id {
                 conditions["app_id"] = value(app_id);
             }
-        }
-        if let Some(ref app_name) = rule.app_name {
-            if !app_name.is_empty() {
+            if let Some(ref app_name) = rule.conditions.app_name {
                 conditions["app_name"] = value(app_name);
             }
-        }
-        if !conditions.is_empty() {
-            table["if"] = toml_edit::Item::Table(conditions);
+            if let Some(ref title_regex) = rule.conditions.title_regex {
+                conditions["title_regex"] = value(title_regex.as_str());
+            }
+            if let Some(ref title_substring) = rule.conditions.title_substring {
+                conditions["title_substring"] = value(title_substring);
+            }
+            if let Some(ref ax_role) = rule.conditions.ax_role {
+                conditions["ax_role"] = value(ax_role);
+            }
+            if let Some(ref ax_subrole) = rule.conditions.ax_subrole {
+                conditions["ax_subrole"] = value(ax_subrole);
+            }
+            if !conditions.is_empty() {
+                table["if"] = toml_edit::Item::Table(conditions);
+            }
+
+            table["float"] = value(rule.float);
+            rules_array.push(table);
         }
 
-        table["float"] = value(rule.behavior == "float");
-        rules_array.push(table);
+        if !rules_array.is_empty() {
+            doc["window_rules"] = toml_edit::Item::ArrayOfTables(rules_array);
+        } else if doc.contains_key("window_rules") {
+            doc.remove("window_rules");
+        }
     }
 
-    if !rules_array.is_empty() {
-        doc["window_rules"] = toml_edit::Item::ArrayOfTables(rules_array);
-    } else if doc.contains_key("window_rules") {
-        doc.remove("window_rules");
-    }
-
-    // Update [keys] section
-    // We need to convert macOS symbol format back to TOML format
-    if !prefs.hotkeys.is_empty() {
-        // Build a new keys table
-        let mut keys_table = toml_edit::Table::new();
-
-        // Build command serializations from BOTH default config AND current loaded config.
-        // This ensures we have serializations for all standard commands (from defaults)
-        // plus any custom commands like `exec` (from the loaded config).
-        let default_config = Config::default();
-        let current_config = Config::load(None).unwrap_or_else(|_| Config::default());
-
-        let mut command_serializations: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-
-        // Add all commands from the default config first
-        for (_hotkey, cmd) in &default_config.keys {
-            let (_, _, command_id) = crate::ui::preferences_json::describe_command_for_toml(cmd);
-            if let Ok(serialized) = serde_json::to_string(cmd) {
-                command_serializations.insert(command_id, serialized);
-            }
-        }
-
-        // Override/extend with commands from the current config (for custom exec commands, etc.)
-        for (_hotkey, cmd) in &current_config.keys {
-            let (_, _, command_id) = crate::ui::preferences_json::describe_command_for_toml(cmd);
-            if let Ok(serialized) = serde_json::to_string(cmd) {
-                command_serializations.insert(command_id, serialized);
-            }
-        }
-
-        for hk in &prefs.hotkeys {
-            // Convert macOS symbol format to TOML key format
-            let toml_key = macos_symbols_to_toml_key(&hk.key);
-
-            // Validate that the hotkey can actually be parsed before writing.
-            // This prevents writing invalid keys that will fail to load on restart.
-            if Hotkey::from_str(&toml_key).is_err() {
-                tracing::warn!(
-                    "Skipping invalid hotkey format for {}: '{}' (converted from '{}')",
-                    hk.command_id,
-                    toml_key,
-                    hk.key
-                );
-                continue;
-            }
-
-            // Get the command serialization for this command_id
-            if let Some(cmd_json) = command_serializations.get(&hk.command_id) {
-                // Parse the command JSON and convert to TOML value
-                if let Ok(cmd_value) = serde_json::from_str::<serde_json::Value>(cmd_json) {
-                    let toml_value = json_to_toml_value(&cmd_value);
-                    keys_table[&toml_key] = toml_value;
-                }
-            } else {
-                tracing::warn!(
-                    "Unknown command_id '{}' for hotkey '{}', skipping",
-                    hk.command_id,
-                    hk.key
-                );
-            }
-        }
-
-        if !keys_table.is_empty() {
-            doc["keys"] = toml_edit::Item::Table(keys_table);
-        }
+    // Update [keys] section, only when a binding changed. No bindings at all
+    // means that the window has none to show, not that the user removed them.
+    let bindings = prefs.bindings();
+    if !bindings.is_empty() && sorted_bindings(&bindings) != sorted_bindings(&current_config.keys) {
+        let file_keys = keys_in_file(&existing)?;
+        let default_keys = current_config.settings.default_keys;
+        let entries = keys_entries(&bindings, default_keys, &file_keys);
+        set_keys_table(&mut doc, &file_keys, entries);
     }
 
     // Ensure parent directory exists
@@ -664,68 +720,102 @@ pub fn write_preferences_to_file(
     // Write atomically using a temp file
     let tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
     write!(tmp.as_file(), "{}", doc)?;
-    tmp.persist(&path)?;
+    tmp.persist(path)?;
 
-    Ok(path)
+    Ok(())
 }
 
-/// Convert macOS symbol hotkey format (⌥⇧H) to TOML key format (Alt + Shift + KeyH).
-fn macos_symbols_to_toml_key(s: &str) -> String {
-    let mut modifiers = Vec::new();
-    let mut key_part = String::new();
+/// The entries under `[keys]` in a config file, by the key as the file
+/// spells it, each with its value as JSON.
+fn keys_in_file(file: &str) -> anyhow::Result<FxHashMap<String, serde_json::Value>> {
+    let keys = toml::from_str::<ConfigPartial>(file)?.keys.unwrap_or_default();
+    let keys = keys.into_iter().map(|(key, entry)| Ok((key, serde_json::to_value(entry)?)));
+    keys.collect()
+}
 
-    for c in s.chars() {
-        match c {
-            '⌃' => modifiers.push("Ctrl"),
-            '⌥' => modifiers.push("Alt"),
-            '⇧' => modifiers.push("Shift"),
-            '⌘' => modifiers.push("Cmd"),
-            _ => key_part.push(c),
-        }
-    }
+/// Key bindings as sorted pairs of a key and a command, for comparison.
+fn sorted_bindings(bindings: &[(Hotkey, WmCommand)]) -> Vec<(String, String)> {
+    let mut bindings: Vec<_> = bindings
+        .iter()
+        .map(|(hotkey, cmd)| (hotkey.to_string(), command_json(cmd).to_string()))
+        .collect();
+    bindings.sort();
+    bindings
+}
 
-    // Convert special key symbols back to names that livesplit_hotkey understands
-    let key_name: String = match key_part.as_str() {
-        "←" => "ArrowLeft".to_string(),
-        "→" => "ArrowRight".to_string(),
-        "↑" => "ArrowUp".to_string(),
-        "↓" => "ArrowDown".to_string(),
-        "⌫" => "Backspace".to_string(),
-        "↩" => "Return".to_string(),
-        "⇥" => "Tab".to_string(),
-        "\\" => "Backslash".to_string(),
-        "/" => "Slash".to_string(),
-        "=" => "Equal".to_string(),
-        "-" => "Minus".to_string(),
-        "[" => "BracketLeft".to_string(),
-        "]" => "BracketRight".to_string(),
-        "'" => "Quote".to_string(),
-        ";" => "Semicolon".to_string(),
-        "," => "Comma".to_string(),
-        "." => "Period".to_string(),
-        "`" => "Backquote".to_string(),
-        "Space" => "Space".to_string(),
-        "Esc" => "Escape".to_string(),
-        other => {
-            // Single letters need "Key" prefix, single digits need "Digit" prefix
-            if other.len() == 1 {
-                let c = other.chars().next().unwrap();
-                if c.is_ascii_alphabetic() {
-                    format!("Key{}", c.to_ascii_uppercase())
-                } else if c.is_ascii_digit() {
-                    format!("Digit{}", c)
-                } else {
-                    other.to_string()
-                }
-            } else {
-                other.to_string()
-            }
-        }
+/// The `[keys]` entries that bind `bindings`, as JSON. With `default_keys`,
+/// the default bindings are left out, and each default key that isn't bound
+/// is disabled. A key that `file_keys` disables stays disabled unless it is
+/// bound.
+fn keys_entries(
+    bindings: &[(Hotkey, WmCommand)],
+    default_keys: bool,
+    file_keys: &FxHashMap<String, serde_json::Value>,
+) -> Vec<(Hotkey, serde_json::Value)> {
+    let disable = serde_json::to_value(Disabled::Disable).unwrap();
+    let is_bound = |hotkey: &Hotkey| bindings.iter().any(|(bound, _)| bound == hotkey);
+    let defaults: Vec<(Hotkey, serde_json::Value)> = if default_keys {
+        let defaults = Config::default().keys;
+        defaults.iter().map(|(hotkey, cmd)| (*hotkey, command_json(cmd))).collect()
+    } else {
+        Vec::new()
     };
 
-    let mut parts: Vec<String> = modifiers.iter().map(|s| s.to_string()).collect();
-    parts.push(key_name);
-    parts.join(" + ")
+    let mut entries: Vec<(Hotkey, serde_json::Value)> = Vec::new();
+    for (hotkey, cmd) in bindings {
+        // A key bound twice keeps the last binding, as in a TOML table.
+        entries.retain(|(entry, _)| entry != hotkey);
+        let binding = (*hotkey, command_json(cmd));
+        if !defaults.contains(&binding) {
+            entries.push(binding);
+        }
+    }
+    let disabled_in_file = file_keys
+        .iter()
+        .filter(|(_, value)| **value == disable)
+        .filter_map(|(key, _)| Hotkey::from_str(key).ok());
+    for hotkey in disabled_in_file.chain(defaults.iter().map(|(hotkey, _)| *hotkey)) {
+        if !is_bound(&hotkey) && !entries.iter().any(|(entry, _)| *entry == hotkey) {
+            entries.push((hotkey, disable.clone()));
+        }
+    }
+    entries
+}
+
+/// Makes the `[keys]` table hold exactly `entries`. An entry that the table
+/// already holds keeps its spelling and comments.
+fn set_keys_table(
+    doc: &mut toml_edit::DocumentMut,
+    file_keys: &FxHashMap<String, serde_json::Value>,
+    mut entries: Vec<(Hotkey, serde_json::Value)>,
+) {
+    if !doc.contains_key("keys") && entries.is_empty() {
+        return;
+    }
+    let keys = doc.entry("keys").or_insert(toml_edit::table());
+    let Some(table) = keys.as_table_like_mut() else {
+        return;
+    };
+    let spellings: Vec<String> = table.iter().map(|(key, _)| key.to_owned()).collect();
+    for key in spellings {
+        let hotkey = Hotkey::from_str(&key).ok();
+        let Some(i) = entries.iter().position(|(entry, _)| Some(*entry) == hotkey) else {
+            table.remove(&key);
+            continue;
+        };
+        let (_, value) = entries.remove(i);
+        if file_keys.get(&key) != Some(&value) {
+            let item = table.get_mut(&key).unwrap();
+            let mut new_item = json_to_toml_value(&value);
+            if let (Some(old), Some(new)) = (item.as_value(), new_item.as_value_mut()) {
+                *new.decor_mut() = old.decor().clone();
+            }
+            *item = new_item;
+        }
+    }
+    for (hotkey, value) in entries {
+        table.insert(&hotkey.to_string(), json_to_toml_value(&value));
+    }
 }
 
 /// Convert a JSON value to a TOML value.
@@ -771,11 +861,34 @@ mod tests {
     use super::*;
     use crate::actor::layout::LayoutCommand;
     use crate::actor::reactor::Command as ReactorCommand;
-    use crate::actor::wm_controller::WmCmd;
+    use crate::actor::wm_controller::{ExecCmd, WmCmd};
+    use crate::model::{Direction, Orientation};
+    use crate::ui::preferences_json::{PreferencesJson, command_json};
+
+    /// The JSON that `ConfigBridge` in `SugargliderUI` sends to
+    /// `sugarglider_update_config` and `sugarglider_save_config_to_file`.
+    /// `PreferencesConfigTests.swift` checks that Swift still encodes it this
+    /// way.
+    const PREFERENCES_FROM_SWIFT: &str =
+        include_str!("../tests/fixtures/preferences-from-swift.json");
 
     #[test]
     fn default_config_is_valid() {
         Config::default();
+    }
+
+    #[test]
+    fn the_parked_window_journal_lives_next_to_the_layout() {
+        assert_eq!(
+            restore_file().with_file_name("parked.json"),
+            parked_journal_file()
+        );
+        assert_eq!(data_dir().join("parked.json"), parked_journal_file());
+    }
+
+    #[test]
+    fn contexts_live_next_to_the_layout() {
+        assert_eq!(data_dir().join("contexts.json"), contexts_file());
     }
 
     #[test]
@@ -865,6 +978,176 @@ mod tests {
     #[test]
     fn scroll_gate_is_disabled_by_default() {
         assert!(!Config::default().settings.experimental.scroll.enable);
+    }
+
+    /// In TOML, a bare integer names a context by number, a string by name,
+    /// and `{ id = 7 }` by id.
+    #[test]
+    fn context_commands_parse() {
+        use crate::actor::reactor::{ContextCommand, ContextRef, RecordRef};
+
+        let config = Config::parse(
+            r#"
+            [keys]
+            "Ctrl + Alt + Digit1" = { switch_context = 1 }
+            "Ctrl + Alt + KeyC" = { switch_context = "Comms" }
+            "Ctrl + Alt + KeyI" = { switch_context = { id = 7 } }
+            "Ctrl + Alt + Digit0" = "show_everything"
+            "Ctrl + Alt + Tab" = "previous_context"
+            "Ctrl + Alt + KeyA" = { add_window_to_context = 2 }
+            "Ctrl + Alt + KeyM" = { move_window_to_context = { id = 7 } }
+            "Ctrl + Alt + KeyN" = { move_window_to_context = "Comms" }
+            "Ctrl + Alt + KeyR" = "remove_window_from_context"
+            "Ctrl + Alt + KeyP" = "toggle_window_pinned"
+            "Ctrl + Alt + KeyD" = { delete_context = 3 }
+            "Ctrl + Alt + KeyU" = { set_context_number = { context = "Comms", number = 2 } }
+            "Ctrl + Alt + KeyF" = { remove_record = { context = { id = 7 }, record = { record = 0, app = "Mail", title = "Inbox" } } }
+            "#,
+        )
+        .unwrap();
+        let command = |key: &str| {
+            config
+                .keys
+                .iter()
+                .find(|(hotkey, _)| hotkey.to_string() == key)
+                .map(|(_, cmd)| match cmd {
+                    WmCommand::ReactorCommand(ReactorCommand::Context(cmd)) => cmd.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .unwrap()
+        };
+        let id = serde_json::from_value(serde_json::json!(7)).unwrap();
+        assert_eq!(
+            ContextCommand::SwitchContext(ContextRef::Number(1)),
+            command("Ctrl + Alt + Digit1")
+        );
+        assert_eq!(
+            ContextCommand::SwitchContext(ContextRef::Name("Comms".into())),
+            command("Ctrl + Alt + KeyC")
+        );
+        assert_eq!(
+            ContextCommand::SwitchContext(ContextRef::Id(id)),
+            command("Ctrl + Alt + KeyI")
+        );
+        assert_eq!(ContextCommand::ShowEverything, command("Ctrl + Alt + Digit0"));
+        assert_eq!(ContextCommand::PreviousContext, command("Ctrl + Alt + Tab"));
+        assert_eq!(
+            ContextCommand::AddWindowToContext(ContextRef::Number(2)),
+            command("Ctrl + Alt + KeyA")
+        );
+        assert_eq!(
+            ContextCommand::MoveWindowToContext(ContextRef::Id(id)),
+            command("Ctrl + Alt + KeyM")
+        );
+        assert_eq!(
+            ContextCommand::MoveWindowToContext(ContextRef::Name("Comms".into())),
+            command("Ctrl + Alt + KeyN")
+        );
+        assert_eq!(
+            ContextCommand::RemoveWindowFromContext,
+            command("Ctrl + Alt + KeyR")
+        );
+        assert_eq!(ContextCommand::ToggleWindowPinned, command("Ctrl + Alt + KeyP"));
+        assert_eq!(
+            ContextCommand::DeleteContext(ContextRef::Number(3)),
+            command("Ctrl + Alt + KeyD")
+        );
+        assert_eq!(
+            ContextCommand::SetContextNumber {
+                context: ContextRef::Name("Comms".into()),
+                number: 2,
+            },
+            command("Ctrl + Alt + KeyU")
+        );
+        assert_eq!(
+            ContextCommand::RemoveRecord {
+                context: ContextRef::Id(id),
+                record: RecordRef {
+                    record: 0,
+                    app: "Mail".into(),
+                    title: "Inbox".into(),
+                },
+            },
+            command("Ctrl + Alt + KeyF")
+        );
+    }
+
+    /// Key bindings. The default config ships the context bindings of the
+    /// spec commented out, so none is bound, and every shipped line parses
+    /// once uncommented.
+    #[test]
+    fn the_default_config_ships_the_context_bindings_commented_out() {
+        use crate::actor::reactor::{ContextCommand, ContextRef};
+
+        let default_config = include_str!("../sugarglider.default.toml");
+        let shipped = [
+            r#"# "Ctrl + Alt + Space" = "open_context_switcher""#,
+            r#"# "Ctrl + Alt + 0" = "show_everything""#,
+            r#"# "Ctrl + Alt + 1" = { switch_context = 1 }"#,
+            r#"# "Ctrl + Alt + 2" = { switch_context = 2 }"#,
+            "# ... through 9",
+            r#"# "Ctrl + Alt + Tab" = "previous_context""#,
+        ]
+        .join("\n");
+        assert!(default_config.contains(&shipped));
+        let context_bindings = |config: &Config| -> Vec<(String, ContextCommand)> {
+            let mut bindings: Vec<_> = config
+                .keys
+                .iter()
+                .filter_map(|(hotkey, cmd)| match cmd {
+                    WmCommand::ReactorCommand(ReactorCommand::Context(cmd)) => {
+                        Some((hotkey.to_string(), cmd.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            bindings.sort_by(|a, b| a.0.cmp(&b.0));
+            bindings
+        };
+        assert!(context_bindings(&Config::default()).is_empty());
+
+        let uncommented: Vec<&str> = shipped
+            .lines()
+            .filter(|line| line.starts_with("# \""))
+            .map(|line| &line[2..])
+            .collect();
+        let config = Config::parse(&format!("[keys]\n{}", uncommented.join("\n"))).unwrap();
+        assert_eq!(
+            vec![
+                ("Ctrl + Alt + Digit0".to_string(), ContextCommand::ShowEverything),
+                (
+                    "Ctrl + Alt + Digit1".to_string(),
+                    ContextCommand::SwitchContext(ContextRef::Number(1))
+                ),
+                (
+                    "Ctrl + Alt + Digit2".to_string(),
+                    ContextCommand::SwitchContext(ContextRef::Number(2))
+                ),
+                (
+                    "Ctrl + Alt + Space".to_string(),
+                    ContextCommand::OpenContextSwitcher
+                ),
+                ("Ctrl + Alt + Tab".to_string(), ContextCommand::PreviousContext),
+            ],
+            context_bindings(&config)
+        );
+    }
+
+    /// R28, M9. Contexts are off by default and choose global scope; the
+    /// scope key is read and rejects values that aren't a scope.
+    #[test]
+    fn contexts_are_off_by_default_and_turn_on_with_their_flag() {
+        assert!(!Config::default().settings.experimental.contexts.enable);
+        assert_eq!(
+            Scope::Global,
+            Config::default().settings.experimental.contexts.scope
+        );
+        let config = Config::parse("settings.experimental.contexts.enable = true").unwrap();
+        assert!(config.settings.experimental.contexts.enable);
+        let scoped =
+            Config::parse("settings.experimental.contexts.scope = \"per_screen\"").unwrap();
+        assert_eq!(Scope::PerScreen, scoped.settings.experimental.contexts.scope);
+        assert!(Config::parse("settings.experimental.contexts.scope = \"sometimes\"").is_err());
     }
 
     #[test]
@@ -1058,6 +1341,74 @@ mod tests {
         assert!(config.keys.iter().any(|(hk, _)| hk.to_string() == "Alt + Slash"));
     }
 
+    /// A key replaces or disables the default binding of the same hotkey,
+    /// however the file spells the hotkey.
+    #[test]
+    fn keys_replace_default_bindings_spelled_differently() {
+        let config = Config::parse(
+            r#"
+            [settings]
+            default_keys = true
+
+            [keys]
+            "Alt + KeyT" = "disable"
+            "Ctrl + Alt + KeyH" = "debug"
+            "#,
+        )
+        .unwrap();
+
+        let bound_to = |key: &str| -> Vec<serde_json::Value> {
+            let hotkey = Hotkey::from_str(key).unwrap();
+            let bindings = config.keys.iter().filter(|(hk, _)| *hk == hotkey);
+            bindings.map(|(_, cmd)| command_json(cmd)).collect()
+        };
+        assert_eq!(Vec::<serde_json::Value>::new(), bound_to("Alt + T"));
+        assert_eq!(vec![serde_json::json!("debug")], bound_to("Alt + Ctrl + H"));
+        assert_eq!(Config::default().keys.len() - 1, config.keys.len());
+    }
+
+    /// Two spellings of one hotkey in one file bind the command of the last
+    /// entry, in the order the file writes them. With `default_keys`, the
+    /// same hotkey of the defaults is replaced too.
+    #[test]
+    fn the_last_spelling_of_a_hotkey_binds_its_command() {
+        for default_keys in [false, true] {
+            let config = Config::parse(&format!(
+                r#"
+                [settings]
+                default_keys = {default_keys}
+
+                [keys]
+                "Alt + T" = "debug"
+                "Alt + KeyT" = {{ group = "vertical" }}
+                "#,
+            ))
+            .unwrap();
+
+            let alt_t = Hotkey::from_str("Alt + T").unwrap();
+            let bindings: Vec<&WmCommand> = config
+                .keys
+                .iter()
+                .filter(|(hotkey, _)| *hotkey == alt_t)
+                .map(|(_, cmd)| cmd)
+                .collect();
+            assert_eq!(1, bindings.len(), "default_keys = {default_keys}");
+            assert_eq!(
+                command_json(&WmCommand::ReactorCommand(ReactorCommand::Layout(
+                    LayoutCommand::Group(Orientation::Vertical)
+                ))),
+                command_json(bindings[0]),
+                "default_keys = {default_keys}"
+            );
+            let default_count = Config::default().keys.len();
+            assert_eq!(
+                if default_keys { default_count } else { 1 },
+                config.keys.len(),
+                "default_keys = {default_keys}"
+            );
+        }
+    }
+
     #[test]
     fn exec_cmd_options_parse() {
         let config = Config::parse(
@@ -1173,68 +1524,6 @@ mod tests {
     }
 
     #[test]
-    fn macos_symbols_to_toml_key_converts_letters() {
-        // Single letters should be converted to "Key" + uppercase
-        assert_eq!(macos_symbols_to_toml_key("⌥H"), "Alt + KeyH");
-        assert_eq!(macos_symbols_to_toml_key("⌥⇧J"), "Alt + Shift + KeyJ");
-        assert_eq!(macos_symbols_to_toml_key("⌃⌥K"), "Ctrl + Alt + KeyK");
-
-        // Converted keys should be parseable
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥H")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥⇧J")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌃⌥K")).is_ok());
-    }
-
-    #[test]
-    fn macos_symbols_to_toml_key_converts_digits() {
-        assert_eq!(macos_symbols_to_toml_key("⌥1"), "Alt + Digit1");
-        assert_eq!(macos_symbols_to_toml_key("⌥⇧0"), "Alt + Shift + Digit0");
-
-        // Converted keys should be parseable
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥1")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥⇧0")).is_ok());
-    }
-
-    #[test]
-    fn macos_symbols_to_toml_key_converts_arrows() {
-        assert_eq!(macos_symbols_to_toml_key("⌥←"), "Alt + ArrowLeft");
-        assert_eq!(macos_symbols_to_toml_key("⌥→"), "Alt + ArrowRight");
-        assert_eq!(macos_symbols_to_toml_key("⌥↑"), "Alt + ArrowUp");
-        assert_eq!(macos_symbols_to_toml_key("⌥↓"), "Alt + ArrowDown");
-
-        // All should be parseable
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥←")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥→")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥↑")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥↓")).is_ok());
-    }
-
-    #[test]
-    fn macos_symbols_to_toml_key_converts_special_keys() {
-        assert_eq!(macos_symbols_to_toml_key("⌥\\"), "Alt + Backslash");
-        assert_eq!(macos_symbols_to_toml_key("⌥/"), "Alt + Slash");
-        assert_eq!(macos_symbols_to_toml_key("⌥="), "Alt + Equal");
-        assert_eq!(macos_symbols_to_toml_key("⌥Space"), "Alt + Space");
-
-        // All should be parseable
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥\\")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥/")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥=")).is_ok());
-        assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥Space")).is_ok());
-    }
-
-    #[test]
-    fn macos_symbols_without_modifiers_still_parseable() {
-        // Note: livesplit_hotkey accepts keys without modifiers (like "KeyH")
-        // but these will be rejected by parse_hotkey_string in preferences_json.rs
-        // which requires at least one modifier for a valid hotkey
-        let toml_key = macos_symbols_to_toml_key("H");
-        assert_eq!(toml_key, "KeyH");
-        // This parses successfully with livesplit_hotkey
-        assert!(Hotkey::from_str(&toml_key).is_ok());
-    }
-
-    #[test]
     fn parse_hotkey_string_requires_modifiers() {
         // parse_hotkey_string (in preferences_json.rs) requires at least one modifier
         // This test verifies that behavior through the public API
@@ -1251,10 +1540,696 @@ mod tests {
                     || hk.key.contains('⌃')
                     || hk.key.contains('⇧')
                     || hk.key.contains('⌘'),
-                "Hotkey '{}' for command '{}' should have at least one modifier",
+                "Hotkey '{}' for command {} should have at least one modifier",
                 hk.key,
-                hk.command_id
+                hk.command
             );
+        }
+    }
+
+    /// The Swift `HotkeyBinding` has no sort order, so the key bindings in
+    /// the Preferences window's JSON have none. Each binding carries its
+    /// command, which the file then holds.
+    #[test]
+    fn preferences_from_the_swift_ui_save_with_their_key_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(&path, "[keys]\n\"Alt + T\" = { exec = \"open -a Terminal\" }\n").unwrap();
+
+        let prefs: PreferencesJson = serde_json::from_str(PREFERENCES_FROM_SWIFT).unwrap();
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let config = Config::load(Some(&path)).unwrap();
+        assert!(!config.settings.animate);
+        assert!(config.settings.focus_follows_mouse);
+        assert_eq!(8.0, config.settings.outer_gap);
+        assert_eq!(4.0, config.settings.inner_gap);
+        let app_names: Vec<_> = config
+            .window_rules
+            .iter()
+            .map(|rule| rule.conditions.app_name.as_deref())
+            .collect();
+        assert_eq!(vec![Some("Finder"), Some("Calculator")], app_names);
+        let bound_to = |key: &str| {
+            let hotkey = Hotkey::from_str(key).unwrap();
+            let binding = config.keys.iter().find(|(hk, _)| *hk == hotkey);
+            binding.map(|(_, cmd)| cmd).unwrap_or_else(|| panic!("{key} is not bound"))
+        };
+        assert!(matches!(
+            bound_to("Alt + KeyZ"),
+            WmCommand::Wm(WmCmd::ToggleGlobalEnabled)
+        ));
+        assert!(matches!(
+            bound_to("Ctrl + Alt + Shift + KeyH"),
+            WmCommand::ReactorCommand(ReactorCommand::Layout(LayoutCommand::MoveFocus(
+                Direction::Left
+            )))
+        ));
+        assert!(matches!(
+            bound_to("Alt + KeyT"),
+            WmCommand::Wm(WmCmd::Exec(ExecCmd::String(cmd))) if cmd == "open -a Terminal"
+        ));
+    }
+
+    /// A save that changes no window rule leaves the file's
+    /// `[[window_rules]]` tables alone, comments included, and a rule's
+    /// conditions stay in the running config too.
+    #[test]
+    fn preferences_keep_window_rule_conditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "# Float the picture-in-picture window.\n\
+             [[window_rules]]\n\
+             if = { title_regex = \"Picture-in-Picture\" }\n\
+             float = true\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(1, config.window_rules.len());
+
+        let mut prefs = preferences_for(&config);
+        prefs.animate = !prefs.animate;
+        let running = prefs.apply_to_config(&config);
+        assert_eq!(config.window_rules, running.window_rules);
+
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("# Float the picture-in-picture window."),
+            "{written}"
+        );
+        assert!(
+            written.contains("title_regex = \"Picture-in-Picture\""),
+            "{written}"
+        );
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(config.window_rules, saved.window_rules);
+    }
+
+    /// A window rule whose condition is an empty string keeps it: a save
+    /// that changes no rule leaves the file alone, and the running config
+    /// keeps the same condition. `app_id = ""` matches only an empty bundle
+    /// id, so dropping the condition would widen the rule to every window.
+    #[test]
+    fn preferences_keep_empty_window_rule_conditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "[[window_rules]]\n\
+             if = { app_id = \"\" }\n\
+             float = true\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(Some(String::new()), config.window_rules[0].conditions.app_id);
+
+        let mut prefs = preferences_for(&config);
+        prefs.animate = !prefs.animate;
+        assert_eq!(config.window_rules, prefs.apply_to_config(&config).window_rules);
+
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("app_id = \"\""), "{written}");
+        assert_eq!(
+            config.window_rules,
+            Config::load(Some(&path)).unwrap().window_rules
+        );
+    }
+
+    /// When a window rule change does rewrite the rules, an empty condition
+    /// is written as it stands, so the rules that stay keep their meaning.
+    #[test]
+    fn preferences_write_empty_window_rule_conditions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "[[window_rules]]\n\
+             if = { app_id = \"\" }\n\
+             float = true\n\n\
+             [[window_rules]]\n\
+             if = { app_name = \"Finder\" }\n\
+             float = false\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(2, config.window_rules.len());
+
+        let mut prefs = preferences_for(&config);
+        prefs.window_rules.remove(1); // the window deleted the Finder rule
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(vec![config.window_rules[0].clone()], saved.window_rules);
+    }
+
+    /// A window rule that the App Rules pane removes goes away, and the
+    /// rules that stay keep their conditions in the file and the running
+    /// config.
+    #[test]
+    fn preferences_write_window_rule_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "[[window_rules]]\n\
+             if = { title_regex = \"Picture-in-Picture\" }\n\
+             float = true\n\n\
+             [[window_rules]]\n\
+             if = { app_id = \"com.example.X\" }\n\
+             float = false\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(2, config.window_rules.len());
+
+        let mut prefs = preferences_for(&config);
+        prefs.window_rules.remove(0);
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(vec![config.window_rules[1].clone()], saved.window_rules);
+        assert_eq!(prefs.apply_to_config(&config).window_rules, saved.window_rules);
+    }
+
+    /// A config file with an error stays as it is, and the error says what
+    /// is wrong without terminal colors.
+    #[test]
+    fn preferences_never_overwrite_a_config_file_with_an_error() {
+        let files = [
+            // Not TOML.
+            ("[settings]\nanimate = tru\n", "could not parse config"),
+            // Not a setting.
+            ("[settings]\nanimates = false\n", "could not parse config"),
+            // Not a key.
+            ("[keys]\n\"Alt + Nope\" = \"debug\"\n", "Could not parse hotkey"),
+            // TOML 1.1, which toml_edit can't edit.
+            (
+                "[settings]\nexperimental = { scroll = { enable = true, } }\n",
+                "TOML parse error",
+            ),
+        ];
+        let prefs: PreferencesJson = serde_json::from_str(PREFERENCES_FROM_SWIFT).unwrap();
+        for (file, message) in files {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("glide.toml");
+            std::fs::write(&path, file).unwrap();
+
+            let error = write_preferences_to_path(&prefs, &path).unwrap_err().to_string();
+
+            assert_eq!(file, std::fs::read_to_string(&path).unwrap());
+            assert_eq!(1, std::fs::read_dir(dir.path()).unwrap().count(), "{file}");
+            assert!(error.contains(message), "{error}");
+            assert!(error.contains("has an error, so it was not changed"), "{error}");
+            assert!(!error.contains('\u{1b}'), "{error}");
+        }
+    }
+
+    /// The Preferences window's JSON for `config`, as Swift sends it back.
+    fn preferences_for(config: &Config) -> PreferencesJson {
+        let json = serde_json::to_string(&PreferencesJson::from_config(config)).unwrap();
+        let mut prefs: PreferencesJson = serde_json::from_str(&json).unwrap();
+        for hotkey in &mut prefs.hotkeys {
+            hotkey.sort_order = 0;
+        }
+        prefs
+    }
+
+    /// Changes the key of the binding on `from` to `to`.
+    fn rebind(prefs: &mut PreferencesJson, from: &str, to: &str) {
+        let binding = prefs.hotkeys.iter_mut().find(|hk| hk.key == from);
+        binding.unwrap_or_else(|| panic!("{from} is not bound")).key = to.to_string();
+    }
+
+    /// Two `exec` bindings, and two `resize` bindings that differ only in
+    /// their percent, stay apart when Preferences changes a key, in the
+    /// running config and in the saved file.
+    #[test]
+    fn preferences_keep_bindings_of_the_same_command_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [keys]
+            "Alt + Q" = { exec = "open -a Terminal" }
+            "Alt + W" = { exec = "open -a Safari" }
+            "Alt + Ctrl + H" = { resize = { direction = "left", percent = 5 } }
+            "Alt + Ctrl + Shift + H" = { resize = { direction = "left", percent = 10 } }
+            "#,
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        let expected = Config::parse(
+            r#"
+            [keys]
+            "Alt + E" = { exec = "open -a Terminal" }
+            "Alt + W" = { exec = "open -a Safari" }
+            "Alt + Ctrl + H" = { resize = { direction = "left", percent = 5 } }
+            "Alt + Ctrl + Shift + Y" = { resize = { direction = "left", percent = 10 } }
+            "#,
+        )
+        .unwrap();
+
+        let mut prefs = preferences_for(&config);
+        rebind(&mut prefs, "⌥Q", "⌥E");
+        rebind(&mut prefs, "⌃⌥⇧H", "⌃⌥⇧Y");
+
+        let running = prefs.apply_to_config(&config);
+        assert_eq!(sorted_bindings(&expected.keys), sorted_bindings(&running.keys));
+        write_preferences_to_path(&prefs, &path).unwrap();
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(sorted_bindings(&expected.keys), sorted_bindings(&saved.keys));
+
+        // The window keeps its bindings for the next change.
+        rebind(&mut prefs, "⌥W", "⌥R");
+        let expected = Config::parse(
+            r#"
+            [keys]
+            "Alt + E" = { exec = "open -a Terminal" }
+            "Alt + R" = { exec = "open -a Safari" }
+            "Alt + Ctrl + H" = { resize = { direction = "left", percent = 5 } }
+            "Alt + Ctrl + Shift + Y" = { resize = { direction = "left", percent = 10 } }
+            "#,
+        )
+        .unwrap();
+
+        let running = prefs.apply_to_config(&running);
+        assert_eq!(sorted_bindings(&expected.keys), sorted_bindings(&running.keys));
+        write_preferences_to_path(&prefs, &path).unwrap();
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(sorted_bindings(&expected.keys), sorted_bindings(&saved.keys));
+    }
+
+    /// With `default_keys = true`, the "disable" entries and their comments
+    /// stay when Preferences saves, and a default binding moved to another
+    /// key doesn't come back on its old key.
+    #[test]
+    fn preferences_keep_disabled_keys_with_default_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        let disabled = [
+            "# No tabs.",
+            "\"Alt + T\" = \"disable\" # Alt + S still stacks.",
+            "\"Alt + W\" = \"disable\"",
+        ];
+        let file = format!(
+            "[settings]\ndefault_keys = true\n\n[keys]\n{}\n",
+            disabled.join("\n")
+        );
+        std::fs::write(&path, file).unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        let alt_t = Hotkey::from_str("Alt + T").unwrap();
+        let alt_s = Hotkey::from_str("Alt + S").unwrap();
+        assert!(!config.keys.iter().any(|(hotkey, _)| *hotkey == alt_t));
+
+        let mut prefs = preferences_for(&config);
+        prefs.animate = !prefs.animate;
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            sorted_bindings(&config.keys),
+            sorted_bindings(&saved.keys),
+            "{written}"
+        );
+        for line in disabled {
+            assert!(written.contains(line), "{written}");
+        }
+
+        rebind(&mut prefs, "⌥S", "⌥G");
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let saved = Config::load(Some(&path)).unwrap();
+        let running = prefs.apply_to_config(&config);
+        assert_eq!(
+            sorted_bindings(&running.keys),
+            sorted_bindings(&saved.keys),
+            "{written}"
+        );
+        assert!(!saved.keys.iter().any(|(hotkey, _)| [alt_s, alt_t].contains(hotkey)));
+        for line in disabled {
+            assert!(written.contains(line), "{written}");
+        }
+    }
+
+    /// Every default binding comes back unchanged through the Preferences
+    /// window's JSON, so a save that changes no binding finds none changed.
+    #[test]
+    fn default_bindings_survive_the_preferences_json() {
+        let config = Config::default();
+        let prefs = preferences_for(&config);
+        assert_eq!(config.keys.len(), prefs.hotkeys.len());
+        assert_eq!(sorted_bindings(&config.keys), sorted_bindings(&prefs.bindings()));
+    }
+
+    /// The `[keys]` table of a saved file, with each key parsed and each
+    /// value as JSON.
+    fn saved_keys(written: &str) -> Vec<(String, String)> {
+        let table: toml::Table = toml::from_str(written).unwrap();
+        let mut keys: Vec<_> = table["keys"]
+            .as_table()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| {
+                let hotkey = Hotkey::from_str(key).unwrap().to_string();
+                (hotkey, serde_json::to_value(value).unwrap().to_string())
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Changing only a setting leaves the key bindings of the file alone,
+    /// so a file without `[keys]` gets none.
+    #[test]
+    fn preferences_add_no_keys_when_no_binding_changed() {
+        let files = [
+            None,
+            Some("[settings]\nanimate = true\n"),
+            Some("[settings]\ndefault_keys = true\n"),
+        ];
+        for file in files {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("glide.toml");
+            if let Some(file) = file {
+                std::fs::write(&path, file).unwrap();
+            }
+            let config = Config::parse(file.unwrap_or_default()).unwrap();
+
+            let mut prefs = preferences_for(&config);
+            prefs.animate = false;
+            write_preferences_to_path(&prefs, &path).unwrap();
+
+            let written = std::fs::read_to_string(&path).unwrap();
+            let table: toml::Table = toml::from_str(&written).unwrap();
+            assert!(!table.contains_key("keys"), "{written}");
+            let saved = Config::load(Some(&path)).unwrap();
+            assert!(!saved.settings.animate);
+            assert_eq!(sorted_bindings(&config.keys), sorted_bindings(&saved.keys));
+        }
+    }
+
+    /// With `default_keys = true`, `[keys]` holds only what differs from the
+    /// defaults: a moved default binding on its new key, and "disable" on
+    /// its old key. Moving it back empties the table.
+    #[test]
+    fn preferences_save_only_changed_bindings_with_default_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(&path, "[settings]\ndefault_keys = true\n").unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+
+        let mut prefs = preferences_for(&config);
+        rebind(&mut prefs, "⌥S", "⌥G");
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            vec![
+                ("Alt + KeyG".to_string(), r#"{"group":"vertical"}"#.to_string()),
+                ("Alt + KeyS".to_string(), r#""disable""#.to_string()),
+            ],
+            saved_keys(&written),
+            "{written}"
+        );
+        let saved = Config::load(Some(&path)).unwrap();
+        let running = prefs.apply_to_config(&config);
+        assert_eq!(sorted_bindings(&running.keys), sorted_bindings(&saved.keys));
+
+        rebind(&mut prefs, "⌥G", "⌥S");
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(Vec::<(String, String)>::new(), saved_keys(&written), "{written}");
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(sorted_bindings(&config.keys), sorted_bindings(&saved.keys));
+    }
+
+    /// With `default_keys = false`, `[keys]` holds every binding once one
+    /// changes, and an entry that stays keeps its comment. A file without
+    /// `[keys]` has the default bindings, which it then holds.
+    #[test]
+    fn preferences_save_every_binding_without_default_keys() {
+        let files = [
+            (
+                "[settings]\ndefault_keys = false\n\n[keys]\n# Terminal\n\
+                 \"Alt + Q\" = { exec = \"open -a Terminal\" }\n\"Alt + W\" = \"debug\"\n",
+                ("⌥W", "⌥E"),
+            ),
+            ("[settings]\nanimate = true\n", ("⌥S", "⌥G")),
+        ];
+        for (file, (from, to)) in files {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("glide.toml");
+            std::fs::write(&path, file).unwrap();
+            let config = Config::load(Some(&path)).unwrap();
+
+            let mut prefs = preferences_for(&config);
+            rebind(&mut prefs, from, to);
+            write_preferences_to_path(&prefs, &path).unwrap();
+
+            let written = std::fs::read_to_string(&path).unwrap();
+            let running = prefs.apply_to_config(&config);
+            assert_eq!(sorted_bindings(&running.keys), saved_keys(&written), "{written}");
+            let saved = Config::load(Some(&path)).unwrap();
+            assert_eq!(sorted_bindings(&running.keys), sorted_bindings(&saved.keys));
+            for comment in file.lines().filter(|line| line.starts_with('#')) {
+                assert!(written.contains(comment), "{written}");
+            }
+        }
+    }
+
+    /// A `[keys]` entry whose command changes keeps its spellings and
+    /// comments: the writer copies the entry's decor onto the new value.
+    #[test]
+    fn preferences_keep_the_comment_of_a_binding_whose_command_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "[settings]\ndefault_keys = false\n\n[keys]\n\
+             # Terminal\n\
+             \"Alt + Q\" = { exec = \"open -a Terminal\" } # was debug\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+
+        let mut prefs = preferences_for(&config);
+        prefs
+            .hotkeys
+            .iter_mut()
+            .find(|hotkey| hotkey.key == "⌥Q")
+            .expect("Alt + Q is shown")
+            .command = r#"{"exec":"open -a Safari"}"#.to_string();
+
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# Terminal"), "{written}");
+        assert!(written.contains("# was debug"), "{written}");
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            command_json(&WmCommand::Wm(WmCmd::Exec(ExecCmd::String(
+                "open -a Safari".to_string()
+            )))),
+            command_json(&saved.keys[0].1),
+            "{written}"
+        );
+    }
+
+    /// A context command survives the Preferences JSON, the file it writes,
+    /// and a fresh load.
+    #[test]
+    fn context_bindings_survive_json_toml_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "[settings]\ndefault_keys = false\n\n[keys]\n\
+             \"Ctrl + Alt + Digit7\" = { switch_context = 7 }\n\
+             \"Ctrl + Alt + KeyC\" = { switch_context = \"Comms\" }\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+
+        let mut prefs = preferences_for(&config);
+        rebind(&mut prefs, "⌃⌥7", "⌃⌥8");
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let saved = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            sorted_bindings(&prefs.apply_to_config(&config).keys),
+            sorted_bindings(&saved.keys)
+        );
+        let commands: Vec<String> =
+            saved.keys.iter().map(|(_, cmd)| command_json(cmd).to_string()).collect();
+        assert!(commands.contains(&r#"{"switch_context":7}"#.to_string()));
+        assert!(commands.contains(&r#"{"switch_context":"Comms"}"#.to_string()));
+    }
+
+    fn leaf_keys(prefix: &str, table: &toml::Table, keys: &mut Vec<String>) {
+        for (key, value) in table {
+            let path = format!("{prefix}.{key}");
+            match value {
+                toml::Value::Table(table) => leaf_keys(&path, table, keys),
+                _ => keys.push(path),
+            }
+        }
+    }
+
+    /// The Preferences window writes only its fixed list of settings, the
+    /// contexts switch among them, and the config file reads the switch back.
+    #[test]
+    fn the_contexts_switch_saves_with_only_the_fixed_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        let mut prefs: PreferencesJson = serde_json::from_str(PREFERENCES_FROM_SWIFT).unwrap();
+        assert!(prefs.contexts_enable);
+
+        write_preferences_to_path(&prefs, &path).unwrap();
+
+        let written: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut top_level: Vec<&str> = written.keys().map(String::as_str).collect();
+        top_level.sort();
+        assert_eq!(vec!["keys", "settings", "window_rules"], top_level);
+        let mut settings = Vec::new();
+        leaf_keys(
+            "settings",
+            written["settings"].as_table().unwrap(),
+            &mut settings,
+        );
+        settings.sort();
+        assert_eq!(
+            vec![
+                "settings.animate",
+                "settings.default_layout_kind",
+                "settings.drag_drop.enable",
+                "settings.drag_drop.live_preview",
+                "settings.experimental.contexts.enable",
+                "settings.focus_follows_mouse",
+                "settings.inner_gap",
+                "settings.mouse_follows_focus",
+                "settings.outer_gap",
+                "settings.status_icon.enable",
+            ],
+            settings
+        );
+        assert!(Config::load(Some(&path)).unwrap().settings.experimental.contexts.enable);
+
+        prefs.contexts_enable = false;
+        write_preferences_to_path(&prefs, &path).unwrap();
+        assert!(!Config::load(Some(&path)).unwrap().settings.experimental.contexts.enable);
+    }
+
+    #[test]
+    fn the_scope_picker_saves_and_an_older_payload_preserves_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("glide.toml");
+        std::fs::write(
+            &path,
+            "[settings.experimental]\n# Keep this comment.\ncontexts.enable = true\n",
+        )
+        .unwrap();
+        let mut prefs: PreferencesJson = serde_json::from_str(PREFERENCES_FROM_SWIFT).unwrap();
+        prefs.contexts_scope = Some(Scope::PerScreen);
+
+        write_preferences_to_path(&prefs, &path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# Keep this comment."));
+        assert_eq!(
+            Scope::PerScreen,
+            Config::load(Some(&path)).unwrap().settings.experimental.contexts.scope
+        );
+
+        prefs.contexts_scope = None;
+        write_preferences_to_path(&prefs, &path).unwrap();
+        assert_eq!(
+            Scope::PerScreen,
+            Config::load(Some(&path)).unwrap().settings.experimental.contexts.scope
+        );
+
+        prefs.contexts_scope = Some(Scope::Global);
+        write_preferences_to_path(&prefs, &path).unwrap();
+        assert_eq!(
+            Scope::Global,
+            Config::load(Some(&path)).unwrap().settings.experimental.contexts.scope
+        );
+    }
+
+    /// The drag-and-drop switches save in each form a file can give the
+    /// `drag_drop` table, next to its other settings and comments.
+    #[test]
+    fn the_drag_and_drop_switches_save() {
+        let files = [
+            "",
+            "[settings.drag_drop]\n# Pixels.\ndrag_threshold = 10.0\n",
+            "[settings]\ndrag_drop.drag_threshold = 10.0\n",
+            "[settings]\ndrag_drop = { drag_threshold = 10.0 }\n",
+            "settings.drag_drop.drag_threshold = 10.0\n",
+        ];
+        let mut prefs: PreferencesJson = serde_json::from_str(PREFERENCES_FROM_SWIFT).unwrap();
+        for file in files {
+            for (enable, live_preview) in [(false, true), (true, false)] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("glide.toml");
+                std::fs::write(&path, file).unwrap();
+                prefs.drag_drop_enable = enable;
+                prefs.drag_drop_live_preview = live_preview;
+
+                write_preferences_to_path(&prefs, &path).unwrap();
+
+                let written = std::fs::read_to_string(&path).unwrap();
+                let config = Config::load(Some(&path)).unwrap_or_else(|e| panic!("{e}\n{written}"));
+                let drag_drop = config.settings.drag_drop;
+                assert_eq!(enable, drag_drop.enable, "{written}");
+                assert_eq!(live_preview, drag_drop.live_preview, "{written}");
+                if !file.is_empty() {
+                    assert_eq!(10.0, drag_drop.drag_threshold, "{written}");
+                }
+                for comment in file.lines().filter(|line| line.starts_with('#')) {
+                    assert!(written.contains(comment), "{written}");
+                }
+            }
+        }
+    }
+
+    /// Saving the contexts switch keeps the file's comments and other
+    /// experimental settings in each form a file can give the `experimental`
+    /// table, and never adds a second `contexts` table.
+    #[test]
+    fn the_contexts_switch_saves_into_the_existing_experimental_table() {
+        let files = [
+            // The form that sugarglider.default.toml uses.
+            "[settings.experimental]\n\n# Scroll layout settings.\nscroll.enable = true\n\n\
+             # Named window sets.\ncontexts.enable = false\n",
+            "[settings.experimental.scroll]\nenable = true\n",
+            "[settings]\nexperimental.scroll.enable = true\n",
+            "[settings]\nexperimental = { scroll = { enable = true } }\n",
+        ];
+        let prefs: PreferencesJson = serde_json::from_str(PREFERENCES_FROM_SWIFT).unwrap();
+        for file in files {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("glide.toml");
+            std::fs::write(&path, file).unwrap();
+
+            write_preferences_to_path(&prefs, &path).unwrap();
+
+            let written = std::fs::read_to_string(&path).unwrap();
+            let config = Config::load(Some(&path)).unwrap_or_else(|e| panic!("{e}\n{written}"));
+            assert!(config.settings.experimental.contexts.enable, "{written}");
+            assert!(config.settings.experimental.scroll.enable, "{written}");
+            for comment in file.lines().filter(|line| line.starts_with('#')) {
+                assert!(written.contains(comment), "{written}");
+            }
         }
     }
 }

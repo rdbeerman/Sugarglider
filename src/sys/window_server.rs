@@ -262,6 +262,20 @@ pub fn make_key_window(pid: pid_t, wsid: WindowServerId) -> Result<(), ()> {
     Ok(())
 }
 
+/// Makes the process frontmost without a window, through the window server.
+/// `make_key_window` does the same with a window. `NSRunningApplication`'s
+/// activation is a request that the system can refuse under cooperative
+/// activation; this one is not.
+pub fn make_front_process(pid: pid_t) -> Result<(), ()> {
+    // See https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468.
+    #[allow(non_upper_case_globals)]
+    const kCPSUserGenerated: u32 = 0x200;
+
+    let psn = ProcessSerialNumber::for_pid(pid)?;
+    let err = unsafe { _SLPSSetFrontProcessWithOptions(&psn, 0, kCPSUserGenerated) };
+    if err == 0 { Ok(()) } else { Err(()) }
+}
+
 pub type SLSConnectionID = c_int;
 
 #[link(name = "SkyLight", kind = "framework")]

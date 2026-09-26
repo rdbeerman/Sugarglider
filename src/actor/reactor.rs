@@ -8,23 +8,35 @@
 //! changes by sending requests out to the other actors in the system.
 
 mod animation;
+mod contexts;
+mod contexts_snapshot;
+mod create_context;
+mod focus;
 mod main_window;
+mod membership;
+mod parking;
+mod quit;
 mod replay;
+mod switcher;
 
 #[cfg(test)]
 mod restore_snapshots;
 #[cfg(test)]
 mod testing;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{mem, thread};
 
 use animation::{Animation, AnimationManager, Message as AnimationMessage};
-use main_window::MainWindowTracker;
+use main_window::{FocusSource, MainWindowTracker, RaisedWindow};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use parking::{Parked, ProcessLookup};
+use quit::PendingExit;
 use redact::Secret;
+use replay::LaunchState;
 pub use replay::{Record, replay};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -33,9 +45,12 @@ use tracing::{Span, debug, error, info, instrument, trace, warn};
 
 use super::mouse;
 use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, WindowInfo, pid_t};
+use crate::actor::contexts_snapshot::{CommandResult, ContextsSnapshot, RequestId};
+use crate::actor::contexts_store::{self, ContextsStore};
 use crate::actor::layout::{
     self, DragUpdate, DropAction, LayoutCommand, LayoutEvent, LayoutManager, LayoutWindowInfo,
 };
+use crate::actor::parked_journal::ParkedJournal;
 use crate::actor::raise::{self, RaiseManager, RaiseRequest};
 use crate::actor::space_manager::SpaceManager;
 use crate::actor::{group_bars, space_manager, status, window_server, wm_controller};
@@ -43,10 +58,12 @@ use crate::collections::{HashMap, HashSet};
 use crate::config::Config;
 use crate::log::{self, MetricsCommand};
 use crate::model::NodeId;
+use crate::model::contexts::{ContextId, Contexts, Query};
+use crate::sys::app::Process;
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
 use crate::sys::geometry::{CGRectDef, CGRectExt, SameAs, round_to_physical};
-use crate::sys::screen::{CoordinateConverter, SpaceId};
+use crate::sys::screen::{CoordinateConverter, ScreenId, SpaceId};
 use crate::sys::timer::Timer;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
 use crate::ui::swift_bridge;
@@ -61,16 +78,25 @@ pub fn channel() -> (Sender, Receiver) {
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Event {
-    /// The screen layout, including resolution, changed. This is always the
-    /// first event sent on startup.
+    /// Physical display ids in the order of the next screen parameters event.
+    DisplayIdsChanged(Vec<u32>),
+    /// The screen layout, including resolution, changed. DisplayIdsChanged
+    /// precedes it on startup.
     ///
-    /// The first vec is the frame for each screen. The main screen is always
-    /// first in the list.
+    /// `frames` holds the visible frame of each screen, and `bounds` the full
+    /// bounds of its display. The main screen is always first in both lists.
+    /// `ids` names each display, main screen first; a recording made before
+    /// M9 has none, and the screens then count from 1.
     ///
     /// See the `SpaceChanged` event for an explanation of the other parameters.
     ScreenParametersChanged {
         #[serde_as(as = "Vec<CGRectDef>")]
         frames: Vec<CGRect>,
+        #[serde_as(as = "Vec<CGRectDef>")]
+        #[serde(default)]
+        bounds: Vec<CGRect>,
+        #[serde(default)]
+        ids: Vec<ScreenId>,
         spaces: Vec<Option<SpaceId>>,
         scale_factors: Vec<f64>,
         converter: CoordinateConverter,
@@ -93,6 +119,11 @@ pub enum Event {
     /// space. Then we can update the windows on screen for the space before
     /// sending SpaceChanged.
     SpaceChanged(Vec<Option<SpaceId>>, WindowsOnScreen),
+
+    /// Sugarglider is about to stop managing these Spaces, because it is
+    /// turned off or the user turned the Spaces off. Every window on them
+    /// shows until the next space change.
+    ShowEverythingOn(Vec<SpaceId>),
 
     /// All running apps at launch have been registered.
     StartupComplete,
@@ -121,6 +152,8 @@ pub enum Event {
     ApplicationGloballyActivated(pid_t),
     ApplicationGloballyDeactivated(pid_t),
     ApplicationMainWindowChanged(pid_t, Option<WindowId>, Quiet),
+    /// An app the reactor asked to activate could not be made frontmost.
+    ActivateFailed(pid_t),
 
     WindowsDiscovered {
         pid: pid_t,
@@ -141,6 +174,11 @@ pub enum Event {
     // TODO: Consider replacing with WindowsOnScreenUpdated.
     WindowBecameVisible(WindowId),
     WindowDestroyed(WindowId),
+    /// The window's title changed. The title is recorded in the clear.
+    WindowTitleChanged(
+        WindowId,
+        #[serde(serialize_with = "redact::expose_secret")] Secret<String>,
+    ),
     WindowFrameChanged(
         WindowId,
         #[serde(with = "CGRectDef")] CGRect,
@@ -190,6 +228,13 @@ pub enum Event {
         sequence_id: u64,
     },
 
+    /// The raise manager sent the raise that focuses a sequence's window.
+    /// The batches before it raise windows quietly; only from here can the
+    /// sequence's failures and timeouts end a switch's wait.
+    RaiseFocusSent {
+        sequence_id: u64,
+    },
+
     LeftMouseDown(
         #[serde(with = "crate::sys::geometry::CGPointDef")] objc2_core_foundation::CGPoint,
         /// The window at the click point, if any. Used to detect clicks on
@@ -207,7 +252,14 @@ pub enum Event {
     },
 
     Command(Command),
+    /// A context command from the command line. The reactor publishes its
+    /// result in the contexts snapshot under the request's id.
+    ContextCommandRequested(RequestId, ContextCommand),
     ConfigChanged(Arc<Config>),
+
+    /// The contexts a config reload read when it turned contexts on. A
+    /// recording keeps them, so a replay applies the same contexts.
+    ContextsRead(Box<Contexts>),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -219,6 +271,7 @@ pub enum Command {
     Layout(LayoutCommand),
     Metrics(MetricsCommand),
     Reactor(ReactorCommand),
+    Context(ContextCommand),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -227,6 +280,151 @@ pub enum ReactorCommand {
     Debug,
     Serialize,
     SaveAndExit,
+}
+
+/// Commands that switch between contexts, the named window sets.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCommand {
+    /// Shows the context's windows in its layout and parks every other window.
+    SwitchContext(ContextRef),
+    /// Shows every window in each Space's normal layout.
+    ShowEverything,
+    /// Switches back to the context used before the current one.
+    PreviousContext,
+    /// Adds the focused window to the context. It shows where it is until
+    /// the next switch.
+    AddWindowToContext(ContextRef),
+    /// Moves the focused window out of the active context and into this one.
+    MoveWindowToContext(ContextRef),
+    /// Removes the focused window from the active context.
+    RemoveWindowFromContext,
+    /// Makes the focused window a member of every context, or stops that.
+    ToggleWindowPinned,
+    /// Creates a context with this name, whose members are the windows that
+    /// show on the visible Spaces, and switches to it.
+    CreateContext(String),
+    /// Opens the switcher panel, or closes it when it is open.
+    OpenContextSwitcher,
+    /// Adds a specific window to the context, or the focused window when
+    /// `window` is absent in a key binding.
+    AddWindow {
+        window: Option<WindowId>,
+        context: ContextRef,
+    },
+    /// Moves a specific window out of the active context and into this one.
+    MoveWindow {
+        window: Option<WindowId>,
+        context: ContextRef,
+    },
+    /// Pins or unpins a specific window.
+    TogglePinned { window: Option<WindowId> },
+    /// Creates a context from exactly these windows and switches to it.
+    CreateContextFromWindows {
+        name: String,
+        windows: Vec<WindowId>,
+    },
+    /// Changes a context's member windows and gone-window records.
+    EditContext {
+        context: ContextRef,
+        add: Vec<WindowId>,
+        remove: Vec<WindowId>,
+        remove_records: Vec<RecordRef>,
+    },
+    /// Renames a context (R4).
+    RenameContext { context: ContextRef, name: String },
+    /// Gives a context a number from 1 to 9, away from the context that
+    /// holds it (R5).
+    SetContextNumber { context: ContextRef, number: u8 },
+    /// Deletes a context (R6). Its windows stay open, and the ones that
+    /// were only in it become unsorted.
+    DeleteContext(ContextRef),
+    /// Changes a context's members: removes the records of closed windows,
+    /// removes windows at once, and adds windows for the next switch (R37).
+    EditContextMembers {
+        context: ContextRef,
+        #[serde(default)]
+        add: Vec<WindowId>,
+        #[serde(default)]
+        remove: Vec<WindowId>,
+        #[serde(default)]
+        remove_records: Vec<RecordRef>,
+    },
+    /// Removes the member record that `record` names, whose window is gone
+    /// (R23). The record's app and title must still match, so a list that
+    /// shifted since the client read it can't remove another record.
+    RemoveRecord {
+        context: ContextRef,
+        record: RecordRef,
+    },
+}
+
+/// Names a member record of a context in an edit command: its index in
+/// `Context.members`, and the app and title a client read there. The
+/// reactor removes the record only while all three still match, because
+/// the record can change while the switcher is open (R23).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RecordRef {
+    pub record: usize,
+    pub app: String,
+    pub title: String,
+}
+
+/// Names a context in a command.
+///
+/// A bare integer is always a number from 1 to 9, and a string is a name. An
+/// id is tagged, `{ id = 7 }` in TOML and `Id(7)` in RON.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(from = "ContextRefRepr", into = "ContextRefRepr")]
+pub enum ContextRef {
+    Number(u8),
+    Name(String),
+    Id(ContextId),
+}
+
+impl ContextRef {
+    /// The reference as the contexts model resolves it.
+    pub fn query(&self) -> Query<'_> {
+        match self {
+            ContextRef::Number(number) => Query::Number(*number),
+            ContextRef::Name(name) => Query::Name(name),
+            ContextRef::Id(id) => Query::Id(*id),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+enum ContextRefRepr {
+    Number(u8),
+    Name(String),
+    Tagged(TaggedContextRef),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+enum TaggedContextRef {
+    #[serde(rename = "id", alias = "Id")]
+    Id(ContextId),
+}
+
+impl From<ContextRefRepr> for ContextRef {
+    fn from(repr: ContextRefRepr) -> Self {
+        match repr {
+            ContextRefRepr::Number(number) => ContextRef::Number(number),
+            ContextRefRepr::Name(name) => ContextRef::Name(name),
+            ContextRefRepr::Tagged(TaggedContextRef::Id(id)) => ContextRef::Id(id),
+        }
+    }
+}
+
+impl From<ContextRef> for ContextRefRepr {
+    fn from(reference: ContextRef) -> Self {
+        match reference {
+            ContextRef::Number(number) => ContextRefRepr::Number(number),
+            ContextRef::Name(name) => ContextRefRepr::Name(name),
+            ContextRef::Id(id) => ContextRefRepr::Tagged(TaggedContextRef::Id(id)),
+        }
+    }
 }
 
 /// Tracks a potential title bar drag for drag-to-rearrange.
@@ -273,6 +471,8 @@ pub struct Reactor {
     frame_attempts: HashMap<WindowId, FrameAttempt>,
     record: Record,
     raise_manager_tx: raise::Sender,
+    /// The sequence id of the last raise request.
+    raise_sequence: u64,
     animation_tx: Option<animation::Sender>,
     mouse_tx: Option<mouse::Sender>,
     status_tx: Option<status::Sender>,
@@ -286,12 +486,78 @@ pub struct Reactor {
     /// window server reports them. This handles Cmd+W closing where the window
     /// is hidden rather than destroyed.
     hidden_windows: HashSet<WindowServerId>,
+    /// Windows parked in a screen corner.
+    parked: HashMap<WindowId, Parked>,
+    /// Windows a per-screen switch moved off a Space, with the Space they
+    /// left, until their frame lands on the new screen. The Space they left
+    /// doesn't take them back into its layouts until then.
+    moving_away: HashMap<WindowId, SpaceId>,
+    /// How many times each parked window was parked again since the last
+    /// switch or Space change, to stop fighting an app that moves it back.
+    repark_counts: HashMap<WindowId, u32>,
+    /// Windows the reactor saw for the first time before the window server
+    /// listed them, whose membership waits for the layer the list reports.
+    pending_first_seen: HashSet<WindowId>,
+    /// The frames of parked windows, on disk before the windows move.
+    journal: ParkedJournal,
+    /// Finds the process that has a pid now, to tell which journal entries
+    /// belong to apps that are still running.
+    process_lookup: ProcessLookup,
+    /// Windows put back from parking whose next frame write goes out even
+    /// when their known frame already matches it.
+    forced_writes: HashSet<WindowId>,
+    /// The user's contexts and the active context.
+    contexts: Contexts,
+    /// Where `contexts` are saved.
+    contexts_store: ContextsStore,
+    /// Whether `contexts_store` is still to be read. It is read when
+    /// contexts are on.
+    contexts_unread: bool,
+    /// Names the boot of the Mac, saved with the contexts.
+    boot_id: Option<String>,
+    /// A quit that waits for parked windows to come back.
+    pending_exit: Option<PendingExit>,
+    /// Visible Spaces that show every window until the next space change,
+    /// because Sugarglider is about to stop managing them.
+    showing_everything: HashSet<SpaceId>,
+    /// What the last switch waits for before focus from outside counts
+    /// again.
+    switch_guard: focus::SwitchGuard,
+    /// A window that took focus before the reactor saw it, and how.
+    focus_waiting: Option<(WindowId, FocusSource)>,
+    /// Windows added to a context since the last switch. They count as
+    /// members of the active context until the next switch.
+    added_since_switch: HashSet<WindowId>,
+    /// Where the layout is saved when Sugarglider quits. `None` saves nothing.
+    layout_file: Option<PathBuf>,
+    /// Ends the process with an exit code.
+    exit: Box<dyn FnMut(i32) + Send>,
+    /// The results of the last context commands from the command line,
+    /// oldest first, which the contexts snapshot carries.
+    command_results: VecDeque<CommandResult>,
+    /// The snapshot of the contexts published last.
+    published_contexts: Option<Arc<ContextsSnapshot>>,
+    /// Physical display ids in screen order, supplied by SpaceManager.
+    display_ids: Vec<u32>,
+    /// Shows the switcher panel with its payload, or closes it when it is
+    /// open. Tests replace it.
+    show_switcher: Box<dyn FnMut(String) + Send>,
+    /// Hides the switcher panel if it is open. Tests replace it.
+    hide_switcher: Box<dyn FnMut() + Send>,
+    /// Where snapshots of the contexts go.
+    publish_contexts: Box<dyn FnMut(Arc<ContextsSnapshot>) + Send>,
 }
 
 /// How many times in a row we write the same frame to a window before giving
 /// up, and how long a pause resets the count.
 const MAX_FRAME_ATTEMPTS: u32 = 5;
 const FRAME_ATTEMPT_RESET: Duration = Duration::from_secs(2);
+
+/// How many times a window is parked again since the last switch or Space
+/// change before Sugarglider leaves it where its app put it. An app that
+/// moves its parked window back every time would otherwise make Sugarglider
+/// write the corner in a loop.
+const MAX_REPARKS: u32 = 5;
 
 /// The smallest size difference that counts as an app refusing to shrink a
 /// window. Anything smaller is pixel rounding.
@@ -348,7 +614,13 @@ struct ResponseContext {
 
 #[derive(Copy, Clone, Debug)]
 struct Screen {
+    /// The display's id, which names the screen in the saved per-screen
+    /// contexts. It stays the same while a display is connected.
+    id: ScreenId,
+    /// The part of the display that the menu bar and the Dock leave free.
     frame: CGRect,
+    /// The whole display, including its menu bar and Dock.
+    bounds: CGRect,
     space: Option<SpaceId>,
     scale_factor: f64,
 }
@@ -360,7 +632,6 @@ pub struct TransactionId(u32);
 
 #[derive(Debug)]
 struct WindowState {
-    #[allow(unused)]
     title: Secret<String>,
     /// The last known frame of the window. Always includes the last write.
     ///
@@ -422,8 +693,29 @@ impl Reactor {
         thread::Builder::new()
             .name("reactor".to_string())
             .spawn(move || {
-                let mut reactor =
-                    Reactor::new(config.clone(), layout, record, group_indicators_tx.clone());
+                let journal =
+                    ParkedJournal::open(crate::config::parked_journal_file(), SystemTime::now());
+                let mut reactor = Reactor::new(
+                    config.clone(),
+                    layout,
+                    record,
+                    group_indicators_tx.clone(),
+                    journal,
+                );
+                reactor.open_contexts(
+                    ContextsStore::new(crate::config::contexts_file()),
+                    contexts_store::boot_id(),
+                    SystemTime::now(),
+                );
+                reactor.record_launch_state();
+                reactor.layout_file = Some(crate::config::restore_file());
+                reactor.exit = Box::new(|code| std::process::exit(code));
+                let contexts_status_tx = status_tx.clone();
+                reactor.publish_contexts = Box::new(move |snapshot| {
+                    crate::actor::contexts_snapshot::publish(snapshot.clone());
+                    contexts_status_tx.send(status::Event::ContextsChanged(snapshot));
+                });
+                reactor.publish_contexts_snapshot();
                 reactor.mouse_tx.replace(mouse_tx.clone());
                 reactor.status_tx.replace(status_tx.clone());
                 let space_manager = SpaceManager::new(
@@ -453,6 +745,7 @@ impl Reactor {
         mut layout: LayoutManager,
         mut record: Record,
         group_indicators_tx: group_bars::Sender,
+        journal: ParkedJournal,
     ) -> Reactor {
         // FIXME: Remove apps that are no longer running from restored state.
         record.start(&config, &layout);
@@ -476,6 +769,7 @@ impl Reactor {
             frame_attempts: HashMap::default(),
             record,
             raise_manager_tx,
+            raise_sequence: 0,
             animation_tx: None,
             mouse_tx: None,
             status_tx: None,
@@ -483,7 +777,48 @@ impl Reactor {
             debug_drop_zones_visible: false,
             startup_complete: false,
             hidden_windows: HashSet::default(),
+            parked: HashMap::default(),
+            moving_away: HashMap::default(),
+            repark_counts: HashMap::default(),
+            pending_first_seen: HashSet::default(),
+            journal,
+            process_lookup: Box::new(Process::with_pid),
+            forced_writes: HashSet::default(),
+            contexts: Contexts::new(),
+            contexts_store: ContextsStore::in_memory(),
+            contexts_unread: false,
+            boot_id: None,
+            pending_exit: None,
+            showing_everything: HashSet::default(),
+            switch_guard: Default::default(),
+            focus_waiting: None,
+            added_since_switch: HashSet::default(),
+            layout_file: None,
+            exit: Box::new(|code| info!(code, "Not quitting a reactor that has no exit")),
+            command_results: VecDeque::new(),
+            published_contexts: None,
+            display_ids: Vec::new(),
+            show_switcher: Box::new(swift_bridge::show_context_switcher),
+            hide_switcher: Box::new(swift_bridge::hide_context_switcher),
+            publish_contexts: Box::new(|_| {}),
         }
+    }
+
+    /// Records the journal, the contexts, and the process checks read at
+    /// launch, so that a replay of the recording starts from them.
+    fn record_launch_state(&mut self) {
+        let processes: Vec<(pid_t, Process)> = self
+            .journal
+            .entries()
+            .iter()
+            .map(|entry| (entry.pid, (self.process_lookup)(entry.pid)))
+            .collect();
+        let state = LaunchState {
+            journal: self.journal.entries().to_vec(),
+            contexts: (!self.contexts_unread).then(|| self.contexts.clone()),
+            processes,
+        };
+        self.record.launch_state(&self.layout, &state);
     }
 
     pub async fn run(mut self, events: Receiver, events_tx: Sender) {
@@ -534,6 +869,8 @@ impl Reactor {
                 _ = visibility_timer.next() => {
                     // Periodically refresh visible windows to detect closed windows.
                     self.update_visible_windows();
+                    self.exit_deadline_tick(Instant::now());
+                    self.guard_deadline_tick(Instant::now());
                     visibility_timer.set_next_fire(visibility_refresh_interval);
                 }
             }
@@ -552,12 +889,36 @@ impl Reactor {
     }
 
     fn handle_event(&mut self, event: Event) {
+        // These come many times a second and change nothing that the
+        // contexts snapshot holds, so no snapshot is built for them.
+        let pointer = matches!(
+            event,
+            Event::MouseMovedOverWindow(..)
+                | Event::LeftMouseDragged(_)
+                | Event::ScrollWheel { .. }
+        );
+        self.on_event(event);
+        self.exit_if_windows_are_back();
+        if !pointer {
+            self.publish_contexts_snapshot();
+        }
+    }
+
+    fn on_event(&mut self, event: Event) {
         self.record.on_event(&event);
         self.log_event(&event);
+        self.journal.retry_failed_write(Instant::now());
         let animation_focus_wids: Vec<WindowId> = Vec::new();
         let mut is_resize = false;
         let raised_window = self.main_window_tracker.handle_event(&event);
+        // An ApplicationActivated that ends a switch's wait for Finder is the
+        // switch's own activation, not the user's.
+        let ends_finder_wait = match &event {
+            Event::ApplicationActivated(pid, _) => self.switch_guard.finder == Some(*pid),
+            _ => false,
+        };
         match event {
+            Event::DisplayIdsChanged(ids) => self.display_ids = ids,
             Event::ApplicationLaunched {
                 pid,
                 info,
@@ -566,29 +927,62 @@ impl Reactor {
                 is_frontmost: _,
                 main_window: _,
             } => {
+                // With contexts off, a title change must not reach the window
+                // rules, so the app doesn't send one. An app that launches
+                // while contexts are on is told to send them; one that
+                // launches while they are off already keeps them off.
+                if self.contexts_enabled() {
+                    _ = handle.send(Request::TrackTitles(true));
+                }
                 self.apps.insert(pid, AppState { info, handle });
                 self.on_windows_discovered(pid, visible_windows, vec![]);
             }
             Event::StartupComplete => {
+                self.update_active_screen();
+                self.reconcile_cold_scope();
                 self.send_layout_event(LayoutEvent::AppsRunningUpdated(
                     self.apps.keys().copied().collect(),
                 ));
                 self.startup_complete = true;
+                self.drop_journal_entries_of_ended_apps();
                 // Don't force layout on startup - windows may already be in
                 // correct positions from a previous run. Layout will be
                 // enforced when something actually changes.
+                if self.contexts_in_use() {
+                    // The windows open at launch have rejoined their contexts,
+                    // and the ones that must not show are parked. When the
+                    // window that has the focus is one of them, the switch's
+                    // focus step moves the focus off it.
+                    self.apply_again_focusing_parked_main();
+                }
             }
             Event::ApplicationTerminated(pid) => {
                 if let Some(app) = self.apps.get_mut(&pid) {
                     _ = app.handle.send(Request::Terminate);
                 }
+                self.app_terminated(pid);
             }
             Event::ApplicationThreadTerminated(pid) => {
+                self.app_terminated(pid);
+                self.guarded_app_gone(pid);
                 self.apps.remove(&pid);
+                self.moving_away.retain(|wid, _| wid.pid != pid);
+                self.forget_parked_app(pid);
                 self.send_layout_event(LayoutEvent::AppClosed(pid));
             }
-            Event::ApplicationActivated(..)
-            | Event::ApplicationDeactivated(..)
+            Event::ApplicationActivated(pid, quiet) => {
+                // Also handled by MainWindowTracker.
+                if quiet == Quiet::No {
+                    self.app_still_running(pid);
+                }
+                self.app_activated(pid);
+            }
+            Event::ActivateFailed(pid) => {
+                // The app that no window could focus never took focus, so the
+                // wait for its activation ends.
+                self.app_activated(pid);
+            }
+            Event::ApplicationDeactivated(..)
             | Event::ApplicationGloballyActivated(..)
             | Event::ApplicationGloballyDeactivated(..) => {
                 // Handled by MainWindowTracker.
@@ -611,7 +1005,12 @@ impl Reactor {
                 if let Some(wsid) = window.sys_id {
                     self.window_ids.insert(wsid, wid);
                 }
-                self.windows.insert(wid, window.clone().into());
+                let first_seen = self.windows.insert(wid, window.clone().into()).is_none();
+                self.app_still_running(wid.pid);
+                if first_seen {
+                    let decided = self.windows_first_seen(&[wid]);
+                    self.focus_windows_seen(&decided);
+                }
                 if mouse_state == MouseState::Down {
                     self.in_drag = true;
                     // Suppress updates while left button is pressed in case
@@ -622,25 +1021,38 @@ impl Reactor {
                 Some(pid) => {
                     self.update_partial_window_server_info(on_screen);
                     // Notify the layout manager about visibility changes (e.g.,
-                    // when a window is minimized or unminimized).
-                    self.send_visible_windows_to_layout(pid);
+                    // when a window is minimized or unminimized). The update
+                    // that comes just before an app registers names none of
+                    // its windows, so with contexts in use it is not sent:
+                    // it would take the app's windows out of the layouts a
+                    // restart restored before they can rejoin their contexts.
+                    if self.apps.contains_key(&pid) || !self.contexts_in_use() {
+                        self.send_visible_windows_to_layout(pid);
+                        if self.startup_complete {
+                            self.park_what_must_not_show(pid);
+                        }
+                    }
                 }
                 None => self.update_complete_window_server_info(on_screen),
             },
             Event::WindowBecameVisible(wid) => {
                 if self.window_is_tracked(wid)
                     && let Some(window) = self.windows.get(&wid)
-                    && let Some(space) = self.best_space_for_window(&window.frame_monotonic)
+                    && let Some(frame) = self.layout_frame(wid)
+                    && let Some(space) = self.best_space_for_window(&frame)
+                    && self.reaches_layout(space, wid)
                     && let Some(info) = self.layout_window_info(wid)
                 {
                     // Check if there's already a visible window from the same app
                     // with the same frame (indicating this is a tab). If so, don't
                     // add - let the existing window represent this position.
+                    // Parked windows share a corner without being tabs.
                     let frame_key = Self::frame_key(&window.frame_monotonic);
                     let dominated_by_existing = self.visible_windows.iter().any(|wsid| {
                         self.window_ids.get(wsid).is_some_and(|other_wid| {
                             *other_wid != wid
                                 && other_wid.pid == wid.pid
+                                && !self.parked.contains_key(other_wid)
                                 && self.windows.get(other_wid).is_some_and(|other_window| {
                                     Self::frame_key(&other_window.frame_monotonic) == frame_key
                                 })
@@ -656,43 +1068,70 @@ impl Reactor {
                 self.in_drag = false;
                 self.resizing_window = None;
                 // Clean up hidden_windows tracking for this window.
-                if let Some(wsid) = self
-                    .window_ids
-                    .iter()
-                    .find(|(_, w)| **w == wid)
-                    .map(|(wsid, _)| *wsid)
+                if let Some(wsid) =
+                    self.window_ids.iter().find(|(_, w)| **w == wid).map(|(wsid, _)| *wsid)
                 {
                     self.hidden_windows.remove(&wsid);
                 }
                 // Check if another window will take this window's place (tab sibling)
-                // before removing it from self.windows.
-                let dominated_by_sibling = self
-                    .windows
-                    .get(&wid)
-                    .map(|w| {
-                        let frame_key = Self::frame_key(&w.frame_monotonic);
-                        self.windows.iter().any(|(other_wid, other_window)| {
-                            *other_wid != wid
-                                && other_wid.pid == wid.pid
-                                && Self::frame_key(&other_window.frame_monotonic) == frame_key
+                // before removing it from self.windows. Parked windows share a
+                // corner without being tabs.
+                let dominated_by_sibling = !self.parked.contains_key(&wid)
+                    && self
+                        .windows
+                        .get(&wid)
+                        .map(|w| {
+                            let frame_key = Self::frame_key(&w.frame_monotonic);
+                            self.windows.iter().any(|(other_wid, other_window)| {
+                                *other_wid != wid
+                                    && other_wid.pid == wid.pid
+                                    && !self.parked.contains_key(other_wid)
+                                    && Self::frame_key(&other_window.frame_monotonic) == frame_key
+                            })
                         })
-                    })
-                    .unwrap_or(false);
-                if self.windows.remove(&wid).is_none() {
+                        .unwrap_or(false);
+                let window = self.windows.remove(&wid);
+                if window.is_none() {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
+                self.pending_first_seen.remove(&wid);
+                self.window_closed(wid);
+                self.guarded_window_gone(wid);
                 self.frame_attempts.remove(&wid);
+                self.moving_away.remove(&wid);
+                self.forget_parked_window(wid, window.and_then(|window| window.window_server_id));
                 // Only send WindowRemoved if no sibling will take its place.
                 // For tabs, the sibling window already represents this position.
                 if !dominated_by_sibling {
                     self.send_layout_event(LayoutEvent::WindowRemoved(wid));
                 }
             }
+            Event::WindowTitleChanged(wid, title) => self.title_changed(wid, title),
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
                 if mouse_state == Some(MouseState::Up) {
                     // The button is up, so any resize we were holding off on is
                     // over, even if we never saw the MouseUp event.
                     self.resizing_window = None;
+                }
+                if !requested.0 && self.parked.contains_key(&wid) {
+                    debug!(
+                        ?wid,
+                        ?new_frame,
+                        "Keeping a parked window's frame change out of the layout"
+                    );
+                    self.observe_parked(wid, new_frame, last_seen);
+                    if self.contexts_enabled() && self.pending_exit.is_none() {
+                        // The app may have moved the window out of its corner.
+                        self.repark_moved_windows();
+                    }
+                    return;
+                }
+                if let Some(left) = self.moving_away.get(&wid).copied()
+                    && self.best_space_for_window(&new_frame) != Some(left)
+                {
+                    // A window a per-screen switch moved has arrived when its
+                    // frame is no longer on the Space it left.
+                    self.moving_away.remove(&wid);
                 }
                 let window = self.windows.get_mut(&wid).unwrap();
                 if last_seen != window.last_sent_txid {
@@ -736,6 +1175,9 @@ impl Reactor {
                             self.update_layout(&[], true);
                         }
                     }
+                    self.observe_parked(wid, new_frame, last_seen);
+                    self.confirm_unparked(wid, new_frame);
+                    self.frame_write_echoed(wid);
                     return;
                 }
                 let old_frame = mem::replace(&mut window.frame_monotonic, new_frame);
@@ -839,11 +1281,16 @@ impl Reactor {
                     && old != new
                     && let Some(info) = self.layout_window_info(wid)
                 {
+                    // The window leaves the old Space's layouts whether or not
+                    // the new Space's layout may take it.
+                    let added =
+                        self.screens[new].space.filter(|&space| self.reaches_layout(space, wid));
                     self.send_layout_event(LayoutEvent::WindowSpaceChanged {
                         wid,
-                        added: self.screens[new].space,
+                        added,
                         removed: self.screens[old].space,
                         info,
+                        contexts_in_use: self.contexts_in_use(),
                     });
                 }
                 if old_frame.size != new_frame.size {
@@ -872,30 +1319,38 @@ impl Reactor {
             }
             Event::ScreenParametersChanged {
                 frames,
+                bounds,
+                ids,
                 spaces,
                 converter,
                 scale_factors,
                 on_screen,
             } => {
                 info!("screen parameters changed");
+                self.showing_everything.retain(|space| spaces.contains(&Some(*space)));
                 let visible_window_order = on_screen.visible.clone();
                 self.update_complete_window_server_info(on_screen);
                 self.screens = frames
                     .into_iter()
                     .zip(spaces.clone())
                     .zip(scale_factors)
-                    .map(|((frame, space), scale_factor)| Screen { frame, space, scale_factor })
-                    .collect();
-                let response = self
-                    .screens
-                    .iter()
-                    .filter_map(|screen| screen.space.map(|space| (space, screen.frame.size)))
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(|(space, size)| {
-                        self.layout.handle_event(LayoutEvent::SpaceExposed(space, size))
+                    .enumerate()
+                    .map(|(idx, ((frame, space), scale_factor))| Screen {
+                        // A recording made before displays had ids numbers
+                        // the screens from 1, like the snapshot does.
+                        id: ids.get(idx).copied().unwrap_or_else(|| ScreenId::new(idx as u32 + 1)),
+                        frame,
+                        // Recordings made before displays reported their bounds
+                        // have none, so the visible frame stands in.
+                        bounds: bounds.get(idx).copied().unwrap_or(frame),
+                        space,
+                        scale_factor,
                     })
-                    .reduce(layout::EventResponse::coalesce);
+                    .collect();
+                if self.screens.iter().all(|screen| screen.space.is_none()) {
+                    self.hide_context_switcher();
+                }
+                let response = self.show_visible_spaces();
                 if let Some(response) = response {
                     self.handle_layout_response_with_context(
                         response,
@@ -908,7 +1363,11 @@ impl Reactor {
                         self.layout.debug_tree_desc(space, "after event", false);
                     }
                 }
+                self.repark_moved_windows();
                 self.update_active_screen();
+                if self.startup_complete && self.reconcile_cold_scope() && self.contexts_in_use() {
+                    self.apply_again_focusing_parked_main();
+                }
                 // FIXME: Update visible windows if space changed.
                 // Forward the event to group_indicators. We serialize these
                 // through the reactor instead of delivering directly from
@@ -932,17 +1391,17 @@ impl Reactor {
                 self.in_drag = false;
                 self.resizing_window = None;
                 info!("space changed");
+                self.showing_everything.clear();
+                // A Space change is a fresh start for the limit on parking
+                // windows again.
+                self.repark_counts.clear();
                 for (space, screen) in spaces.iter().zip(&mut self.screens) {
                     screen.space = *space;
                 }
-                let response = self
-                    .screens
-                    .iter()
-                    .filter_map(|screen| screen.space.map(|space| (space, screen.frame.size)))
-                    .map(|(space, size)| {
-                        self.layout.handle_event(LayoutEvent::SpaceExposed(space, size))
-                    })
-                    .reduce(layout::EventResponse::coalesce);
+                if self.screens.iter().all(|screen| screen.space.is_none()) {
+                    self.hide_context_switcher();
+                }
+                let response = self.show_visible_spaces();
                 if let Some(response) = response {
                     self.handle_layout_response_with_context(
                         response,
@@ -962,6 +1421,7 @@ impl Reactor {
                 self.update_active_screen();
                 self.update_visible_windows();
             }
+            Event::ShowEverythingOn(spaces) => self.show_everything_on(&spaces),
             Event::LeftMouseDown(point, window_at_point) => {
                 if let Some(screen) = self.active_screen().copied()
                     && let Some(space) = screen.space
@@ -1142,6 +1602,9 @@ impl Reactor {
                     // The space is disabled.
                     return;
                 };
+                if !self.reaches_layout(to_space, wid) {
+                    return;
+                }
                 let current_main = match (self.main_window_space(), self.main_window()) {
                     (Some(space), Some(id)) => Some((space, id)),
                     _ => None,
@@ -1176,10 +1639,15 @@ impl Reactor {
             Event::RaiseCompleted { window_id, sequence_id } => {
                 let msg = raise::Event::RaiseCompleted { window_id, sequence_id };
                 _ = self.raise_manager_tx.send((Span::current(), msg));
+                self.raise_ended(sequence_id, Some(window_id));
             }
             Event::RaiseRequestFailed { windows, sequence_id, quiet } => {
-                let msg = raise::Event::RaiseRequestFailed { windows, sequence_id };
+                let msg = raise::Event::RaiseRequestFailed {
+                    windows: windows.clone(),
+                    sequence_id,
+                };
                 _ = self.raise_manager_tx.send((Span::current(), msg));
+                self.raise_failed(sequence_id, &windows);
                 if quiet == Quiet::No
                     && let Some(main_window) = self.main_window()
                 {
@@ -1192,7 +1660,9 @@ impl Reactor {
             Event::RaiseTimeout { sequence_id } => {
                 let msg = raise::Event::RaiseTimeout { sequence_id };
                 _ = self.raise_manager_tx.send((Span::current(), msg));
+                self.raise_ended(sequence_id, None);
             }
+            Event::RaiseFocusSent { sequence_id } => self.raise_started(sequence_id),
             Event::ScrollWheel { delta_x, delta_y, alt_held } => {
                 if !self.config.settings.experimental.scroll.enable {
                     return;
@@ -1238,6 +1708,18 @@ impl Reactor {
                 }
             }
             Event::Command(Command::Metrics(cmd)) => log::handle_command(cmd),
+            Event::Command(Command::Context(cmd)) => {
+                info!(?cmd);
+                self.handle_context_command(cmd);
+            }
+            Event::ContextCommandRequested(request, cmd) => {
+                info!(?request, ?cmd);
+                let result = self.run_context_command(cmd);
+                if let Err(reason) = &result {
+                    info!(?request, "The context command did nothing: {reason}");
+                }
+                self.record_command_result(request, result.err());
+            }
             Event::Command(Command::Reactor(ReactorCommand::Debug)) => {
                 for screen in &self.screens {
                     if let Some(space) = screen.space {
@@ -1259,23 +1741,30 @@ impl Reactor {
             }
             Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)) => {
                 info!("SaveAndExit command received");
-                match self.layout.save(crate::config::restore_file()) {
-                    Ok(()) => std::process::exit(0),
-                    Err(e) => {
-                        error!("Could not save layout: {e}");
-                        std::process::exit(3);
-                    }
-                }
+                self.save_and_exit(Instant::now());
             }
             Event::ConfigChanged(config) => {
+                let contexts_were_enabled = self.contexts_enabled();
+                let scope = self.config.settings.experimental.contexts.scope;
                 self.layout.set_config(&config);
                 self.config = config;
+                if self.contexts_enabled() != contexts_were_enabled {
+                    self.contexts_turned_on_or_off();
+                } else if self.contexts_enabled()
+                    && self.config.settings.experimental.contexts.scope != scope
+                {
+                    self.scope_changed(scope);
+                }
             }
+            Event::ContextsRead(contexts) => self.contexts_read(*contexts),
         }
-        if let Some(raised_window) = raised_window {
+        if let Some(RaisedWindow { wid: raised_window, source }) = raised_window {
             let spaces = self.screens.iter().flat_map(|screen| screen.space).collect();
             self.send_layout_event(LayoutEvent::WindowFocused(spaces, raised_window));
             self.update_active_screen();
+            if !ends_finder_wait {
+                self.focus_changed(raised_window, source);
+            }
         }
         if !self.in_drag {
             self.update_layout(&animation_focus_wids, is_resize);
@@ -1284,10 +1773,14 @@ impl Reactor {
 
     fn update_complete_window_server_info(&mut self, on_screen: WindowsOnScreen) {
         for info in on_screen.info.iter().filter(|i| i.layer == 0) {
-            let Some(wid) = self.window_ids.get(&info.id) else {
+            let Some(&wid) = self.window_ids.get(&info.id) else {
                 continue;
             };
-            let Some(window) = self.windows.get_mut(wid) else {
+            if let Some(parked) = self.parked.get_mut(&wid) {
+                parked.observed = info.frame;
+                continue;
+            }
+            let Some(window) = self.windows.get_mut(&wid) else {
                 continue;
             };
             // Assume this update comes from after the last write. Typically the
@@ -1312,13 +1805,14 @@ impl Reactor {
         // with Cmd+W). The window server might still show them as visible, but
         // we should not include them in the layout.
         self.visible_windows.extend(
-            on_screen
-                .visible
-                .into_iter()
-                .filter(|wsid| !self.hidden_windows.contains(wsid)),
+            on_screen.visible.into_iter().filter(|wsid| !self.hidden_windows.contains(wsid)),
         );
         self.window_server_info
             .extend(on_screen.info.into_iter().map(|info| (info.id, info)));
+        // The windows waiting for their layer can now have their membership
+        // decided, before the caller parks the ones that must not show.
+        let decided = self.decide_pending_membership();
+        self.focus_windows_seen(&decided);
     }
 
     fn should_compare_visible_window(&self, wsid: WindowServerId) -> bool {
@@ -1373,6 +1867,11 @@ impl Reactor {
         //
         // TODO: Notice when returning from the login screen and ask again for
         // undiscovered windows.
+        let first_seen: Vec<WindowId> = new
+            .iter()
+            .map(|&(wid, _)| wid)
+            .filter(|wid| !self.windows.contains_key(wid))
+            .collect();
         self.window_ids
             .extend(new.iter().flat_map(|(wid, info)| info.sys_id.map(|wsid| (wsid, *wid))));
         self.windows.extend(new.into_iter().map(|(wid, info)| (wid, info.into())));
@@ -1400,7 +1899,21 @@ impl Reactor {
             self.visible_windows.retain(|wsid| !self.hidden_windows.contains(wsid));
         }
 
+        // The membership of the windows found for the first time is decided
+        // before the layout sees them. Windows parked before a restart go
+        // back first, so the layout sees them at their frames from before
+        // parking. The windows open at launch are parked, if they must not
+        // show, when startup completes.
+        if !first_seen.is_empty() {
+            self.app_still_running(pid);
+        }
+        self.decide_membership(&first_seen);
+        self.restore_from_journal(pid);
         self.send_visible_windows_to_layout(pid);
+        if self.startup_complete {
+            self.park_what_must_not_show(pid);
+        }
+        self.focus_windows_seen(&first_seen);
     }
 
     /// Sends the current list of visible windows for the given app to the
@@ -1422,27 +1935,46 @@ impl Reactor {
             .filter(|wid| self.window_is_tracked(*wid))
         {
             let Some(window) = self.windows.get(&wid) else { continue };
-            let Some(space) = self.best_space_for_window(&window.frame_monotonic) else {
-                continue;
-            };
             let Some(layout_info) = self.layout_window_info(wid) else {
                 continue;
             };
-            // Tabs in the same window group will have the same visual frame.
-            let frame_key = Self::frame_key(&window.frame_monotonic);
-            // If we've already seen a window with this frame, skip this one
-            // unless it's the main window (active tab).
-            if seen_frames.contains(&frame_key) {
-                if main_window != Some(wid) {
-                    continue;
-                }
-                // This is the main window, remove the previous entry with this frame
-                // and add this one instead.
-                if let Some(windows) = app_windows.get_mut(&space) {
-                    windows.retain(|(_, info)| Self::frame_key(&info.frame) != frame_key);
-                }
+            let Some(space) = self.best_space_for_window(&layout_info.frame) else {
+                continue;
+            };
+            // A window a per-screen switch just moved away is not on the
+            // Space it left any more, even though its frame still says so
+            // until the write lands.
+            if self.moving_away.get(&wid) == Some(&space) {
+                continue;
             }
-            seen_frames.insert(frame_key);
+            // A parked window stays in the list of a layout it belongs to, at
+            // its frame from before parking, so that parking never removes
+            // its node.
+            let parked = self.parked.contains_key(&wid);
+            if !(self.reaches_layout(space, wid) || parked && self.shows_on(space, wid)) {
+                continue;
+            }
+            // Tabs in the same window group will have the same visual frame.
+            // Parked windows share a corner without being tabs.
+            if !parked {
+                let frame_key = Self::frame_key(&window.frame_monotonic);
+                // If we've already seen a window with this frame, skip this one
+                // unless it's the main window (active tab).
+                if seen_frames.contains(&frame_key) {
+                    if main_window != Some(wid) {
+                        continue;
+                    }
+                    // This is the main window, remove the previous entry with this frame
+                    // and add this one instead.
+                    if let Some(windows) = app_windows.get_mut(&space) {
+                        windows.retain(|(other, info)| {
+                            self.parked.contains_key(other)
+                                || Self::frame_key(&info.frame) != frame_key
+                        });
+                    }
+                }
+                seen_frames.insert(frame_key);
+            }
             app_windows.entry(space).or_default().push((wid, layout_info));
         }
         let screens = self.screens.clone();
@@ -1483,12 +2015,22 @@ impl Reactor {
         self.screens[self.best_screen_idx_for_window(frame)?].space
     }
 
+    /// The frame that places a window on a screen and a Space, and that the
+    /// layout sees. For a parked window, that is its frame from before it was
+    /// parked, not its corner.
+    fn layout_frame(&self, wid: WindowId) -> Option<CGRect> {
+        match self.parked.get(&wid) {
+            Some(parked) => Some(parked.before),
+            None => Some(self.windows.get(&wid)?.frame_monotonic),
+        }
+    }
+
     /// Gathers the window properties the layout uses to classify a window.
     fn layout_window_info(&self, wid: WindowId) -> Option<LayoutWindowInfo> {
         let window = self.windows.get(&wid)?;
         let app = self.apps.get(&wid.pid);
         Some(LayoutWindowInfo {
-            frame: window.frame_monotonic,
+            frame: self.layout_frame(wid)?,
             bundle_id: app.and_then(|a| a.info.bundle_id.clone()),
             app_name: app.and_then(|a| a.info.localized_name.clone()),
             title: window.title.clone().into(),
@@ -1505,8 +2047,7 @@ impl Reactor {
 
     fn update_active_screen(&mut self) {
         let changed = (|| {
-            let frame = self.windows.get(&self.main_window()?)?.frame_monotonic;
-            let screen = self.best_screen_idx_for_window(&frame)?;
+            let screen = self.current_main_screen_index()?;
             Some(self.active_screen_idx.replace(screen as u16) != Some(screen as u16))
         })();
         if changed.unwrap_or(false)
@@ -1514,6 +2055,11 @@ impl Reactor {
         {
             status_tx.send(status::Event::FocusedScreenChanged);
         }
+    }
+
+    fn current_main_screen_index(&self) -> Option<usize> {
+        let frame = self.layout_frame(self.main_window()?)?;
+        self.best_screen_idx_for_window(&frame)
     }
 
     fn active_screen(&self) -> Option<&Screen> {
@@ -1549,8 +2095,10 @@ impl Reactor {
         }
     }
 
-    fn handle_layout_response(&mut self, response: layout::EventResponse) {
-        self.handle_layout_response_with_context(response, ResponseContext::default());
+    /// Handles the layout's response, and returns the sequence id of the
+    /// raise request it made, if any.
+    fn handle_layout_response(&mut self, response: layout::EventResponse) -> Option<u64> {
+        self.handle_layout_response_with_context(response, ResponseContext::default())
     }
 
     fn handle_layout_response_with_context(
@@ -1560,7 +2108,7 @@ impl Reactor {
             visible_window_order,
             from_mouse,
         }: ResponseContext,
-    ) {
+    ) -> Option<u64> {
         if let Some(visible_window_order) = visible_window_order {
             response = self.filter_response(response, &visible_window_order);
         }
@@ -1580,7 +2128,7 @@ impl Reactor {
             }
         }
         if raise_windows.is_empty() && focus_window.is_none() {
-            return;
+            return None;
         }
 
         let mut app_handles = HashMap::default();
@@ -1592,9 +2140,9 @@ impl Reactor {
 
         let mut windows_by_app_and_screen = HashMap::default();
         for &wid in &raise_windows {
-            let Some(window) = self.windows.get(&wid) else { continue };
+            let Some(frame) = self.layout_frame(wid) else { continue };
             windows_by_app_and_screen
-                .entry((wid.pid, self.best_space_for_window(&window.frame_monotonic)))
+                .entry((wid.pid, self.best_space_for_window(&frame)))
                 .or_insert(vec![])
                 .push(wid);
         }
@@ -1610,13 +2158,17 @@ impl Reactor {
             (wid, warp)
         });
 
+        self.raise_sequence += 1;
+        let sequence_id = self.raise_sequence;
         let msg = raise::Event::RaiseRequest(RaiseRequest {
             raise_windows: windows_by_app_and_screen.into_values().collect(),
             focus_window: focus_window_with_warp,
             app_handles,
+            sequence_id,
         });
 
         _ = self.raise_manager_tx.send((Span::current(), msg));
+        Some(sequence_id)
     }
 
     fn filter_response(
@@ -1664,7 +2216,7 @@ impl Reactor {
 
     fn main_window_space(&self) -> Option<SpaceId> {
         // TODO: Optimize this with a cache or something.
-        self.best_space_for_window(&self.windows.get(&self.main_window()?)?.frame_monotonic)
+        self.best_space_for_window(&self.layout_frame(self.main_window()?)?)
     }
 
     #[instrument(skip(self), fields())]
@@ -1715,13 +2267,19 @@ impl Reactor {
                 // here rather than deferred to mouse up.
                 continue;
             }
+            if self.parked.contains_key(&wid) {
+                // A parked window keeps its place in the layout but stays in
+                // its corner.
+                continue;
+            }
             let Some(window) = self.windows.get_mut(&wid) else {
                 // If we restored a saved state the window may not be available yet.
                 continue;
             };
             let target_frame = round_to_physical(target_frame, scale_factor);
             let current_frame = window.frame_monotonic;
-            if target_frame.same_as(current_frame) {
+            let forced = self.forced_writes.remove(&wid);
+            if target_frame.same_as(current_frame) && !forced {
                 continue;
             }
             // Some apps move a window back after we place it, which turns into
@@ -1759,10 +2317,22 @@ impl Reactor {
             anim.add_window(&app.handle, wid, current_frame, target_frame, is_new, txid);
             window.frame_monotonic = target_frame;
         }
+        self.forced_writes.clear();
         // If the user is doing something with the mouse we don't want to
         // animate on top of that.
         let skip_anim =
             skip_anim || !self.config.settings.animate || self.layout.has_active_scroll_animation();
+        self.send_animation(anim, skip_anim);
+
+        // Refresh debug overlay if visible
+        self.refresh_debug_drop_zones();
+    }
+
+    /// Hands the frames to the animation manager, which ends any animation in
+    /// progress before it writes them. With no animation manager, the final
+    /// frames are written at once. `skip_anim` writes the final frames
+    /// without animating.
+    fn send_animation(&self, anim: Animation, skip_anim: bool) {
         if let Some(tx) = &self.animation_tx
             && !anim.is_empty()
         {
@@ -1781,9 +2351,6 @@ impl Reactor {
         } else {
             anim.skip_to_end();
         }
-
-        // Refresh debug overlay if visible
-        self.refresh_debug_drop_zones();
     }
 
     /// Animate windows to preview positions during a drag operation.
@@ -1866,7 +2433,7 @@ pub mod tests {
     use super::testing::*;
     use super::*;
     use crate::actor::app::Request;
-    use crate::actor::layout::{LayoutManager, SizeShare};
+    use crate::actor::layout::{ActiveContext, LayoutManager, SizeShare};
     use crate::model::Direction;
     use crate::sys::window_server::WindowServerId;
 
@@ -1875,7 +2442,9 @@ pub mod tests {
         let mut apps = Apps::new();
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -1907,7 +2476,9 @@ pub mod tests {
         let (mut reactor, mut animation_rx) =
             Reactor::new_for_test_with_animation(LayoutManager::new_for_test(), true);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -1937,7 +2508,9 @@ pub mod tests {
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let wid = WindowId::new(1, 1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -1993,7 +2566,9 @@ pub mod tests {
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let wid = WindowId::new(1, 1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2025,7 +2600,9 @@ pub mod tests {
         let mut apps = Apps::new();
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2064,7 +2641,9 @@ pub mod tests {
         let mut apps = Apps::new();
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2107,7 +2686,9 @@ pub mod tests {
         let mut apps = Apps::new();
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2157,7 +2738,9 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2180,7 +2763,9 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![1.0],
             converter: CoordinateConverter::default(),
@@ -2226,7 +2811,9 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2244,6 +2831,232 @@ pub mod tests {
     }
 
     #[test]
+    fn it_keeps_each_displays_bounds_next_to_its_visible_frame() {
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let visible = CGRect::new(CGPoint::new(0., 25.), CGSize::new(1000., 975.));
+        let bounds = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let event = Event::ScreenParametersChanged {
+            ids: vec![],
+            frames: vec![visible],
+            bounds: vec![bounds],
+            spaces: vec![Some(SpaceId::new(1))],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        };
+        let event = ron::de::from_str(&ron::ser::to_string(&event).unwrap()).unwrap();
+        reactor.handle_event(event);
+        assert_eq!(visible, reactor.screens[0].frame);
+        assert_eq!(bounds, reactor.screens[0].bounds);
+    }
+
+    #[test]
+    fn a_recording_without_display_bounds_uses_the_visible_frames() {
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let visible = CGRect::new(CGPoint::new(0., 25.), CGSize::new(1000., 975.));
+        let event = Event::ScreenParametersChanged {
+            ids: vec![],
+            frames: vec![visible],
+            bounds: vec![],
+            spaces: vec![Some(SpaceId::new(1))],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        };
+        let recorded = ron::ser::to_string(&event).unwrap();
+        let old_recording = recorded.replace("bounds:[],", "");
+        assert_ne!(recorded, old_recording);
+        reactor.handle_event(ron::de::from_str(&old_recording).unwrap());
+        assert_eq!(visible, reactor.screens[0].bounds);
+    }
+
+    #[test]
+    fn h1_a_display_without_reported_bounds_uses_its_visible_frame() {
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let main = CGRect::new(CGPoint::new(0., 25.), CGSize::new(1000., 975.));
+        let main_bounds = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let right = CGRect::new(CGPoint::new(1000., 25.), CGSize::new(1000., 975.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
+            frames: vec![main, right],
+            bounds: vec![main_bounds],
+            spaces: vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
+            scale_factors: vec![2.0, 2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        assert_eq!(
+            vec![(main, main_bounds), (right, right)],
+            reactor
+                .screens
+                .iter()
+                .map(|screen| (screen.frame, screen.bounds))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_recording_file_made_before_displays_reported_bounds_replays() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("trace.ron");
+        let mut config = Config::default();
+        config.settings.default_disable = false;
+        config.settings.animate = false;
+        let (group_indicators_tx, _) = crate::actor::channel();
+        let mut reactor = Reactor::new(
+            Arc::new(config),
+            LayoutManager::new_for_test(),
+            Record::new(Some(&path)),
+            group_indicators_tx,
+            ParkedJournal::in_memory(),
+        );
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
+            frames: vec![screen],
+            bounds: vec![screen],
+            spaces: vec![Some(SpaceId::new(1))],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        let mut apps = Apps::new();
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        apps.simulate_until_quiet(&mut reactor);
+        drop(reactor);
+
+        let recorded = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(1, recorded.matches("bounds:[").count());
+        let start = recorded.find("bounds:[").unwrap();
+        let end = start + recorded[start..].find("],").unwrap() + 2;
+        let old_recording = format!("{}{}", &recorded[..start], &recorded[end..]);
+        assert!(!old_recording.contains("bounds:"));
+        std::fs::write(&path, old_recording).unwrap();
+
+        replay(&path, |_, _| {}).unwrap();
+    }
+
+    /// A replay starts from the parked-window journal and the contexts that
+    /// the recorded reactor read at launch, so it writes the same frames: it
+    /// puts back the window parked before the launch and parks the window
+    /// that isn't in the active context.
+    #[test]
+    fn a_replay_starts_from_the_journal_and_the_contexts_read_at_launch() {
+        use crate::actor::contexts_store::ContextsStore;
+        use crate::actor::parked_journal::JournalEntry;
+        use crate::model::contexts::{ContextKey, Contexts, WindowDesc};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("trace.ron");
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let mut contexts = Contexts::new();
+        let id = contexts.create("C").unwrap();
+        let desc = WindowDesc {
+            wid: WindowId::new(1, 1),
+            bundle_id: Some("com.testapp1".into()),
+            app_name: Some("TestApp1".into()),
+            title: "Window1".into(),
+            window_server_id: Some(WindowServerId::new(1)),
+        };
+        contexts.add_window(id, &desc).unwrap();
+        contexts.switch_to(ContextKey::Named(id)).unwrap();
+        let store = ContextsStore::new(dir.path().join("contexts.json"));
+        store.save(&contexts, Some("boot")).unwrap();
+        let parked_before = CGRect::new(CGPoint::new(500., 0.), CGSize::new(500., 1000.));
+        let mut journal =
+            ParkedJournal::open(dir.path().join("parked.json"), std::time::SystemTime::now());
+        journal
+            .record(vec![JournalEntry {
+                pid: 1,
+                bundle_id: Some("com.testapp1".into()),
+                window_server_id: WindowServerId::new(2),
+                title: "Window2".into(),
+                frame: parked_before.into(),
+            }])
+            .unwrap();
+        let mut config = Config::default();
+        config.settings.default_disable = false;
+        config.settings.animate = false;
+        config.settings.experimental.contexts.enable = true;
+        let (group_indicators_tx, _) = crate::actor::channel();
+        let mut reactor = Reactor::new(
+            Arc::new(config),
+            LayoutManager::new_for_test(),
+            Record::new(Some(&path)),
+            group_indicators_tx,
+            ParkedJournal::open(dir.path().join("parked.json"), std::time::SystemTime::now()),
+        );
+        reactor.process_lookup = Box::new(test_app_process);
+        reactor.open_contexts(store, Some("boot".into()), std::time::SystemTime::now());
+        reactor.record_launch_state();
+        reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
+            frames: vec![screen],
+            bounds: vec![screen],
+            spaces: vec![Some(SpaceId::new(1))],
+            scale_factors: vec![1.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        let mut apps = Apps::new();
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        reactor.handle_event(Event::StartupComplete);
+        let frame_writes = |requests: Vec<Request>| -> Vec<(WindowId, CGRect)> {
+            requests
+                .into_iter()
+                .filter_map(|request| match request {
+                    Request::SetWindowFrame(wid, frame, _) => Some((wid, frame)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let recorded = frame_writes(apps.requests());
+        assert!(recorded.contains(&(WindowId::new(1, 2), parked_before)));
+        assert_eq!(
+            vec![WindowId::new(1, 2)],
+            reactor.parked.keys().copied().collect::<Vec<_>>()
+        );
+        drop(reactor);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        replay(&path, move |_, request| _ = tx.send(request)).unwrap();
+        let mut replayed = vec![];
+        while let Ok(request) = rx.recv_timeout(Duration::from_millis(200)) {
+            replayed.push(request);
+        }
+        assert_eq!(recorded, frame_writes(replayed));
+    }
+
+    /// The launch state line keeps the active context, whichever it is.
+    #[test]
+    fn the_launch_state_line_keeps_every_active_context() {
+        use crate::model::contexts::{ContextKey, Contexts};
+
+        let mut contexts = Contexts::new();
+        let id = contexts.create("C").unwrap();
+        for key in [
+            ContextKey::Everything,
+            ContextKey::Unsorted,
+            ContextKey::Named(id),
+        ] {
+            contexts.switch_to(key).unwrap();
+            let state = LaunchState {
+                journal: vec![],
+                contexts: Some(contexts.clone()),
+                processes: vec![],
+            };
+            let line = ron::ser::to_string(&state).unwrap();
+            let read: LaunchState = ron::de::from_str(&line).unwrap();
+            assert_eq!(
+                Some(key),
+                read.contexts.map(|contexts| contexts.active()),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn it_selects_the_main_window_on_space_enable() {
         let mut apps = Apps::new();
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
@@ -2257,7 +3070,9 @@ pub mod tests {
             })
             .collect::<Vec<_>>();
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
+            bounds: vec![],
             spaces: vec![None],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2297,7 +3112,9 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2308,7 +3125,9 @@ pub mod tests {
         while raise_manager_rx.try_recv().is_ok() {}
 
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2325,7 +3144,9 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2344,7 +3165,9 @@ pub mod tests {
             frame: CGRect::new(CGPoint::new(0., 0.), CGSize::new(100., 100.)),
         }];
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2361,7 +3184,9 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2374,7 +3199,11 @@ pub mod tests {
         // A screen change that doesn't disturb the stacking shouldn't restack.
         let desired = reactor
             .layout
-            .handle_event(LayoutEvent::SpaceExposed(space, CGSize::new(1000., 900.)))
+            .handle_event(LayoutEvent::SpaceExposed(
+                space,
+                CGSize::new(1000., 900.),
+                ActiveContext::EVERYTHING,
+            ))
             .raise_windows;
         let on_screen = desired
             .iter()
@@ -2386,7 +3215,9 @@ pub mod tests {
             })
             .collect();
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2403,7 +3234,9 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2428,7 +3261,9 @@ pub mod tests {
             frame: window.frame_monotonic,
         }));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2445,7 +3280,9 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2457,7 +3294,11 @@ pub mod tests {
 
         let desired = reactor
             .layout
-            .handle_event(LayoutEvent::SpaceExposed(space, CGSize::new(1000., 1000.)))
+            .handle_event(LayoutEvent::SpaceExposed(
+                space,
+                CGSize::new(1000., 1000.),
+                ActiveContext::EVERYTHING,
+            ))
             .raise_windows;
         let on_screen = desired
             .iter()
@@ -2484,7 +3325,9 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2496,7 +3339,11 @@ pub mod tests {
 
         let desired = reactor
             .layout
-            .handle_event(LayoutEvent::SpaceExposed(space, CGSize::new(1000., 1000.)))
+            .handle_event(LayoutEvent::SpaceExposed(
+                space,
+                CGSize::new(1000., 1000.),
+                ActiveContext::EVERYTHING,
+            ))
             .raise_windows;
         let on_screen = desired
             .iter()
@@ -2524,7 +3371,9 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2536,7 +3385,11 @@ pub mod tests {
 
         let desired = reactor
             .layout
-            .handle_event(LayoutEvent::SpaceExposed(space, CGSize::new(1000., 1000.)))
+            .handle_event(LayoutEvent::SpaceExposed(
+                space,
+                CGSize::new(1000., 1000.),
+                ActiveContext::EVERYTHING,
+            ))
             .raise_windows;
         let mut on_screen = vec![WindowServerInfo {
             id: WindowServerId::new(90),
@@ -2558,9 +3411,7 @@ pub mod tests {
         let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
         match msg {
             raise::Event::RaiseRequest(RaiseRequest {
-                raise_windows,
-                focus_window,
-                app_handles: _,
+                raise_windows, focus_window, ..
             }) => {
                 assert_eq!(raise_windows, vec![desired]);
                 assert!(focus_window.is_none());
@@ -2573,7 +3424,9 @@ pub mod tests {
     fn filter_response_clears_matching_focus_and_raise_windows() {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.screens = vec![Screen {
+            id: ScreenId::new(1),
             frame: CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.)),
+            bounds: CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.)),
             space: Some(SpaceId::new(1)),
             scale_factor: 2.0,
         }];
@@ -2668,7 +3521,9 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2680,7 +3535,11 @@ pub mod tests {
 
         let desired = reactor
             .layout
-            .handle_event(LayoutEvent::SpaceExposed(space, CGSize::new(1000., 1000.)))
+            .handle_event(LayoutEvent::SpaceExposed(
+                space,
+                CGSize::new(1000., 1000.),
+                ActiveContext::EVERYTHING,
+            ))
             .raise_windows;
         let mut on_screen = vec![
             WindowServerInfo {
@@ -2716,7 +3575,9 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
+            bounds: vec![],
             spaces: vec![None],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2746,7 +3607,9 @@ pub mod tests {
         let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen1, screen2],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
@@ -2778,7 +3641,9 @@ pub mod tests {
         let space1 = SpaceId::new(1);
         let space2 = SpaceId::new(2);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen1, screen2],
+            bounds: vec![],
             spaces: vec![Some(space1), Some(space2)],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
@@ -2855,7 +3720,9 @@ pub mod tests {
         let space1 = SpaceId::new(1);
         let space2 = SpaceId::new(2);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen1, screen2],
+            bounds: vec![],
             spaces: vec![Some(space1), Some(space2)],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
@@ -2906,7 +3773,9 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -2982,7 +3851,9 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3048,7 +3919,9 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3090,7 +3963,9 @@ pub mod tests {
         let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen1, screen2],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
@@ -3120,9 +3995,7 @@ pub mod tests {
         let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
         match msg {
             raise::Event::RaiseRequest(RaiseRequest {
-                raise_windows,
-                focus_window,
-                app_handles: _,
+                raise_windows, focus_window, ..
             }) => {
                 let raise_windows: HashSet<Vec<WindowId>> = raise_windows.into_iter().collect();
                 let expected = [
@@ -3175,7 +4048,9 @@ pub mod tests {
         let space = SpaceId::new(1);
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3202,14 +4077,18 @@ pub mod tests {
         assert_ne!(default, modified);
 
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::ZERO],
+            bounds: vec![],
             spaces: vec![None],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
         });
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3263,7 +4142,9 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3282,10 +4163,12 @@ pub mod tests {
         // Simulate the system resizing a window after it recognizes an old
         // configurations. Resize events are not sent in this case.
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![
                 full_screen,
                 CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.)),
             ],
+            bounds: vec![],
             spaces: vec![Some(SpaceId::new(1)), None],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
@@ -3320,7 +4203,9 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3353,7 +4238,9 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3394,7 +4281,9 @@ pub mod tests {
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3450,7 +4339,9 @@ pub mod tests {
         // First reactor: simulate the state before shutdown with three apps running
         let mut reactor1 = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor1.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3474,7 +4365,9 @@ pub mod tests {
         let mut apps2 = Apps::new();
         let mut reactor2 = Reactor::new_for_test(restored_layout);
         reactor2.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3519,7 +4412,9 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3544,7 +4439,9 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1200., 1200.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3675,7 +4572,9 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3723,7 +4622,9 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3770,7 +4671,9 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3826,7 +4729,9 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
+            bounds: vec![],
             spaces: vec![Some(space)],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
@@ -3863,6 +4768,61 @@ pub mod tests {
         );
     }
 
+    /// R28. Without contexts, every Space the reactor exposes shows
+    /// Everything's layout, so no context layout is ever made.
+    #[test]
+    fn it_shows_everything_on_every_space_without_contexts() {
+        let mut apps = Apps::new();
+        let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
+        let space1 = SpaceId::new(1);
+        let space2 = SpaceId::new(2);
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let shorter = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.));
+        reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
+            frames: vec![screen],
+            bounds: vec![],
+            spaces: vec![Some(space1)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        reactor.handle_events(apps.make_app(1, make_windows(2)));
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_event(Event::SpaceChanged(
+            vec![Some(space2)],
+            WindowsOnScreen::new(vec![]),
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
+            frames: vec![shorter],
+            bounds: vec![],
+            spaces: vec![Some(space1)],
+            scale_factors: vec![2.0],
+            converter: CoordinateConverter::default(),
+            on_screen: Default::default(),
+        });
+        apps.simulate_until_quiet(&mut reactor);
+
+        assert!(reactor.layout.serialize_to_string().contains(",context_layouts:{},"));
+        let mut frames = reactor.layout.calculate_layout(space1, shorter, &reactor.config);
+        frames.sort_by_key(|&(wid, _)| wid);
+        assert_eq!(
+            vec![
+                (
+                    WindowId::new(1, 1),
+                    CGRect::new(CGPoint::new(0., 0.), CGSize::new(500., 900.))
+                ),
+                (
+                    WindowId::new(1, 2),
+                    CGRect::new(CGPoint::new(500., 0.), CGSize::new(500., 900.))
+                ),
+            ],
+            frames
+        );
+    }
+
     /// Moves the window slightly without the mouse, as an app might, so the
     /// next layout pass has something to correct.
     fn nudge_window(apps: &mut Apps, reactor: &mut Reactor, wid: WindowId) {
@@ -3877,5 +4837,139 @@ pub mod tests {
             Requested(false),
             None,
         ));
+    }
+
+    /// The contexts as the status item's title and menu receive them.
+    mod menu_bar {
+        use std::sync::{Arc, Mutex};
+
+        use pretty_assertions::assert_eq;
+        use test_log::test;
+
+        use super::super::create_context::tests::{Setup, space, wid};
+        use super::super::{ContextCommand, ContextRef, Event, Reactor};
+        use crate::actor::contexts_snapshot::{ContextsSnapshot, ScreenContext};
+        use crate::model::contexts::ContextKey;
+        use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
+        use crate::ui::status_bar::ContextMenuKeys;
+        use crate::ui::status_bar::context_menu::{MenuAction, MenuEntry, context_menu};
+
+        type Published = Arc<Mutex<Vec<Arc<ContextsSnapshot>>>>;
+
+        /// Keeps every snapshot that the reactor publishes from now on.
+        fn capture(reactor: &mut Reactor) -> Published {
+            let published = Published::default();
+            let sink = published.clone();
+            reactor.publish_contexts =
+                Box::new(move |snapshot| sink.lock().unwrap().push(snapshot));
+            published
+        }
+
+        fn count(published: &Published) -> usize {
+            published.lock().unwrap().len()
+        }
+
+        fn last(published: &Published) -> ContextsSnapshot {
+            (**published.lock().unwrap().last().unwrap()).clone()
+        }
+
+        /// A window server snapshot that lists app 1's windows at their
+        /// frames.
+        fn listed(s: &Setup, idxs: &[u32]) -> WindowsOnScreen {
+            WindowsOnScreen::new(
+                idxs.iter()
+                    .map(|&idx| WindowServerInfo {
+                        id: WindowServerId::new(idx),
+                        pid: 1,
+                        layer: 0,
+                        frame: s.apps.windows[&wid(idx)].frame,
+                    })
+                    .collect(),
+            )
+        }
+
+        /// Menu bar, R29. When the windows of an active Unsorted all join a
+        /// context, Unsorted isn't listed any more. The menu built from the
+        /// published snapshot then offers no Unsorted item, whose switch the
+        /// reactor would refuse, and the reactor refuses that switch.
+        #[test]
+        fn the_menu_offers_no_unsorted_item_while_unsorted_is_not_listed() {
+            let mut s = Setup::new(2);
+            let work = s.reactor.contexts.create("Unsorted work").unwrap();
+            let desc = s.reactor.window_desc(wid(1)).unwrap();
+            s.reactor.contexts.add_window(work, &desc).unwrap();
+            let unsorted = || ContextCommand::SwitchContext(ContextRef::Name("Unsorted".into()));
+            s.run(unsorted());
+            assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+            assert_eq!(vec![wid(1)], s.parked());
+            let desc = s.reactor.window_desc(wid(2)).unwrap();
+            s.reactor.contexts.add_window(work, &desc).unwrap();
+            let published = capture(&mut s.reactor);
+
+            s.reactor.handle_event(Event::MouseUp);
+
+            let snapshot = last(&published);
+            assert_eq!(ContextKey::Unsorted, snapshot.active);
+            assert!(!snapshot.unsorted.listed);
+            let entries = context_menu(&snapshot, &ContextMenuKeys::default(), |action| {
+                action.command().is_some()
+            });
+            let switches: Vec<(&str, bool)> = entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    MenuEntry::Item(item) if matches!(item.action, MenuAction::Switch(_)) => {
+                        Some((item.title.as_str(), item.checked))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                vec![("Unsorted work", false), ("Show Everything", false)],
+                switches
+            );
+            let used = s.reactor.contexts.last_used(ContextKey::Unsorted);
+            s.run(unsorted());
+            assert_eq!(used, s.reactor.contexts.last_used(ContextKey::Unsorted));
+            assert_eq!(vec![wid(1)], s.parked());
+        }
+
+        /// Menu bar, with the coordinator's decision for a desktop without
+        /// a managed Space. When no screen shows a managed Space any more,
+        /// the reactor publishes a snapshot without screens, and the active
+        /// context stays, so the title can tell that no Space shows it.
+        /// This holds for a Space change from the login window, and for
+        /// R33's path, where the Space shows Everything before it is turned
+        /// off.
+        #[test]
+        fn leaving_every_managed_space_publishes_a_snapshot_without_screens() {
+            let mut s = Setup::new(2);
+            s.create("Work");
+            let work = ContextKey::Named(s.id("Work"));
+            let shows = |key| vec![ScreenContext { id: 1, shows: key }];
+            let all = listed(&s, &[1, 2]);
+            let published = capture(&mut s.reactor);
+
+            s.reactor.handle_event(Event::SpaceChanged(vec![None], all.clone()));
+
+            assert_eq!(1, count(&published));
+            let login_window = last(&published);
+            assert_eq!(Vec::<ScreenContext>::new(), login_window.screens);
+            assert_eq!(work, login_window.active);
+
+            s.reactor.handle_event(Event::SpaceChanged(vec![Some(space())], all.clone()));
+            s.apps.simulate_until_quiet(&mut s.reactor);
+            assert_eq!(shows(work), last(&published).screens);
+            s.reactor.handle_event(Event::ShowEverythingOn(vec![space()]));
+            s.apps.simulate_until_quiet(&mut s.reactor);
+            assert_eq!(shows(ContextKey::Everything), last(&published).screens);
+            let before = count(&published);
+
+            s.reactor.handle_event(Event::SpaceChanged(vec![None], all));
+
+            assert_eq!(before + 1, count(&published));
+            let turned_off = last(&published);
+            assert_eq!(Vec::<ScreenContext>::new(), turned_off.screens);
+            assert_eq!(work, turned_off.active);
+        }
     }
 }

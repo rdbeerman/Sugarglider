@@ -13,9 +13,10 @@ use tracing::{Span, debug, info};
 use super::{Event, Reactor, Record, Requested, TransactionId, animation};
 use crate::actor::app::{AppThreadHandle, Request, WindowId};
 use crate::actor::layout::LayoutManager;
+use crate::actor::parked_journal::ParkedJournal;
 use crate::actor::reactor;
 use crate::config::Config;
-use crate::sys::app::{AppInfo, WindowInfo};
+use crate::sys::app::{AppInfo, Process, WindowInfo};
 use crate::sys::geometry::SameAs;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
 
@@ -26,7 +27,15 @@ impl Reactor {
         config.settings.animate = false;
         let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
         let (group_indicators_tx, _) = crate::actor::channel();
-        Reactor::new(Arc::new(config), layout, record, group_indicators_tx)
+        let mut reactor = Reactor::new(
+            Arc::new(config),
+            layout,
+            record,
+            group_indicators_tx,
+            ParkedJournal::in_memory(),
+        );
+        reactor.process_lookup = Box::new(test_app_process);
+        reactor
     }
 
     pub fn new_for_test_with_animation(
@@ -38,7 +47,14 @@ impl Reactor {
         config.settings.animate = animate;
         let record = Record::new_for_test(tempfile::NamedTempFile::new().unwrap());
         let (group_indicators_tx, _) = crate::actor::channel();
-        let mut reactor = Reactor::new(Arc::new(config), layout, record, group_indicators_tx);
+        let mut reactor = Reactor::new(
+            Arc::new(config),
+            layout,
+            record,
+            group_indicators_tx,
+            ParkedJournal::in_memory(),
+        );
+        reactor.process_lookup = Box::new(test_app_process);
         let (tx, rx) = unbounded_channel();
         reactor.animation_tx = Some(tx);
         (reactor, rx)
@@ -68,6 +84,21 @@ impl Drop for Reactor {
                 panic!("replay failed: {e}");
             }
         }
+    }
+}
+
+/// The app that `Apps::make_app` launches with `pid`.
+pub fn test_app_info(pid: pid_t) -> AppInfo {
+    AppInfo {
+        bundle_id: Some(format!("com.testapp{pid}")),
+        localized_name: Some(format!("TestApp{pid}")),
+    }
+}
+
+/// The process of the test app that `Apps::make_app` launches with `pid`.
+pub fn test_app_process(pid: pid_t) -> Process {
+    Process::Running {
+        bundle_id: Some(format!("com.testapp{pid}")),
     }
 }
 
@@ -137,7 +168,8 @@ impl Apps {
         main_window: Option<WindowId>,
         is_frontmost: bool,
     ) -> Vec<Event> {
-        self.make_app_impl(pid, windows, main_window, is_frontmost, true)
+        let info = test_app_info(pid);
+        self.make_app_impl(pid, info, windows, main_window, is_frontmost, true)
     }
 
     pub fn make_app_without_ws_info(
@@ -147,12 +179,27 @@ impl Apps {
         main_window: Option<WindowId>,
         is_frontmost: bool,
     ) -> Vec<Event> {
-        self.make_app_impl(pid, windows, main_window, is_frontmost, false)
+        let info = test_app_info(pid);
+        self.make_app_impl(pid, info, windows, main_window, is_frontmost, false)
+    }
+
+    /// Like [`Apps::make_app_with_opts`], for an app that `info` describes,
+    /// such as an app that runs again with a new pid.
+    pub fn make_app_with_info(
+        &mut self,
+        pid: pid_t,
+        info: AppInfo,
+        windows: Vec<WindowInfo>,
+        main_window: Option<WindowId>,
+        is_frontmost: bool,
+    ) -> Vec<Event> {
+        self.make_app_impl(pid, info, windows, main_window, is_frontmost, true)
     }
 
     fn make_app_impl(
         &mut self,
         pid: pid_t,
+        info: AppInfo,
         windows: Vec<WindowInfo>,
         main_window: Option<WindowId>,
         is_frontmost: bool,
@@ -188,10 +235,7 @@ impl Apps {
         }
         events.push(Event::ApplicationLaunched {
             pid,
-            info: AppInfo {
-                bundle_id: Some(format!("com.testapp{pid}")),
-                localized_name: Some(format!("TestApp{pid}")),
-            },
+            info,
             handle,
             is_frontmost,
             main_window,
@@ -229,7 +273,9 @@ impl Apps {
         for request in requests {
             debug!(?request);
             match request {
-                Request::Terminate => break,
+                // Every app shares this channel, so the requests that follow
+                // can be for other apps.
+                Request::Terminate => continue,
                 Request::GetVisibleWindows => {
                     // Only do this once per cycle, since we simulate responding
                     // from all apps.
@@ -300,6 +346,11 @@ impl Apps {
                 }
                 Request::Raise(..) => todo!(),
                 Request::WindowDestroyed(..) => todo!(),
+                // A test sends the activation events itself.
+                Request::Activate(_) => {}
+                // Titles only reach the reactor while contexts are on, which
+                // no test app thread needs to simulate.
+                Request::TrackTitles(_) => {}
             }
         }
         debug!(?events);

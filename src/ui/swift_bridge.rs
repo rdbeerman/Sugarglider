@@ -11,7 +11,11 @@ use std::ffi::{CStr, CString, c_char};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
+use crate::actor::contexts_snapshot::{self, CONTEXTS_OFF};
+use crate::actor::reactor::Command;
+use crate::actor::wm_controller::{WmCommand, WmEvent};
 use crate::config::{self, Config};
+use crate::ui::context_switcher::{SwitcherCommand, rank_snapshot};
 use crate::ui::preferences_json::PreferencesJson;
 
 /// Track whether the Swift UI library is available
@@ -53,6 +57,9 @@ unsafe extern "C" {
     /// Hides drop zone overlays (defined in DropZoneOverlay.swift)
     fn sugarglider_hide_drop_zones();
 
+    fn sugarglider_show_context_switcher(json: *const c_char);
+    fn sugarglider_hide_context_switcher();
+
     /// Shows a transient size share badge (defined in SizeShareBadge.swift)
     fn sugarglider_show_size_share_badge(
         text: *const c_char,
@@ -77,6 +84,8 @@ pub fn init() -> bool {
         std::hint::black_box(sugarglider_update_config as *const () as usize);
         std::hint::black_box(sugarglider_save_config_to_file as *const () as usize);
         std::hint::black_box(sugarglider_free_string as *const () as usize);
+        std::hint::black_box(sugarglider_rank_contexts as *const () as usize);
+        std::hint::black_box(sugarglider_run_context_command as *const () as usize);
 
         // The library is linked at compile time, so if we got here it's available
         SWIFT_UI_AVAILABLE.store(true, Ordering::SeqCst);
@@ -96,6 +105,89 @@ pub fn init() -> bool {
 /// Check if Swift UI is available
 pub fn is_available() -> bool {
     SWIFT_UI_AVAILABLE.load(Ordering::SeqCst)
+}
+
+/// Sends a fresh show payload to Swift, which copies it before returning.
+pub fn show_context_switcher(json: String) {
+    #[cfg(feature = "swift-ui")]
+    if is_available() {
+        if let Ok(json) = CString::new(json) {
+            unsafe { sugarglider_show_context_switcher(json.as_ptr()) };
+        }
+    }
+    #[cfg(not(feature = "swift-ui"))]
+    let _ = json;
+}
+
+/// Hides the panel, including when a context action came from another source.
+pub fn hide_context_switcher() {
+    #[cfg(feature = "swift-ui")]
+    if is_available() {
+        unsafe { sugarglider_hide_context_switcher() };
+    }
+}
+
+/// Returns ranked contexts from the last published snapshot. No actor reply
+/// is needed while the panel waits on the main thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn sugarglider_rank_contexts(query: *const c_char) -> *mut c_char {
+    if query.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Ok(query) = (unsafe { CStr::from_ptr(query) }).to_str() else {
+        return std::ptr::null_mut();
+    };
+    let Some(snapshot) = contexts_snapshot::published()
+        .filter(|snapshot| snapshot.enabled && snapshot.shown().is_some())
+    else {
+        return std::ptr::null_mut();
+    };
+    serde_json::to_string(&rank_snapshot(query, &snapshot))
+        .ok()
+        .and_then(|json| CString::new(json).ok())
+        .map_or(std::ptr::null_mut(), CString::into_raw)
+}
+
+/// Checks the command against the published snapshot and queues it without
+/// waiting for the reactor or WmController to execute it.
+#[unsafe(no_mangle)]
+pub extern "C" fn sugarglider_run_context_command(json: *const c_char) -> *mut c_char {
+    if json.is_null() {
+        return error_string("Null command pointer");
+    }
+    let Ok(json) = (unsafe { CStr::from_ptr(json) }).to_str() else {
+        return error_string("Invalid UTF-8 in context command");
+    };
+    let command: SwitcherCommand = match serde_json::from_str(json) {
+        Ok(command) => command,
+        Err(err) => return error_string(&format!("Invalid context command: {err}")),
+    };
+    let Some(snapshot) = contexts_snapshot::published().filter(|snapshot| snapshot.enabled) else {
+        return error_string(CONTEXTS_OFF);
+    };
+    if snapshot.shown().is_none() {
+        return error_string("No Space is managed right now");
+    }
+    let command = match command.checked(&snapshot) {
+        Ok(command) => command,
+        Err(err) => return error_string(&err),
+    };
+    let Some(sender) = CONFIG_UPDATE_SENDER.get() else {
+        return error_string("The context command channel is unavailable");
+    };
+    let Ok(sender) = sender.try_lock() else {
+        return error_string("The context command channel is busy");
+    };
+    let Some(sender) = sender.as_ref() else {
+        return error_string("The context command channel is unavailable");
+    };
+    match sender.send((
+        tracing::Span::current(),
+        WmEvent::Command(WmCommand::ReactorCommand(Command::Context(command))),
+    )) {
+        Ok(()) => std::ptr::null_mut(),
+        Err(_) => error_string("The context command channel is closed"),
+    }
 }
 
 /// Show the preferences window.

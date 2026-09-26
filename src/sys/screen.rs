@@ -101,7 +101,7 @@ impl<S: System> ScreenCache<S> {
 
         let screens: Vec<ScreenInfo> = cg_screens
             .iter()
-            .flat_map(|&CGScreenInfo { cg_id, .. }| {
+            .flat_map(|&CGScreenInfo { cg_id, bounds }| {
                 let Some(ns_screen) = ns_screens.iter().find(|s| s.cg_id == cg_id) else {
                     warn!("Can't find NSScreen corresponding to {cg_id:?}");
                     return None;
@@ -109,6 +109,7 @@ impl<S: System> ScreenCache<S> {
                 let converted = converter.convert_rect(ns_screen.visible_frame).unwrap();
                 Some(ScreenInfo {
                     visible_frame: converted,
+                    bounds,
                     id: cg_id,
                     scale_factor: ns_screen.backing_scale_factor,
                 })
@@ -239,18 +240,59 @@ type CGDirectDisplayID = u32;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScreenInfo {
+    /// The part of the display that the menu bar and the Dock leave free.
     pub visible_frame: CGRect,
+    /// The whole display, including its menu bar and Dock.
+    pub bounds: CGRect,
     pub id: ScreenId,
     pub scale_factor: f64,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy, Serialize)]
+#[serde(transparent)]
 pub struct ScreenId(CGDirectDisplayID);
 
-#[cfg(test)]
 impl ScreenId {
+    pub fn get(self) -> u32 {
+        self.0
+    }
+
     pub fn new(id: u32) -> ScreenId {
         ScreenId(id)
+    }
+}
+
+/// Reads a display id written as an integer or as the string form of one,
+/// since JSON object keys are strings and the contexts file keys screens by
+/// display id.
+impl<'de> Deserialize<'de> for ScreenId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ScreenIdVisitor;
+
+        impl serde::de::Visitor<'_> for ScreenIdVisitor {
+            type Value = ScreenId;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a display id as an integer or as a string")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<ScreenId, E> {
+                u32::try_from(value).map(ScreenId).map_err(E::custom)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<ScreenId, E> {
+                u32::try_from(value).map(ScreenId).map_err(E::custom)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<ScreenId, E> {
+                value.trim().parse::<u32>().map(ScreenId).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(ScreenIdVisitor)
     }
 }
 
@@ -441,6 +483,52 @@ mod test {
                 .iter()
                 .map(|s| s.visible_frame)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn it_reports_the_full_display_bounds_next_to_the_visible_frame() {
+        let main = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1920.0, 1080.0));
+        let above = CGRect::new(CGPoint::new(0.0, -1080.0), CGSize::new(1920.0, 1080.0));
+        let mut sc = ScreenCache::new_with(Stub {
+            cg_screens: vec![
+                CGScreenInfo {
+                    cg_id: ScreenId(2),
+                    bounds: above,
+                },
+                CGScreenInfo {
+                    cg_id: ScreenId(1),
+                    bounds: main,
+                },
+            ],
+        });
+        let ns_screens = vec![
+            NSScreenInfo {
+                cg_id: ScreenId(1),
+                frame: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1920.0, 1080.0)),
+                visible_frame: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1920.0, 1055.0)),
+                backing_scale_factor: 2.0,
+            },
+            NSScreenInfo {
+                cg_id: ScreenId(2),
+                frame: CGRect::new(CGPoint::new(0.0, 1080.0), CGSize::new(1920.0, 1080.0)),
+                visible_frame: CGRect::new(CGPoint::new(0.0, 1080.0), CGSize::new(1920.0, 1055.0)),
+                backing_scale_factor: 2.0,
+            },
+        ];
+        let (screens, _) = sc.update_screen_config(ns_screens).unwrap();
+        assert_eq!(
+            vec![
+                (
+                    CGRect::new(CGPoint::new(0.0, 25.0), CGSize::new(1920.0, 1055.0)),
+                    main
+                ),
+                (
+                    CGRect::new(CGPoint::new(0.0, -1055.0), CGSize::new(1920.0, 1055.0)),
+                    above
+                ),
+            ],
+            screens.iter().map(|s| (s.visible_frame, s.bounds)).collect::<Vec<_>>()
         );
     }
 

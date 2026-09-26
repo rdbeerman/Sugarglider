@@ -3,28 +3,34 @@
 
 //! Menu bar icon for displaying the current space ID.
 
+pub(crate) mod context_menu;
+
+use std::cell::RefCell;
 use std::ffi::c_void;
 
+pub use context_menu::ContextMenuKeys;
+use context_menu::{MenuAction, MenuEntry, MenuItem, command_available, context_menu};
 use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSEventModifierFlags, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSEventModifierFlags, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem,
     NSVariableStatusItemLength,
 };
 use objc2_core_foundation::CGSize;
-use objc2_foundation::{NSData, NSObject, NSString, ns_string};
+use objc2_foundation::{NSData, NSInteger, NSObject, NSObjectProtocol, NSString, ns_string};
 use tracing::{Span, debug, warn};
 
 use crate::actor::layout::LayoutCommand;
-use crate::actor::reactor;
 use crate::actor::wm_controller::{self, WmCmd, WmCommand, WmEvent};
+use crate::actor::{contexts_snapshot, reactor};
 use crate::config;
 use crate::ui::swift_bridge;
 
 /// Key equivalent info for a menu item (key character and modifier flags).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuKeyEquivalent {
     /// The key character (e.g., "c" for the C key).
     pub key: String,
@@ -36,24 +42,23 @@ impl MenuKeyEquivalent {
     /// Convert a livesplit_hotkey::Hotkey to menu key equivalent format.
     pub fn from_hotkey(hotkey: &livesplit_hotkey::Hotkey) -> Option<Self> {
         let s = hotkey.to_string();
+        let (modifier_names, key_part) = match s.rsplit_once(" + ") {
+            Some((modifiers, key)) => (modifiers, key),
+            None => ("", s.as_str()),
+        };
         let mut modifiers = NSEventModifierFlags::empty();
 
-        // Check for modifiers
-        if s.contains("Ctrl") {
-            modifiers |= NSEventModifierFlags::Control;
+        // Check for modifiers, each exactly as the hotkey writes it. The
+        // config writes the Command modifier as Meta.
+        for modifier in modifier_names.split(" + ").filter(|name| !name.is_empty()) {
+            modifiers |= match modifier {
+                "Ctrl" => NSEventModifierFlags::Control,
+                "Alt" | "Option" => NSEventModifierFlags::Option,
+                "Shift" => NSEventModifierFlags::Shift,
+                "Meta" => NSEventModifierFlags::Command,
+                _ => return None,
+            };
         }
-        if s.contains("Alt") {
-            modifiers |= NSEventModifierFlags::Option;
-        }
-        if s.contains("Shift") {
-            modifiers |= NSEventModifierFlags::Shift;
-        }
-        if s.contains("Cmd") || s.contains("Super") {
-            modifiers |= NSEventModifierFlags::Command;
-        }
-
-        // Extract the key name (last part after " + ")
-        let key_part = s.rsplit(" + ").next()?;
 
         // Convert key name to single character for NSMenuItem
         let key = key_part
@@ -87,11 +92,17 @@ const TOGGLE_SPACE_TAG: i64 = 3;
 const FLOAT_WINDOW_TAG: i64 = 4;
 const SHOW_PREFERENCES_TAG: i64 = 5;
 const CLEAN_UP_SPACE_TAG: i64 = 6;
+/// The tag of the first item of the contexts section. Each item of the
+/// section has its own tag from here on.
+const CONTEXT_ACTION_TAG_BASE: i64 = 1000;
+
+/// `NSControlStateValueOn`, which shows a checkmark on a menu item.
+const MENU_ITEM_STATE_ON: NSInteger = 1;
 
 pub struct StatusIcon {
     status_item: Retained<NSStatusItem>,
     mtm: MainThreadMarker,
-    _menu_handler: Retained<MenuHandler>,
+    menu_handler: Retained<MenuHandler>,
     toggle_item: Retained<NSMenuItem>,
     space_toggle_item: Retained<NSMenuItem>,
     float_window_item: Retained<NSMenuItem>,
@@ -141,6 +152,7 @@ impl StatusIcon {
         menu.setAutoenablesItems(false);
 
         let menu_handler = MenuHandler::new(mtm, wm_tx);
+        menu.setDelegate(Some(ProtocolObject::from_ref(&*menu_handler)));
 
         // Global toggle item - "Stop Globally" when enabled, "Start Globally" when disabled
         let toggle_ns_title = ns_string!("Stop Globally");
@@ -248,7 +260,7 @@ impl StatusIcon {
         Self {
             status_item,
             mtm,
-            _menu_handler: menu_handler,
+            menu_handler,
             toggle_item,
             space_toggle_item,
             float_window_item,
@@ -264,6 +276,11 @@ impl StatusIcon {
         } else {
             warn!("Could not get button from status item");
         }
+    }
+
+    /// Sets the key equivalents that the contexts section shows.
+    pub fn set_context_keys(&mut self, keys: ContextMenuKeys) {
+        *self.menu_handler.ivars().context_keys.borrow_mut() = keys;
     }
 
     /// Sets the toggle menu item title.
@@ -313,6 +330,13 @@ impl Drop for StatusIcon {
 
 struct MenuHandlerIvars {
     wm_tx: wm_controller::Sender,
+    /// The key equivalents that the contexts section shows.
+    context_keys: RefCell<ContextMenuKeys>,
+    /// The items of the contexts section, which the next rebuild removes.
+    context_items: RefCell<Vec<Retained<NSMenuItem>>>,
+    /// The actions of the contexts section's items, by tag, from
+    /// `CONTEXT_ACTION_TAG_BASE`.
+    context_actions: RefCell<Vec<MenuAction>>,
 }
 
 define_class!(
@@ -376,10 +400,22 @@ define_class!(
                     debug!("Opening preferences window");
                     swift_bridge::show_preferences();
                 }
+                tag if tag >= CONTEXT_ACTION_TAG_BASE => {
+                    self.run_context_action(tag - CONTEXT_ACTION_TAG_BASE);
+                }
                 _ => {
                     warn!("Unknown tag: {}", tag);
                 }
             }
+        }
+    }
+
+    unsafe impl NSObjectProtocol for MenuHandler {}
+
+    unsafe impl NSMenuDelegate for MenuHandler {
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn menu_needs_update(&self, menu: &NSMenu) {
+            self.rebuild_contexts_section(menu);
         }
     }
 );
@@ -388,8 +424,107 @@ impl MenuHandler {
     /// Creates the parachute icon from the SVG file
     pub fn new(mtm: MainThreadMarker, wm_tx: wm_controller::Sender) -> Retained<Self> {
         let this = Self::alloc(mtm);
-        let this = this.set_ivars(MenuHandlerIvars { wm_tx });
+        let this = this.set_ivars(MenuHandlerIvars {
+            wm_tx,
+            context_keys: RefCell::default(),
+            context_items: RefCell::default(),
+            context_actions: RefCell::default(),
+        });
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn run_context_action(&self, index: i64) {
+        let actions = &self.ivars().context_actions;
+        let action = usize::try_from(index).ok().and_then(|i| actions.borrow().get(i).cloned());
+        let Some(action) = action else {
+            warn!("Unknown contexts menu item: {index}");
+            return;
+        };
+        let Some(command) = action.command() else {
+            warn!(?action, "No command for the contexts menu item");
+            return;
+        };
+        debug!(?command, "Sending the contexts menu item's command");
+        let _ = self.ivars().wm_tx.send((Span::current(), WmEvent::Command(command)));
+    }
+
+    /// Replaces the contexts section at the top of `menu` with one built from
+    /// the published contexts snapshot.
+    fn rebuild_contexts_section(&self, menu: &NSMenu) {
+        let ivars = self.ivars();
+        for item in ivars.context_items.take() {
+            menu.removeItem(&item);
+        }
+        let entries = match contexts_snapshot::published() {
+            Some(snapshot) => {
+                context_menu(&snapshot, &ivars.context_keys.borrow(), command_available)
+            }
+            None => Vec::new(),
+        };
+        let mut actions = Vec::new();
+        let items: Vec<Retained<NSMenuItem>> =
+            entries.iter().map(|entry| self.ns_menu_entry(entry, &mut actions)).collect();
+        for (index, item) in items.iter().enumerate() {
+            menu.insertItem_atIndex(item, index as NSInteger);
+        }
+        *ivars.context_items.borrow_mut() = items;
+        *ivars.context_actions.borrow_mut() = actions;
+    }
+
+    fn ns_menu_entry(
+        &self,
+        entry: &MenuEntry,
+        actions: &mut Vec<MenuAction>,
+    ) -> Retained<NSMenuItem> {
+        let mtm = self.mtm();
+        match entry {
+            MenuEntry::Separator => NSMenuItem::separatorItem(mtm),
+            MenuEntry::Item(item) => self.ns_menu_item(item, actions),
+            MenuEntry::Submenu { title, enabled, items } => {
+                let title = NSString::from_str(title);
+                let submenu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &title);
+                submenu.setAutoenablesItems(false);
+                for item in items {
+                    submenu.addItem(&self.ns_menu_item(item, actions));
+                }
+                let parent = unsafe {
+                    NSMenuItem::initWithTitle_action_keyEquivalent(
+                        NSMenuItem::alloc(mtm),
+                        &title,
+                        None,
+                        ns_string!(""),
+                    )
+                };
+                parent.setSubmenu(Some(&submenu));
+                parent.setEnabled(*enabled);
+                parent
+            }
+        }
+    }
+
+    /// An item whose tag is its action's place in `actions`, from
+    /// `CONTEXT_ACTION_TAG_BASE`.
+    fn ns_menu_item(&self, item: &MenuItem, actions: &mut Vec<MenuAction>) -> Retained<NSMenuItem> {
+        let key = NSString::from_str(item.key.as_ref().map_or("", |key| key.key.as_str()));
+        let ns_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(self.mtm()),
+                &NSString::from_str(&item.title),
+                Some(sel!(handleAction:)),
+                &key,
+            )
+        };
+        unsafe { ns_item.setTarget(Some(self)) };
+        ns_item.setTag((CONTEXT_ACTION_TAG_BASE + actions.len() as i64) as isize);
+        actions.push(item.action.clone());
+        if let Some(key) = &item.key {
+            ns_item.setKeyEquivalentModifierMask(key.modifiers);
+        }
+        if item.checked {
+            let _: () = unsafe { msg_send![&*ns_item, setState: MENU_ITEM_STATE_ON] };
+        }
+        ns_item.setEnabled(item.enabled);
+        ns_item
     }
 }
 

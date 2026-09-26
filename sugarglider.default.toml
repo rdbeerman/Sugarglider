@@ -61,7 +61,7 @@ size_share.overflow = "reject"
 # config. You can disable this by adding an empty `[keys]` section to your
 # config file.
 #
-# Individual key bindings can be disabled by setting the key to "disabled".
+# Individual key bindings can be disabled by setting the key to "disable".
 default_keys = false
 
 [keys]
@@ -218,6 +218,16 @@ default_keys = false
 # "Alt + Shift + T" = "toggle_column_tabbed"
 # "Alt + Shift + W" = "cycle_column_width"
 
+# Context commands are experimental and not bound by default. If you enable
+# settings.experimental.contexts.enable, add keybindings in your personal
+# config under [keys], for example:
+# "Ctrl + Alt + Space" = "open_context_switcher"
+# "Ctrl + Alt + 0" = "show_everything"
+# "Ctrl + Alt + 1" = { switch_context = 1 }
+# "Ctrl + Alt + 2" = { switch_context = 2 }
+# ... through 9
+# "Ctrl + Alt + Tab" = "previous_context"
+
 # WARNING:
 # This section contains experimental features that might break or be removed in
 # the future. Use at your own risk!
@@ -260,6 +270,13 @@ scroll.infinite_loop = false
 
 # Aspect ratio for single-column mode (e.g. "16:9"). Empty string disables.
 scroll.single_column_aspect_ratio = ""
+
+# Named window sets you switch between. See docs/specs/contexts.md.
+contexts.enable = false
+
+# "global": a switch changes every screen. "per_screen": only the focused
+# screen, and the members of the context come along from the other screens.
+contexts.scope = "global"
 
 # Per-app/window rules overriding how windows are managed when first observed.
 #
