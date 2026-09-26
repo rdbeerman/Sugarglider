@@ -160,6 +160,9 @@ struct SwitcherChecklistItem: Equatable {
   var app: String
   var checked: Bool
   var initiallyChecked: Bool
+  /// A pinned window is a member of every context (R3). It shows checked,
+  /// can't be unchecked, and is never sent.
+  var pinned = false
 }
 
 enum SwitcherMode: Equatable {
@@ -434,7 +437,9 @@ final class ContextSwitcherModel: ObservableObject {
   func toggleItem(at index: Int) {
     guard checklist.indices.contains(index) else { return }
     checklistHighlight = index
-    checklist[index].checked.toggle()
+    if !checklist[index].pinned {
+      checklist[index].checked.toggle()
+    }
   }
 
   private func moveHighlight(by offset: Int) {
@@ -511,7 +516,8 @@ final class ContextSwitcherModel: ObservableObject {
         title: window.title,
         app: window.app,
         checked: true,
-        initiallyChecked: true
+        initiallyChecked: true,
+        pinned: window.pinned
       )
     }
     checklistHighlight = 0
@@ -523,13 +529,14 @@ final class ContextSwitcherModel: ObservableObject {
     let onScreen = Set(payload.windows.map(\.id))
     let members = Set(context.members.compactMap(\.window))
     var items = payload.windows.map { window in
-      let member = members.contains(window.id)
+      let member = window.pinned || members.contains(window.id)
       return SwitcherChecklistItem(
         source: .window(window.id),
         title: window.title,
         app: window.app,
         checked: member,
-        initiallyChecked: member
+        initiallyChecked: member,
+        pinned: window.pinned
       )
     }
     for member in context.members {
@@ -577,7 +584,7 @@ final class ContextSwitcherModel: ObservableObject {
     switch mode {
     case .create(let name):
       let windows = checklist.compactMap { item -> SwitcherWindowId? in
-        guard item.checked, case .window(let id) = item.source else { return nil }
+        guard item.checked, !item.pinned, case .window(let id) = item.source else { return nil }
         return id
       }
       run(.create(name: name, windows: windows))
@@ -585,7 +592,7 @@ final class ContextSwitcherModel: ObservableObject {
       var add: [SwitcherWindowId] = []
       var remove: [SwitcherWindowId] = []
       var removeRecords: [SwitcherRecordRef] = []
-      for item in checklist where item.checked != item.initiallyChecked {
+      for item in checklist where !item.pinned && item.checked != item.initiallyChecked {
         switch item.source {
         case .window(let window) where item.checked:
           add.append(window)

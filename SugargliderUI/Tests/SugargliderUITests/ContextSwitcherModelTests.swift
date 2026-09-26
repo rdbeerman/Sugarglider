@@ -518,16 +518,14 @@ final class ContextSwitcherModelTests: XCTestCase {
 
     model.handle(.down)
     model.handle(.down)
+    model.handle(.down)
     XCTAssertTrue(model.handle(.space))
     model.toggleItem(at: 4)
     model.handle(.enter)
 
     XCTAssertEqual(
       backend.sent,
-      [
-        .create(
-          name: "Sugar glider", windows: [Fixtures.ghostty, Fixtures.chrome, Fixtures.finder])
-      ]
+      [.create(name: "Sugar glider", windows: [Fixtures.ghostty, Fixtures.chrome])]
     )
     XCTAssertEqual(closed, 1)
   }
@@ -549,9 +547,7 @@ final class ContextSwitcherModelTests: XCTestCase {
       [
         .create(
           name: "Research",
-          windows: [
-            Fixtures.ghostty, Fixtures.chrome, Fixtures.whatsApp, Fixtures.finder, Fixtures.slack,
-          ]
+          windows: [Fixtures.ghostty, Fixtures.chrome, Fixtures.finder, Fixtures.slack]
         )
       ]
     )
@@ -594,7 +590,7 @@ final class ContextSwitcherModelTests: XCTestCase {
         .record(SwitcherRecordRef(record: 3, app: "Mail", title: "Inbox")),
       ]
     )
-    XCTAssertEqual(model.checklist.map(\.checked), [true, true, false, false, false, true, true])
+    XCTAssertEqual(model.checklist.map(\.checked), [true, true, true, false, false, true, true])
     XCTAssertEqual(model.checklist[6].title, "Inbox")
   }
 
@@ -639,7 +635,7 @@ final class ContextSwitcherModelTests: XCTestCase {
       [Fixtures.ghostty, Fixtures.chrome, Fixtures.whatsApp, Fixtures.finder, Fixtures.slack]
         .map { .window($0) }
     )
-    XCTAssertEqual(model.checklist.map(\.checked), [false, false, false, false, true])
+    XCTAssertEqual(model.checklist.map(\.checked), [false, false, true, false, true])
 
     model.toggleItem(at: 4)
     model.handle(.enter)
@@ -649,11 +645,68 @@ final class ContextSwitcherModelTests: XCTestCase {
     )
   }
 
+  // MARK: Pinned windows
+
+  /// R3: a pinned window is a member of every context. The create view
+  /// shows it checked and fixed, and `create` leaves it out, so it gets no
+  /// record.
+  func testTheCreateViewShowsAPinnedWindowCheckedAndLeavesItOut() throws {
+    let model = try makeModel()
+    model.query = "cli"
+    model.handle(.down)
+    model.handle(.enter)
+    XCTAssertEqual(model.checklist.map(\.pinned), [false, false, true, false, false])
+    XCTAssertTrue(model.checklist[2].checked)
+
+    model.handle(.down)
+    model.handle(.down)
+    XCTAssertTrue(model.handle(.space))
+    model.toggleItem(at: 2)
+    XCTAssertTrue(model.checklist[2].checked)
+    XCTAssertEqual(model.checklistHighlight, 2)
+    model.handle(.enter)
+    XCTAssertEqual(
+      backend.sent,
+      [
+        .create(
+          name: "cli",
+          windows: [Fixtures.ghostty, Fixtures.chrome, Fixtures.finder, Fixtures.slack])
+      ]
+    )
+  }
+
+  /// R3: the edit view shows a pinned window checked and fixed, whether or
+  /// not the context has a record of it, and `edit` never adds or removes
+  /// it.
+  func testTheEditViewShowsAPinnedWindowCheckedAndNeverSendsIt() throws {
+    for records in [
+      [],
+      [SwitcherMember(record: 0, app: "WhatsApp", title: "WhatsApp", window: Fixtures.whatsApp)],
+    ] {
+      var payload = try Fixtures.payload()
+      payload.contexts[1].members = records
+      let model = try makeModel(payload)
+      model.handle(.commandE)
+      XCTAssertEqual(model.checklist[2].source, .window(Fixtures.whatsApp))
+      XCTAssertTrue(model.checklist[2].checked)
+      XCTAssertTrue(model.checklist[2].pinned)
+
+      model.toggleItem(at: 2)
+      XCTAssertTrue(model.checklist[2].checked)
+      model.toggleItem(at: 3)
+      model.handle(.enter)
+      XCTAssertEqual(
+        backend.sent.last,
+        .edit(context: Fixtures.clientWork, add: [Fixtures.finder], remove: [], removeRecords: [])
+      )
+    }
+  }
+
   func testEditWithoutChangesClosesWithoutACommand() throws {
     let model = try makeModel()
     model.handle(.commandE)
     XCTAssertEqual(model.mode, .edit(Fixtures.clientWork))
-    XCTAssertEqual(model.checklist.map(\.checked), [false, false, false, false, false])
+    XCTAssertEqual(model.checklist.map(\.checked), [false, false, true, false, false])
     model.handle(.enter)
     XCTAssertEqual(backend.sent, [])
     XCTAssertEqual(closed, 1)

@@ -141,9 +141,7 @@ final class SwitcherListSpecTests: SwitcherSpecTestCase {
       [
         .create(
           name: "unsorted",
-          windows: [
-            Fixtures.ghostty, Fixtures.chrome, Fixtures.whatsApp, Fixtures.finder, Fixtures.slack,
-          ]
+          windows: [Fixtures.ghostty, Fixtures.chrome, Fixtures.finder, Fixtures.slack]
         )
       ]
     )

@@ -198,6 +198,11 @@ import Foundation
 /// whose members are exactly these windows, and switches to it, as
 /// `sugarglider context create` does. `windows` can be empty.
 ///
+/// A pinned window is a member of every context already (R3). The create
+/// and edit views show it checked and fixed, and `create.windows`,
+/// `edit.add`, and `edit.remove` never hold it. Rust ignores a pinned
+/// window there and gives it no record.
+///
 /// ```json
 /// { "edit": { "context": { "id": 1 },
 ///             "add": [{ "pid": 977, "idx": 9310 }],

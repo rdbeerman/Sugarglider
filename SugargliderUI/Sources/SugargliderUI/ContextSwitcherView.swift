@@ -192,7 +192,7 @@ struct ContextSwitcherView: View {
   private func checklistRow(_ item: SwitcherChecklistItem, highlighted: Bool) -> some View {
     HStack(spacing: 8) {
       Image(systemName: item.checked ? "checkmark.square.fill" : "square")
-        .foregroundStyle(item.checked ? Color.accentColor : Color.secondary)
+        .foregroundStyle(item.checked && !item.pinned ? Color.accentColor : Color.secondary)
       Text(item.title.isEmpty ? "Untitled" : item.title)
         .lineLimit(1)
       Text(item.app)
@@ -214,8 +214,11 @@ struct ContextSwitcherView: View {
     )
   }
 
-  /// Marks members that the user can't see on screen.
+  /// Marks pinned windows, and members that the user can't see on screen.
   private func note(for item: SwitcherChecklistItem) -> String? {
+    if item.pinned {
+      return "pinned"
+    }
     switch item.source {
     case .record:
       return "closed"

@@ -110,7 +110,7 @@ In this example the Zed window (record 1) is open but not on screen (another Spa
 | `windows` | array | The windows on screen that the create and edit views list: the tracked windows that show now on the visible Spaces (the focused screen in `per_screen` scope), including the target window. Leave out parked windows, Sugarglider's own windows, and untracked windows. |
 | `windows[].id` | window | The window. |
 | `windows[].title`, `windows[].app` | string | Its title and app name. |
-| `windows[].pinned` | bool | Whether it is pinned (R3). |
+| `windows[].pinned` | bool | Whether it is pinned (R3). The create and edit views show a pinned window checked and fixed. |
 
 Exactly one of the `active` flags is true. Keys whose type says "or null" may also be missing.
 
@@ -199,6 +199,8 @@ Pins or unpins the target window, as `toggle_window_pinned` does (R3). Sent by �
 
 Creates a context with this name (R4) and the lowest free number (R5), whose members are exactly these windows, and switches to it, as `sugarglider context create` does. `windows` can be empty. Sent from the create view, which ↩ on the "New context" row or ⌘N opens.
 
+`windows` never holds a pinned window. A pinned window is a member of every context already (R3), so the create view shows it checked and fixed and leaves it out. Rust ignores a pinned window in `windows` and gives it no record.
+
 ### `edit`
 
 ```json
@@ -214,7 +216,7 @@ Changes a context's members. Sent from the edit view (⌘E) with only what chang
 2. Removes the windows in `remove`. This takes effect at once, as `remove_window_from_context` does (R37). A window here is open; it may be off screen.
 3. Adds the windows in `add`. This takes effect at the next switch, as `add_window_to_context` does (R37).
 
-The panel puts an unchecked member with an open window in `remove`, and one without a window in `remove_records`.
+The panel puts an unchecked member with an open window in `remove`, and one without a window in `remove_records`. `add` and `remove` never hold a pinned window: the edit view shows it checked and fixed. Rust ignores a pinned window in them, so its records stay as they are.
 
 ### `rename`
 
