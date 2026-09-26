@@ -99,7 +99,9 @@ final class SwitcherListSpecTests: SwitcherSpecTestCase {
   func testTheReservedNameEverythingOffersNoNewContextRow() throws {
     let model = try makeModel()
     for query in ["everything", "EVERYTHING", "  Everything "] {
-      backend.ranks[query] = SpecPayload.ranked([(.everything, .exact)])
+      backend.ranks[query.trimmingCharacters(in: .whitespaces)] = SpecPayload.ranked([
+        (.everything, .exact)
+      ])
       model.query = query
       XCTAssertEqual(model.rows, [.entry(everything)], query)
       XCTAssertEqual(model.highlight, 0, query)

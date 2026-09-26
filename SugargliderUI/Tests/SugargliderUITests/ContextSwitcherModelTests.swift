@@ -7,6 +7,9 @@ import XCTest
 @testable import SugargliderUI
 
 /// Records commands and answers rank queries without Rust.
+///
+/// Like `model::contexts::rank`, it trims the query first, so a blank query
+/// gets the entries of the empty one. `ranks` is keyed by the trimmed query.
 @MainActor
 final class FakeBackend: ContextSwitcherBackend {
   var ranks: [String: [SwitcherRankedEntry]] = [:]
@@ -29,7 +32,7 @@ final class FakeBackend: ContextSwitcherBackend {
   func rank(_ query: String) throws -> [SwitcherRankedEntry] {
     queries.append(query)
     if let rankError { throw rankError }
-    return ranks[query] ?? []
+    return ranks[query.trimmingCharacters(in: .whitespacesAndNewlines)] ?? []
   }
 
   func run(_ command: SwitcherCommand) throws {
@@ -176,8 +179,8 @@ final class ContextSwitcherModelTests: XCTestCase {
   func testNewContextRowUsesTheTrimmedQueryAndNeedsText() throws {
     let model = try makeModel()
     model.query = "   "
-    XCTAssertFalse(model.rows.contains(.newContext("")))
-    XCTAssertEqual(model.rows.count, 0)
+    XCTAssertEqual(names(model), ["Sugarglider", "Client work", "Unsorted", "Everything"])
+    XCTAssertEqual(model.highlight, 1)
 
     model.query = "  Deep work "
     XCTAssertEqual(model.rows, [.newContext("Deep work")])
@@ -260,8 +263,12 @@ final class ContextSwitcherModelTests: XCTestCase {
   }
 
   func testArrowsDoNothingOnAnEmptyList() throws {
-    let model = try makeModel()
-    model.query = "   "
+    var payload = try Fixtures.payload()
+    payload.contexts = []
+    payload.everything.active = true
+    backend.ranks[""] = [SwitcherRankedEntry(key: .everything, match: .emptyQuery)]
+    let model = try makeModel(payload)
+    XCTAssertEqual(model.rows, [])
     XCTAssertTrue(model.handle(.down))
     XCTAssertEqual(model.highlight, 0)
     XCTAssertTrue(model.handle(.enter))
