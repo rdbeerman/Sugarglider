@@ -10,7 +10,7 @@ use objc2_core_foundation::{CGRect, CGSize};
 use tracing::{debug, info};
 
 use super::animation::Animation;
-use super::{Reactor, fit_frame_to_screen};
+use super::{Reactor, TransactionId, fit_frame_to_screen};
 use crate::actor::app::{WindowId, pid_t};
 use crate::actor::parked_journal::JournalEntry;
 use crate::collections::HashSet;
@@ -38,6 +38,18 @@ fn is_back(reported: CGRect, target: CGRect) -> bool {
 /// missing bundle id on one side only doesn't.
 fn same_app(journal: &Option<String>, running: &Option<String>) -> bool {
     journal == running
+}
+
+/// A parked window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Parked {
+    /// The frame the window had before it was parked, which is in its journal
+    /// entry.
+    pub(super) before: CGRect,
+    /// Where the window was last seen: the corner written to it, or a frame
+    /// that its app or the window server reported since. It never reaches the
+    /// layout.
+    pub(super) observed: CGRect,
 }
 
 /// A window whose journal entry is written, with the frame it has before it
@@ -123,7 +135,13 @@ impl Reactor {
     pub(super) fn move_to_corners(&mut self, parking: Vec<Parking>) -> Vec<WindowId> {
         let mut writes = vec![];
         for Parking { wid, frame, corner } in parking {
-            self.parked.insert(wid, frame);
+            self.parked.insert(
+                wid,
+                Parked {
+                    before: frame,
+                    observed: corner,
+                },
+            );
             writes.push((wid, corner));
         }
         self.write_frames_now(&writes);
@@ -150,7 +168,9 @@ impl Reactor {
     pub(super) fn release_parked(&mut self, wids: &[WindowId]) -> Vec<(WindowId, CGRect)> {
         let mut released = vec![];
         for wid in wids {
-            let Some(frame) = self.parked.remove(wid) else { continue };
+            let Some(Parked { before: frame, .. }) = self.parked.remove(wid) else {
+                continue;
+            };
             self.frame_attempts.remove(wid);
             self.forced_writes.insert(*wid);
             // The user can't be resizing a window in a corner, and
@@ -252,6 +272,22 @@ impl Reactor {
             window.frame_monotonic = frame;
         }
         self.send_animation(anim, true);
+    }
+
+    /// Notes where a parked window is now, from a frame change that comes
+    /// after the last write to it.
+    pub(super) fn observe_parked(
+        &mut self,
+        wid: WindowId,
+        frame: CGRect,
+        last_seen: TransactionId,
+    ) {
+        let Some(parked) = self.parked.get_mut(&wid) else {
+            return;
+        };
+        if self.windows.get(&wid).is_some_and(|window| window.last_sent_txid == last_seen) {
+            parked.observed = frame;
+        }
     }
 
     /// Handles the echo of a frame write. If the window is back from parking
@@ -368,7 +404,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::super::testing::*;
-    use super::super::{Command, Event, FrameAttempt, MAX_FRAME_ATTEMPTS, Reactor, Requested};
+    use super::super::{
+        Command, Event, FrameAttempt, MAX_FRAME_ATTEMPTS, Reactor, Requested, TransactionId,
+    };
     use crate::actor::app::{Quiet, Request, WindowId, pid_t};
     use crate::actor::layout::{LayoutCommand, LayoutEvent, LayoutManager};
     use crate::actor::parked_journal::{FailingWrites, JournalEntry, ParkedJournal};
@@ -1696,7 +1734,10 @@ mod tests {
         assert_eq!(vec![wid(1)], s.reactor.park_windows(&[wid(1)]).unwrap());
 
         assert_eq!(vec![entry(1, 1, tile)], s.journal_on_disk());
-        assert_eq!(Some(&tile), s.reactor.parked.get(&wid(1)));
+        assert_eq!(
+            Some(tile),
+            s.reactor.parked.get(&wid(1)).map(|parked| parked.before)
+        );
     }
 
     #[test]
@@ -1887,6 +1928,57 @@ mod tests {
         assert_eq!(Some(floating), s.reactor.layout.floating_restore_frame(wid(1)));
         s.reactor.unpark_windows(&[wid(1)]);
         assert_eq!(vec![floating], frame_writes(&s.apps.requests(), wid(1)));
+    }
+
+    #[test]
+    fn h2_a_parked_window_keeps_the_frames_it_reports_apart_from_the_layout() {
+        let mut s = Setup::new(2);
+        let tiles = s.tiles();
+        s.reactor.park_windows(&[wid(1)]).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        let corner = s.frame(wid(1));
+        let observed = |s: &Setup| s.reactor.parked[&wid(1)].observed;
+        assert_eq!(corner, observed(&s));
+
+        let moved = rect(20., 30., 500., 1000.);
+        app_moves(&mut s, wid(1), moved, None);
+        assert_eq!(moved, observed(&s));
+
+        // A report from before the last write is stale.
+        let txid = s.reactor.windows[&wid(1)].last_sent_txid;
+        s.reactor.handle_event(Event::WindowFrameChanged(
+            wid(1),
+            rect(40., 50., 500., 1000.),
+            TransactionId(txid.0 - 1),
+            Requested(false),
+            None,
+        ));
+        assert_eq!(moved, observed(&s));
+
+        let snapshot = rect(60., 70., 500., 1000.);
+        s.reactor.handle_event(Event::WindowsOnScreenUpdated {
+            pid: None,
+            on_screen: WindowsOnScreen::new(vec![
+                WindowServerInfo {
+                    id: WindowServerId::new(1),
+                    pid: 1,
+                    layer: 0,
+                    frame: snapshot,
+                },
+                WindowServerInfo {
+                    id: WindowServerId::new(2),
+                    pid: 1,
+                    layer: 0,
+                    frame: tiles[1].1,
+                },
+            ]),
+        });
+        assert_eq!(snapshot, observed(&s));
+
+        assert_eq!(corner, s.reactor.windows[&wid(1)].frame_monotonic);
+        s.refresh_visible_windows();
+        assert_eq!(tiles, s.tiles());
+        assert!(s.apps.requests().is_empty());
     }
 
     #[test]

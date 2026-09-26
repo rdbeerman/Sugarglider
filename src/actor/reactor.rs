@@ -25,7 +25,7 @@ use std::{mem, thread};
 use animation::{Animation, AnimationManager, Message as AnimationMessage};
 use main_window::MainWindowTracker;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use parking::ProcessLookup;
+use parking::{Parked, ProcessLookup};
 use redact::Secret;
 pub use replay::{Record, replay};
 use serde::{Deserialize, Serialize};
@@ -294,8 +294,8 @@ pub struct Reactor {
     /// window server reports them. This handles Cmd+W closing where the window
     /// is hidden rather than destroyed.
     hidden_windows: HashSet<WindowServerId>,
-    /// Windows parked in a screen corner, with the frame each had before.
-    parked: HashMap<WindowId, CGRect>,
+    /// Windows parked in a screen corner.
+    parked: HashMap<WindowId, Parked>,
     /// The frames of parked windows, on disk before the windows move.
     journal: ParkedJournal,
     /// Finds the process that has a pid now, to tell which journal entries
@@ -740,7 +740,12 @@ impl Reactor {
                     self.resizing_window = None;
                 }
                 if !requested.0 && !self.own_frame_reaches_layout(wid) {
-                    debug!(?wid, ?new_frame, "Ignoring a frame change of a parked window");
+                    debug!(
+                        ?wid,
+                        ?new_frame,
+                        "Keeping a parked window's frame change out of the layout"
+                    );
+                    self.observe_parked(wid, new_frame, last_seen);
                     return;
                 }
                 let window = self.windows.get_mut(&wid).unwrap();
@@ -785,6 +790,7 @@ impl Reactor {
                             self.update_layout(&[], true);
                         }
                     }
+                    self.observe_parked(wid, new_frame, last_seen);
                     self.confirm_unparked(wid, new_frame);
                     return;
                 }
@@ -1351,7 +1357,8 @@ impl Reactor {
             let Some(&wid) = self.window_ids.get(&info.id) else {
                 continue;
             };
-            if !self.own_frame_reaches_layout(wid) {
+            if let Some(parked) = self.parked.get_mut(&wid) {
+                parked.observed = info.frame;
                 continue;
             }
             let Some(window) = self.windows.get_mut(&wid) else {
@@ -1564,7 +1571,7 @@ impl Reactor {
     /// parked, not its corner.
     fn layout_frame(&self, wid: WindowId) -> Option<CGRect> {
         match self.parked.get(&wid) {
-            Some(&before_parking) => Some(before_parking),
+            Some(parked) => Some(parked.before),
             None => Some(self.windows.get(&wid)?.frame_monotonic),
         }
     }
