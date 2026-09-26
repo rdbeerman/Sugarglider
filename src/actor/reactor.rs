@@ -404,6 +404,9 @@ pub struct Reactor {
     hidden_windows: HashSet<WindowServerId>,
     /// Windows parked in a screen corner.
     parked: HashMap<WindowId, Parked>,
+    /// Windows the reactor saw for the first time before the window server
+    /// listed them, whose membership waits for the layer the list reports.
+    pending_first_seen: HashSet<WindowId>,
     /// The frames of parked windows, on disk before the windows move.
     journal: ParkedJournal,
     /// Finds the process that has a pid now, to tell which journal entries
@@ -668,6 +671,7 @@ impl Reactor {
             startup_complete: false,
             hidden_windows: HashSet::default(),
             parked: HashMap::default(),
+            pending_first_seen: HashSet::default(),
             journal,
             process_lookup: Box::new(Process::with_pid),
             forced_writes: HashSet::default(),
@@ -863,8 +867,8 @@ impl Reactor {
                 let first_seen = self.windows.insert(wid, window.clone().into()).is_none();
                 self.app_still_running(wid.pid);
                 if first_seen {
-                    self.windows_seen(&[wid]);
-                    self.focus_windows_seen(&[wid]);
+                    let decided = self.windows_first_seen(&[wid]);
+                    self.focus_windows_seen(&decided);
                 }
                 if mouse_state == MouseState::Down {
                     self.in_drag = true;
@@ -952,6 +956,7 @@ impl Reactor {
                 if window.is_none() {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
+                self.pending_first_seen.remove(&wid);
                 self.window_closed(wid);
                 self.guarded_window_gone(wid);
                 self.frame_attempts.remove(&wid);
@@ -1633,6 +1638,10 @@ impl Reactor {
         );
         self.window_server_info
             .extend(on_screen.info.into_iter().map(|info| (info.id, info)));
+        // The windows waiting for their layer can now have their membership
+        // decided, before the caller parks the ones that must not show.
+        let decided = self.decide_pending_membership();
+        self.focus_windows_seen(&decided);
         let listed: Vec<WindowServerId> = self.visible_windows.iter().copied().collect();
         self.apps_listed(&listed);
     }
@@ -1729,7 +1738,7 @@ impl Reactor {
         if !first_seen.is_empty() {
             self.app_still_running(pid);
         }
-        self.windows_seen(&first_seen);
+        self.decide_membership(&first_seen);
         self.restore_from_journal(pid);
         self.send_visible_windows_to_layout(pid);
         if self.startup_complete {

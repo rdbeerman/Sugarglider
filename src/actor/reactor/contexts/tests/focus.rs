@@ -355,6 +355,9 @@ fn r24_focus_that_waits_for_a_window_switches_when_the_window_rejoins_another_co
     assert_ne!(d, s.reactor.contexts.active());
 
     s.reactor.handle_event(Event::WindowCreated(launched, window, MouseState::Up));
+    let on_screen = on_screen(&s, &[wid(1), launched]);
+    s.reactor
+        .handle_event(Event::WindowsOnScreenUpdated { pid: Some(3), on_screen });
 
     assert_eq!(d, s.reactor.contexts.active());
     assert!(s.reactor.contexts.is_member(d, launched));

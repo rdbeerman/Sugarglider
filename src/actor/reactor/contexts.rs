@@ -513,6 +513,9 @@ impl Reactor {
             }
         } else {
             info!("Contexts are off; showing every window");
+            // A window that waits for the window server's list is not new when
+            // contexts come back: it was found while they were off.
+            self.pending_first_seen.clear();
         }
         self.apply_again();
         if !self.contexts_enabled() {
@@ -5020,13 +5023,26 @@ mod tests {
             sys_id: Some(WindowServerId::new(sys_id)),
             ..make_window(1)
         };
-        s.reactor.handle_events(s.apps.make_app(2, vec![at(20)]));
+        // App 2 opens a panel, which reaches the reactor as a new window
+        // does: `WindowCreated` first, then the window server's list, which
+        // reports the panel's layer and so takes it out of the layout's
+        // tracked windows.
+        let info = at(20);
+        s.apps.windows.insert(
+            panel,
+            WindowState {
+                frame: info.frame,
+                ..Default::default()
+            },
+        );
+        s.reactor.handle_event(Event::WindowCreated(panel, info, MouseState::Up));
         s.reactor.handle_events(s.apps.make_app(3, vec![at(30)]));
         let mut listed = on_screen(&s, &[wid(1), wid(2), panel, quitting]);
         listed.info[2].layer = 3;
         s.reactor
             .handle_event(Event::WindowsOnScreenUpdated { pid: None, on_screen: listed });
         s.reactor.contexts.add_window(id_of(c), &s.desc(quitting)).unwrap();
+        assert!(!s.reactor.contexts.is_member(c, panel), "the panel is in no context");
         assert!(!s.reactor.lists_unsorted(), "only the panel is in no context");
 
         s.reactor.contexts.remove_window(id_of(c), quitting).unwrap();

@@ -68,7 +68,7 @@ impl Reactor {
             debug!(?wid, guard = ?self.switch_guard, "Ignoring focus while a switch is in progress");
             return;
         }
-        if !self.windows.contains_key(&wid) {
+        if !self.windows.contains_key(&wid) || self.pending_first_seen.contains(&wid) {
             debug!(?wid, "Focus on a window not seen yet waits for it");
             self.focus_waiting = Some(wid);
             return;

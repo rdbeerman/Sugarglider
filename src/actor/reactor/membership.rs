@@ -24,13 +24,66 @@ impl Reactor {
     /// unsorted. Later windows rejoin the contexts whose records they match, or
     /// else join the context that their screen shows.
     ///
+    /// A window waits when the window server hasn't listed it yet: its layer
+    /// decides whether the layout tracks it, and only tracked windows join a
+    /// context. The window server's list decides the waiting windows. This
+    /// keeps a panel, whose layer is reported after its creation, out of the
+    /// contexts.
+    ///
     /// Sugarglider's own windows, windows the layout doesn't track, and windows
     /// of apps that haven't registered get no membership. With contexts off
     /// nothing is decided; the windows rejoin their contexts when contexts are
     /// turned on.
-    pub(super) fn windows_seen(&mut self, wids: &[WindowId]) {
+    pub(super) fn windows_first_seen(&mut self, wids: &[WindowId]) -> Vec<WindowId> {
+        if !self.contexts_enabled() {
+            return Vec::new();
+        }
+        let (ready, waiting): (Vec<WindowId>, Vec<WindowId>) =
+            wids.iter().copied().partition(|&wid| self.window_layer_known(wid));
+        self.pending_first_seen.extend(waiting);
+        if ready.is_empty() {
+            return ready;
+        }
+        self.decide_membership(&ready);
+        ready
+    }
+
+    /// Decides the membership of the windows that waited for the window
+    /// server to list them, now that its list has arrived. The caller applies
+    /// the focus that waited for them.
+    pub(super) fn decide_pending_membership(&mut self) -> Vec<WindowId> {
+        let ready: Vec<WindowId> = self
+            .pending_first_seen
+            .iter()
+            .copied()
+            .filter(|&wid| self.window_layer_known(wid))
+            .collect();
+        if ready.is_empty() {
+            return ready;
+        }
+        for wid in &ready {
+            self.pending_first_seen.remove(wid);
+        }
+        self.decide_membership(&ready);
+        ready
+    }
+
+    /// Whether the window server has listed the window, so the layout knows
+    /// the layer the window is on.
+    fn window_layer_known(&self, wid: WindowId) -> bool {
+        self.layout_window_info(wid).is_some_and(|info| info.layer.is_some())
+    }
+
+    /// Decides the membership of windows the reactor sees for the first time,
+    /// or decides them again when their layer became known. A window that the
+    /// app reports in its own list is decided here even if the window server
+    /// hasn't listed it.
+    pub(super) fn decide_membership(&mut self, wids: &[WindowId]) {
         if !self.contexts_enabled() {
             return;
+        }
+        for wid in wids {
+            self.pending_first_seen.remove(wid);
         }
         let own_pid = std::process::id() as pid_t;
         let windows: Vec<WindowDesc> = wids

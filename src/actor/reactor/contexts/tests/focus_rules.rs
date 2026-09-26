@@ -289,7 +289,6 @@ fn r24_launching_an_app_whose_global_activation_comes_last_never_switches() {
 /// activates the app, whose main window is still the parked one, Sugarglider
 /// switches to D, because the app has no member of C.
 #[test]
-#[ignore = "bug: a new panel's layer is unknown at WindowCreated, so it joins the active context, and R40 raises it instead of switching"]
 fn r24_r14_a_new_panel_joins_no_context_and_focus_on_its_app_still_switches() {
     let mut s = Setup::new(1);
     let main = launch(&mut s, 3, test_app_info(3), vec![window_at(31, 700.)], &[wid(1)])[0];
