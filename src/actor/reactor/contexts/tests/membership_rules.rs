@@ -463,14 +463,11 @@ fn r23_every_order_of_a_quit_keeps_the_records_of_every_window() {
     }
 }
 
-/// R23, Q4. While app 2 quits, "Doc A" closes, and then a window server list
-/// names "Doc B", which is still open. By R23 that shows the app still runs,
-/// so the records of "Doc A" go, and those of "Doc B" stay when the app
-/// terminates. A list that names only other apps' windows, or the window
-/// that closed, shows nothing, and both records stay. So does a list that
-/// comes after `ApplicationTerminated`, which has kept the records already.
+/// R23, Q4. A window server list inside the quit gap is no longer a signal
+/// that the app still runs, so the records of a window that closed stay
+/// pending whatever the list names, and stay when the app terminates.
 #[test]
-fn r23_a_window_list_between_the_closes_of_a_quit_deletes_the_first_windows_records() {
+fn r23_a_window_list_between_the_closes_of_a_quit_keeps_the_first_windows_records() {
     for listed in [
         "Doc B",
         "other apps",
@@ -493,16 +490,31 @@ fn r23_a_window_list_between_the_closes_of_a_quit_deletes_the_first_windows_reco
         s.reactor
             .handle_event(Event::WindowsOnScreenUpdated { pid: Some(2), on_screen });
         s.apps.simulate_until_quiet(&mut s.reactor);
+
+        if listed != "Doc B, terminated" {
+            assert_eq!(
+                vec![
+                    record("Window1", RecordLink::Live(wid(1))),
+                    record("Doc A", RecordLink::Pending(a)),
+                    record("Doc B", RecordLink::Live(b)),
+                ],
+                records(&s, c),
+                "{listed}"
+            );
+        }
         quit_step(&mut s, "destroy b", a, b);
         quit_step(&mut s, "terminated", a, b);
         quit_step(&mut s, "thread", a, b);
 
-        let mut in_c = vec![record("Window1", RecordLink::Live(wid(1)))];
-        if listed != "Doc B" {
-            in_c.push(record("Doc A", RecordLink::Empty));
-        }
-        in_c.push(record("Doc B", RecordLink::Empty));
-        assert_eq!(in_c, records(&s, c), "{listed}");
+        assert_eq!(
+            vec![
+                record("Window1", RecordLink::Live(wid(1))),
+                record("Doc A", RecordLink::Empty),
+                record("Doc B", RecordLink::Empty),
+            ],
+            records(&s, c),
+            "{listed}"
+        );
         assert_eq!(
             vec![
                 record("Window1", RecordLink::Live(wid(1))),
@@ -511,9 +523,62 @@ fn r23_a_window_list_between_the_closes_of_a_quit_deletes_the_first_windows_reco
             records(&s, d),
             "{listed}"
         );
-        let saved: Vec<String> = in_c.into_iter().map(|(title, _)| title).collect();
+        let saved: Vec<String> = vec!["Window1".to_string(), "Doc A".to_string(), "Doc B".to_string()];
         assert_eq!(saved, saved_members(&s, c), "{listed}");
     }
+}
+
+/// R23. `ApplicationTerminated` stops a closed window's records being
+/// pending at once, before its own destroyed event arrives, so they keep
+/// their titles and match the windows of a relaunch.
+#[test]
+fn r23_an_apps_records_stop_being_pending_when_it_terminates() {
+    let (mut s, c, _d, a, b) = quitting_app();
+    s.close(a);
+    assert_eq!(
+        vec![
+            record("Window1", RecordLink::Live(wid(1))),
+            record("Doc A", RecordLink::Pending(a)),
+            record("Doc B", RecordLink::Live(b)),
+        ],
+        records(&s, c)
+    );
+
+    quit_step(&mut s, "terminated", a, b);
+    assert_eq!(
+        vec![
+            record("Window1", RecordLink::Live(wid(1))),
+            record("Doc A", RecordLink::Empty),
+            record("Doc B", RecordLink::Empty),
+        ],
+        records(&s, c)
+    );
+
+    // Neither a window server list nor the destroyed window changes them.
+    report_visible(&mut s, &[wid(1), b]);
+    quit_step(&mut s, "destroy b", a, b);
+    quit_step(&mut s, "thread", a, b);
+    assert_eq!(
+        vec![
+            record("Window1", RecordLink::Live(wid(1))),
+            record("Doc A", RecordLink::Empty),
+            record("Doc B", RecordLink::Empty),
+        ],
+        records(&s, c)
+    );
+
+    let windows = vec![titled("Doc B", 52, 900.), titled("Doc A", 51, 700.)];
+    let [b2, a2] = launch(&mut s, 5, test_app_info(2), windows)[..] else {
+        panic!()
+    };
+    assert_eq!(
+        vec![
+            record("Window1", RecordLink::Live(wid(1))),
+            record("Doc A", RecordLink::Live(a2)),
+            record("Doc B", RecordLink::Live(b2)),
+        ],
+        records(&s, c)
+    );
 }
 
 /// R23. A single-window app stays running after the user closes its window

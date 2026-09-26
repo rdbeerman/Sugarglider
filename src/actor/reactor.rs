@@ -1655,8 +1655,6 @@ impl Reactor {
         // decided, before the caller parks the ones that must not show.
         let decided = self.decide_pending_membership();
         self.focus_windows_seen(&decided);
-        let listed: Vec<WindowServerId> = self.visible_windows.iter().copied().collect();
-        self.apps_listed(&listed);
     }
 
     fn should_compare_visible_window(&self, wsid: WindowServerId) -> bool {

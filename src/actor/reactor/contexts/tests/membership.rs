@@ -301,12 +301,12 @@ fn records(s: &Setup, key: ContextKey) -> Vec<(String, RecordLink)> {
 }
 
 /// R23. A closed window's records wait until its app shows it is still
-/// running: it creates a window, the user activates it, or a window server
-/// list names one of its windows. Then they go, and `contexts.json` is
-/// written without them.
+/// running: it creates a window, or the user activates it. Then they go, and
+/// `contexts.json` is written without them. A window server list that names
+/// another window of the app doesn't show this by itself.
 #[test]
 fn r23_a_closed_windows_records_go_once_its_app_shows_it_still_runs() {
-    for signal in ["new window", "activation", "window server list"] {
+    for signal in ["new window", "activation"] {
         let mut s = Setup::new(3);
         let c = s.create("C", &[wid(1), wid(2)]);
         s.switch(c);
@@ -328,10 +328,9 @@ fn r23_a_closed_windows_records_go_once_its_app_shows_it_still_runs() {
                 };
                 open_window(&mut s, wid(4), info, &[wid(1), wid(3)]);
             }
-            "activation" => {
+            _ => {
                 s.reactor.handle_event(Event::ApplicationActivated(1, Quiet::No));
             }
-            _ => report_visible(&mut s, &[wid(1), wid(3)]),
         }
 
         let mut left = vec![("Window1".to_string(), RecordLink::Live(wid(1)))];
@@ -342,6 +341,23 @@ fn r23_a_closed_windows_records_go_once_its_app_shows_it_still_runs() {
         let saved: Vec<String> = left.into_iter().map(|(title, _)| title).collect();
         assert_eq!(saved, saved_members(&s, c), "{signal}");
     }
+
+    // A window server list that names window 3 shows nothing about window 2,
+    // which the app closed.
+    let mut s = Setup::new(3);
+    let c = s.create("C", &[wid(1), wid(2)]);
+    s.switch(c);
+    s.close(wid(2));
+
+    report_visible(&mut s, &[wid(1), wid(3)]);
+
+    assert_eq!(
+        vec![
+            ("Window1".to_string(), RecordLink::Live(wid(1))),
+            ("Window2".to_string(), RecordLink::Pending(wid(2))),
+        ],
+        records(&s, c)
+    );
 }
 
 /// R23. An activation that Sugarglider's own raise caused doesn't show that

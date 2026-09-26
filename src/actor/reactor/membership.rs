@@ -11,7 +11,6 @@ use tracing::{debug, error, info};
 use super::{ContextRef, Reactor};
 use crate::actor::app::{WindowId, pid_t};
 use crate::model::contexts::{Arrival, ContextKey, MatchPass, RecordLink, WindowDesc, plan_switch};
-use crate::sys::window_server::WindowServerId;
 
 impl Reactor {
     /// Decides the membership of windows that the reactor sees for the first
@@ -302,22 +301,6 @@ impl Reactor {
             );
             self.contexts.app_still_running(pid);
             self.save_contexts();
-        }
-    }
-
-    /// A window server list that names an open window of an app shows that the
-    /// app is still running.
-    pub(super) fn apps_listed(&mut self, listed: &[WindowServerId]) {
-        let mut pids: Vec<pid_t> = listed
-            .iter()
-            .filter_map(|wsid| self.window_ids.get(wsid))
-            .filter(|&&wid| self.windows.contains_key(&wid))
-            .map(|wid| wid.pid)
-            .collect();
-        pids.sort();
-        pids.dedup();
-        for pid in pids {
-            self.app_still_running(pid);
         }
     }
 
