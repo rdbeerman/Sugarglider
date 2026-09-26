@@ -419,6 +419,7 @@ impl Reactor {
                 self.remove_window_from_context(self.main_window())
             }
             ContextCommand::ToggleWindowPinned => self.toggle_window_pinned(self.main_window()),
+            ContextCommand::CreateContext(name) => self.create_context(&name),
         }
     }
 

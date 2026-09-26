@@ -515,6 +515,12 @@ fn describe_context_command(cmd: &ContextCommand) -> (String, String, String, u3
             "toggle_window_pinned".to_string(),
             81,
         ),
+        ContextCommand::CreateContext(name) => (
+            format!("Create context \"{name}\" from the windows on screen"),
+            category,
+            format!("create_context_{name}"),
+            40,
+        ),
     }
 }
 

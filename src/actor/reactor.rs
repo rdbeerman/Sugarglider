@@ -9,6 +9,7 @@
 
 mod animation;
 mod contexts;
+mod create_context;
 mod focus;
 mod main_window;
 mod membership;
@@ -275,6 +276,9 @@ pub enum ContextCommand {
     RemoveWindowFromContext,
     /// Makes the focused window a member of every context, or stops that.
     ToggleWindowPinned,
+    /// Creates a context with this name, whose members are the windows that
+    /// show on the visible Spaces, and switches to it.
+    CreateContext(String),
 }
 
 /// Names a context in a command.
