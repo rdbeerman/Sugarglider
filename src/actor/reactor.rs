@@ -731,15 +731,21 @@ impl Reactor {
                 if let Some(app) = self.apps.get_mut(&pid) {
                     _ = app.handle.send(Request::Terminate);
                 }
+                self.app_terminated(pid);
             }
             Event::ApplicationThreadTerminated(pid) => {
+                self.app_terminated(pid);
                 self.apps.remove(&pid);
                 self.forget_parked_app(pid);
                 self.send_layout_event(LayoutEvent::AppClosed(pid));
-                self.app_quit(pid);
             }
-            Event::ApplicationActivated(..)
-            | Event::ApplicationDeactivated(..)
+            Event::ApplicationActivated(pid, quiet) => {
+                // Also handled by MainWindowTracker.
+                if quiet == Quiet::No {
+                    self.app_still_running(pid);
+                }
+            }
+            Event::ApplicationDeactivated(..)
             | Event::ApplicationGloballyActivated(..)
             | Event::ApplicationGloballyDeactivated(..) => {
                 // Handled by MainWindowTracker.
@@ -763,6 +769,7 @@ impl Reactor {
                     self.window_ids.insert(wsid, wid);
                 }
                 let first_seen = self.windows.insert(wid, window.clone().into()).is_none();
+                self.app_still_running(wid.pid);
                 if first_seen {
                     self.windows_seen(&[wid]);
                 }
@@ -849,6 +856,7 @@ impl Reactor {
                 if window.is_none() {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
+                self.window_closed(wid);
                 self.frame_attempts.remove(&wid);
                 self.forget_parked_window(wid, window.and_then(|window| window.window_server_id));
                 // Only send WindowRemoved if no sibling will take its place.
@@ -1513,6 +1521,8 @@ impl Reactor {
         );
         self.window_server_info
             .extend(on_screen.info.into_iter().map(|info| (info.id, info)));
+        let listed: Vec<WindowServerId> = self.visible_windows.iter().copied().collect();
+        self.apps_listed(&listed);
     }
 
     fn should_compare_visible_window(&self, wsid: WindowServerId) -> bool {
@@ -1604,6 +1614,9 @@ impl Reactor {
         // back first, so the layout sees them at their frames from before
         // parking. The windows open at launch are parked, if they must not
         // show, when startup completes.
+        if !first_seen.is_empty() {
+            self.app_still_running(pid);
+        }
         self.windows_seen(&first_seen);
         self.restore_from_journal(pid);
         self.send_visible_windows_to_layout(pid);

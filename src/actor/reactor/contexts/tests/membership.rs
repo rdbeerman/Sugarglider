@@ -293,3 +293,144 @@ fn r38_windows_found_while_contexts_are_off_rejoin_when_they_are_turned_on() {
     assert_eq!(tiles, s.frames(&[wid(1), arrived]));
     assert!(s.parked().is_empty());
 }
+
+/// The titles of C's records and whether each has an open window.
+fn records(s: &Setup, key: ContextKey) -> Vec<(String, RecordLink)> {
+    let members = &s.reactor.contexts.get(id_of(key)).unwrap().members;
+    members.iter().map(|m| (m.title.clone(), m.link)).collect()
+}
+
+/// R23. A closed window's records wait until its app shows it is still
+/// running: it creates a window, the user activates it, or a window server
+/// list names one of its windows. Then they go, and `contexts.json` is
+/// written without them.
+#[test]
+fn r23_a_closed_windows_records_go_once_its_app_shows_it_still_runs() {
+    for signal in ["new window", "activation", "window server list"] {
+        let mut s = Setup::new(3);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        s.switch(c);
+        s.close(wid(2));
+        assert_eq!(
+            vec![
+                ("Window1".to_string(), RecordLink::Live(wid(1))),
+                ("Window2".to_string(), RecordLink::Pending(wid(2))),
+            ],
+            records(&s, c),
+            "{signal}"
+        );
+
+        match signal {
+            "new window" => {
+                let info = WindowInfo {
+                    frame: rect(700., 100., 50., 50.),
+                    ..make_window(4)
+                };
+                open_window(&mut s, wid(4), info, &[wid(1), wid(3)]);
+            }
+            "activation" => {
+                s.reactor.handle_event(Event::ApplicationActivated(1, Quiet::No));
+            }
+            _ => report_visible(&mut s, &[wid(1), wid(3)]),
+        }
+
+        let mut left = vec![("Window1".to_string(), RecordLink::Live(wid(1)))];
+        if signal == "new window" {
+            left.push(("Window4".to_string(), RecordLink::Live(wid(4))));
+        }
+        assert_eq!(left, records(&s, c), "{signal}");
+        let saved: Vec<String> = left.into_iter().map(|(title, _)| title).collect();
+        assert_eq!(saved, saved_members(&s, c), "{signal}");
+    }
+}
+
+/// R23. An activation that Sugarglider's own raise caused doesn't show that
+/// the app is still running.
+#[test]
+fn r23_a_quiet_activation_keeps_a_closed_windows_records() {
+    let mut s = Setup::new(2);
+    let c = s.create("C", &[wid(1), wid(2)]);
+    s.switch(c);
+    s.close(wid(2));
+
+    s.reactor.handle_event(Event::ApplicationActivated(1, Quiet::Yes));
+
+    assert_eq!(
+        vec![
+            ("Window1".to_string(), RecordLink::Live(wid(1))),
+            ("Window2".to_string(), RecordLink::Pending(wid(2))),
+        ],
+        records(&s, c)
+    );
+}
+
+/// App 2 with window 1, titled "Doc", on the right half of the screen, and
+/// its window server id `wsid`. `pid` stands for a launch of app 2: a
+/// relaunch has a new pid and the same bundle id.
+fn doc_app(s: &mut Setup, pid: i32, wsid: u32) -> Vec<Event> {
+    let window = WindowInfo {
+        title: "Doc".to_string().into(),
+        sys_id: Some(WindowServerId::new(wsid)),
+        frame: rect(700., 100., 50., 50.),
+        ..make_window(1)
+    };
+    let info = test_app_info(2);
+    s.apps.make_app_with_info(pid, info, vec![window], None, false)
+}
+
+/// R21, R22, R23, L8. App 2 quits while D is active, and its window, a
+/// member of C, is parked. When the app runs again with a new pid, its
+/// window rejoins C by its title, and not D, and stays parked. Switching to
+/// C puts it back and tiles it. This holds whether macOS reports the window
+/// destroyed before the app terminates or not at all.
+#[test]
+fn r21_r22_r23_an_app_that_quits_and_relaunches_rejoins_its_context_by_title() {
+    for destroyed_first in [true, false] {
+        let mut s = Setup::new(1);
+        let events = doc_app(&mut s, 2, 21);
+        s.reactor.handle_events(events);
+        let doc = WindowId::new(2, 1);
+        report_visible(&mut s, &[wid(1), doc]);
+        let c = s.create("C", &[wid(1), doc]);
+        let d = s.create("D", &[wid(1)]);
+        s.switch(c);
+        s.switch(d);
+        assert_eq!(vec![doc], s.parked());
+
+        if destroyed_first {
+            s.close(doc);
+        }
+        s.reactor.handle_event(Event::ApplicationTerminated(2));
+        s.reactor.handle_event(Event::ApplicationThreadTerminated(2));
+        s.apps.windows.remove(&doc);
+        assert_eq!(
+            vec![
+                ("Window1".to_string(), RecordLink::Live(wid(1))),
+                ("Doc".to_string(), RecordLink::Empty),
+            ],
+            records(&s, c),
+            "destroyed first: {destroyed_first}"
+        );
+        assert_eq!(vec!["Window1", "Doc"], saved_members(&s, c));
+
+        let events = doc_app(&mut s, 5, 51);
+        s.reactor.handle_events(events);
+        let relaunched = WindowId::new(5, 1);
+        report_visible(&mut s, &[wid(1), relaunched]);
+
+        assert!(s.reactor.contexts.is_member(c, relaunched));
+        assert!(!s.reactor.contexts.is_member(d, relaunched));
+        assert_eq!(vec![relaunched], s.parked());
+        assert_eq!(vec![(wid(1), screen())], s.tiles());
+
+        s.switch(c);
+
+        let tiles = vec![
+            (wid(1), rect(0., 0., 600., 1000.)),
+            (relaunched, rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(tiles, s.tiles(), "destroyed first: {destroyed_first}");
+        assert_eq!(tiles, s.frames(&[wid(1), relaunched]));
+        assert!(s.parked().is_empty());
+    }
+}

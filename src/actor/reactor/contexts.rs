@@ -16,8 +16,8 @@ use crate::actor::app::{WindowId, pid_t};
 use crate::actor::contexts_store::{ContextsStore, Loaded, empty_contexts_after};
 use crate::actor::layout::{ActiveContext, EventResponse, LayoutEvent};
 use crate::model::contexts::{
-    ContextError, ContextId, ContextKey, Contexts, MatchPass, NameMatch, RecordLink, SwitchInput,
-    SwitchPlan, SwitchScreen, WindowDesc, plan_switch, rank,
+    ContextError, ContextId, ContextKey, Contexts, MatchPass, NameMatch, SwitchInput, SwitchPlan,
+    SwitchScreen, WindowDesc, plan_switch, rank,
 };
 use crate::sys::screen::SpaceId;
 
@@ -488,27 +488,6 @@ impl Reactor {
             info!(rejoined, "Windows rejoined their contexts");
         }
         rejoined > 0
-    }
-
-    /// Saves the contexts when an app that has member records quits, so the
-    /// records keep the windows' last titles.
-    pub(super) fn app_quit(&mut self, pid: pid_t) {
-        if !self.contexts_enabled() {
-            return;
-        }
-        let has_records = self
-            .contexts
-            .contexts()
-            .iter()
-            .flat_map(|context| &context.members)
-            .chain(self.contexts.pinned())
-            .any(|record| {
-                matches!(record.link, RecordLink::Live(wid) | RecordLink::Pending(wid)
-                    if wid.pid == pid)
-            });
-        if has_records {
-            self.save_contexts();
-        }
     }
 
     /// Sets `store` as the place the contexts are read from and saved to,

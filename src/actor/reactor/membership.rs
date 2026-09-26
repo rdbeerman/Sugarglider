@@ -9,7 +9,8 @@ use tracing::{debug, error, info};
 
 use super::Reactor;
 use crate::actor::app::{WindowId, pid_t};
-use crate::model::contexts::{Arrival, ContextKey, MatchPass, WindowDesc, plan_switch};
+use crate::model::contexts::{Arrival, ContextKey, MatchPass, RecordLink, WindowDesc, plan_switch};
+use crate::sys::window_server::WindowServerId;
 
 impl Reactor {
     /// Decides the membership of windows that the reactor sees for the first
@@ -89,6 +90,78 @@ impl Reactor {
         match self.layout_frame(wid).and_then(|frame| self.best_space_for_window(&frame)) {
             Some(space) => self.shown_context(space),
             None => self.contexts.active(),
+        }
+    }
+
+    /// Whether a record of a window of `pid` has `link`'s kind: open, or
+    /// closed and pending (R23).
+    fn has_records(&self, pid: pid_t, link: fn(RecordLink) -> Option<WindowId>) -> bool {
+        self.contexts
+            .contexts()
+            .iter()
+            .flat_map(|context| &context.members)
+            .chain(self.contexts.pinned())
+            .any(|record| link(record.link).is_some_and(|wid| wid.pid == pid))
+    }
+
+    /// A window closed. Its records wait, pending, until its app shows
+    /// whether it quit (R23).
+    pub(super) fn window_closed(&mut self, wid: WindowId) {
+        if self.contexts_enabled() {
+            self.contexts.window_closed(wid);
+        }
+    }
+
+    /// The app quit. Its records stay, and keep the windows' last titles, so
+    /// its windows can rejoin when it runs again (R21, R23). The contexts are
+    /// saved when the app had records.
+    pub(super) fn app_terminated(&mut self, pid: pid_t) {
+        if !self.contexts_enabled() {
+            return;
+        }
+        let had_records = self.has_records(pid, |link| match link {
+            RecordLink::Live(wid) | RecordLink::Pending(wid) => Some(wid),
+            RecordLink::Empty => None,
+        });
+        if had_records {
+            self.contexts.app_terminated(pid);
+            self.save_contexts();
+        }
+    }
+
+    /// The app showed that it is still running, so its closed windows are
+    /// gone for good, and their pending records go (R23).
+    pub(super) fn app_still_running(&mut self, pid: pid_t) {
+        if !self.contexts_enabled() || !self.apps.contains_key(&pid) {
+            return;
+        }
+        let pending = self.has_records(pid, |link| match link {
+            RecordLink::Pending(wid) => Some(wid),
+            RecordLink::Live(_) | RecordLink::Empty => None,
+        });
+        if pending {
+            info!(
+                pid,
+                "Deleting the records of windows closed by an app that still runs"
+            );
+            self.contexts.app_still_running(pid);
+            self.save_contexts();
+        }
+    }
+
+    /// R23. A window server list that names an open window of an app shows
+    /// that the app is still running.
+    pub(super) fn apps_listed(&mut self, listed: &[WindowServerId]) {
+        let mut pids: Vec<pid_t> = listed
+            .iter()
+            .filter_map(|wsid| self.window_ids.get(wsid))
+            .filter(|&&wid| self.windows.contains_key(&wid))
+            .map(|wid| wid.pid)
+            .collect();
+        pids.sort();
+        pids.dedup();
+        for pid in pids {
+            self.app_still_running(pid);
         }
     }
 

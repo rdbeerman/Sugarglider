@@ -87,6 +87,14 @@ impl Drop for Reactor {
     }
 }
 
+/// The app that `Apps::make_app` launches with `pid`.
+pub fn test_app_info(pid: pid_t) -> AppInfo {
+    AppInfo {
+        bundle_id: Some(format!("com.testapp{pid}")),
+        localized_name: Some(format!("TestApp{pid}")),
+    }
+}
+
 /// The process of the test app that `Apps::make_app` launches with `pid`.
 pub fn test_app_process(pid: pid_t) -> Process {
     Process::Running {
@@ -160,7 +168,8 @@ impl Apps {
         main_window: Option<WindowId>,
         is_frontmost: bool,
     ) -> Vec<Event> {
-        self.make_app_impl(pid, windows, main_window, is_frontmost, true)
+        let info = test_app_info(pid);
+        self.make_app_impl(pid, info, windows, main_window, is_frontmost, true)
     }
 
     pub fn make_app_without_ws_info(
@@ -170,12 +179,27 @@ impl Apps {
         main_window: Option<WindowId>,
         is_frontmost: bool,
     ) -> Vec<Event> {
-        self.make_app_impl(pid, windows, main_window, is_frontmost, false)
+        let info = test_app_info(pid);
+        self.make_app_impl(pid, info, windows, main_window, is_frontmost, false)
+    }
+
+    /// Like [`Apps::make_app_with_opts`], for an app that `info` describes,
+    /// such as an app that runs again with a new pid.
+    pub fn make_app_with_info(
+        &mut self,
+        pid: pid_t,
+        info: AppInfo,
+        windows: Vec<WindowInfo>,
+        main_window: Option<WindowId>,
+        is_frontmost: bool,
+    ) -> Vec<Event> {
+        self.make_app_impl(pid, info, windows, main_window, is_frontmost, true)
     }
 
     fn make_app_impl(
         &mut self,
         pid: pid_t,
+        info: AppInfo,
         windows: Vec<WindowInfo>,
         main_window: Option<WindowId>,
         is_frontmost: bool,
@@ -211,10 +235,7 @@ impl Apps {
         }
         events.push(Event::ApplicationLaunched {
             pid,
-            info: AppInfo {
-                bundle_id: Some(format!("com.testapp{pid}")),
-                localized_name: Some(format!("TestApp{pid}")),
-            },
+            info,
             handle,
             is_frontmost,
             main_window,
