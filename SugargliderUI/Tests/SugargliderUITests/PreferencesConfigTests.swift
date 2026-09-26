@@ -105,6 +105,31 @@ final class PreferencesConfigTests: XCTestCase {
     XCTAssertEqual(encoded["axSubrole"] as? String, "AXDialog")
   }
 
+  /// The scope picker's value travels as `contextsScope`. Rust doesn't send
+  /// or read the key yet, so a config without it decodes with no scope.
+  func testDecodesAndEncodesTheContextsScope() throws {
+    let json = """
+      {
+        "statusIconEnable": true, "animate": true, "focusFollowsMouse": false,
+        "mouseFollowsFocus": false, "outerGap": 0.0, "innerGap": 0.0,
+        "dragDropEnable": true, "dragDropLivePreview": true, "defaultLayoutKind": "tree",
+        "contextsEnable": true, "contextsScope": "per_screen", "windowRules": [],
+        "hotkeys": []
+      }
+      """
+    let config = try JSONDecoder().decode(PreferencesConfig.self, from: Data(json.utf8))
+    XCTAssertEqual(config.contextsScope, "per_screen")
+
+    let encoded = try Self.jsonObject(JSONEncoder().encode(config))
+    XCTAssertEqual(encoded["contextsScope"] as? String, "per_screen")
+
+    let withoutScope = try JSONDecoder().decode(
+      PreferencesConfig.self,
+      from: Data(
+        json.replacingOccurrences(of: #", "contextsScope": "per_screen""#, with: "").utf8))
+    XCTAssertNil(withoutScope.contextsScope)
+  }
+
   /// Each decoded binding is its own row, even when two are alike.
   func testDecodedBindingsHaveTheirOwnIdentity() throws {
     let binding = """

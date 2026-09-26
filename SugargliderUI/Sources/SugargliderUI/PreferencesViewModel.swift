@@ -78,6 +78,8 @@ public class PreferencesViewModel: ObservableObject {
 
     // Experimental
     @Published public var contextsEnable: Bool = false
+    /// Which screens a context switch changes: "global" or "per_screen".
+    @Published public var contextsScope: String = "global"
 
     // Hotkeys (read-only, loaded from config)
     @Published public var hotkeys: [HotkeyBinding] = []
@@ -200,6 +202,7 @@ public class PreferencesViewModel: ObservableObject {
         defaultLayout = config.defaultLayoutKind == "scroll" ? .column : .tree
 
         contextsEnable = config.contextsEnable
+        contextsScope = config.contextsScope ?? "global"
 
         // Load hotkeys
         hotkeys = config.hotkeys
@@ -239,6 +242,7 @@ public class PreferencesViewModel: ObservableObject {
             $dragDropLivePreview.map { _ in () }.eraseToAnyPublisher(),
             $defaultLayout.map { _ in () }.eraseToAnyPublisher(),
             $contextsEnable.map { _ in () }.eraseToAnyPublisher(),
+            $contextsScope.map { _ in () }.eraseToAnyPublisher(),
             $appRules.map { _ in () }.eraseToAnyPublisher(),
         ]
 
@@ -288,6 +292,7 @@ public class PreferencesViewModel: ObservableObject {
             // Map layout mode: .column -> "scroll", .tree -> "tree"
             defaultLayoutKind: defaultLayout == .column ? "scroll" : "tree",
             contextsEnable: contextsEnable,
+            contextsScope: contextsScope,
             windowRules: appRules.map { rule in
                 WindowRuleJson(
                     appName: rule.appName,

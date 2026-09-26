@@ -159,6 +159,27 @@ final class PreferencesViewModelTests: XCTestCase {
     XCTAssertTrue(backend.saved.isEmpty)
   }
 
+  /// The scope picker shows the loaded scope and saves the chosen one with
+  /// the rest of the config.
+  func testContextsScopeFollowsTheContextsSwitch() {
+    let backend = FakePreferencesBackend(
+      PreferencesConfig(contextsEnable: true, contextsScope: "per_screen"))
+    let model = PreferencesViewModel(backend: backend)
+    XCTAssertEqual(model.contextsScope, "per_screen")
+
+    model.contextsScope = "global"
+    model.saveToConfig()
+
+    XCTAssertEqual(backend.updated.last?.contextsScope, "global")
+    XCTAssertEqual(backend.saved.last?.contextsScope, "global")
+  }
+
+  /// A config from Rust without the scope key shows the global default.
+  func testContextsScopeDefaultsToGlobalWhenTheConfigHasNone() {
+    let model = PreferencesViewModel(backend: FakePreferencesBackend(PreferencesConfig()))
+    XCTAssertEqual(model.contextsScope, "global")
+  }
+
   /// A window rule condition that the App Rules pane doesn't show survives
   /// a save, in the running config and in the file.
   func testKeepsWindowRuleConditionsThePaneDoesNotShow() throws {

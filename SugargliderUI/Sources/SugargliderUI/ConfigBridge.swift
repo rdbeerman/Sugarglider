@@ -25,6 +25,9 @@ public struct PreferencesConfig: Codable {
 
     // Experimental features
     public var contextsEnable: Bool
+    /// Which screens a context switch changes: "global" or "per_screen".
+    /// Optional because Rust doesn't send the key yet.
+    public var contextsScope: String?
 
     // Window rules
     public var windowRules: [WindowRuleJson]
@@ -43,6 +46,7 @@ public struct PreferencesConfig: Codable {
         dragDropLivePreview: Bool = true,
         defaultLayoutKind: String = "tree",
         contextsEnable: Bool = false,
+        contextsScope: String? = nil,
         windowRules: [WindowRuleJson] = [],
         hotkeys: [HotkeyBinding] = []
     ) {
@@ -56,6 +60,7 @@ public struct PreferencesConfig: Codable {
         self.dragDropLivePreview = dragDropLivePreview
         self.defaultLayoutKind = defaultLayoutKind
         self.contextsEnable = contextsEnable
+        self.contextsScope = contextsScope
         self.windowRules = windowRules
         self.hotkeys = hotkeys
     }

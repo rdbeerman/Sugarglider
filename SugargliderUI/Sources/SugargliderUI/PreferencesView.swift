@@ -153,6 +153,12 @@ struct GeneralPane: View {
 
             Section {
                 Toggle("Contexts (experimental)", isOn: $viewModel.contextsEnable)
+                Picker("Scope:", selection: $viewModel.contextsScope) {
+                    Text("All screens").tag("global")
+                    Text("Focused screen").tag("per_screen")
+                }
+                .pickerStyle(.radioGroup)
+                .disabled(!viewModel.contextsEnable)
             } footer: {
                 Text("Named sets of windows that you switch between, each with its own layout.")
                     .font(.caption)
