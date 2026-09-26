@@ -8,6 +8,7 @@
 use redact::Secret;
 use tracing::{debug, error, info};
 
+use super::contexts::Apply;
 use super::{ContextRef, Reactor};
 use crate::actor::app::{WindowId, pid_t};
 use crate::model::contexts::{Arrival, ContextKey, MatchPass, RecordLink, WindowDesc, plan_switch};
@@ -320,6 +321,15 @@ impl Reactor {
         Ok(self.tabs_of(wid))
     }
 
+    fn command_window_key(&self, wid: WindowId) -> ContextKey {
+        self.layout_frame(wid)
+            .and_then(|frame| self.best_screen_idx_for_window(&frame))
+            .map_or_else(
+                || self.screen_key(self.focused_screen_index()),
+                |screen| self.screen_key(screen),
+            )
+    }
+
     /// Adds the window and its tabs to the context. They take effect at the
     /// next switch: until then the windows count as members of the active
     /// context, so they stay where they are.
@@ -350,9 +360,10 @@ impl Reactor {
     ) -> Result<(), String> {
         let tabs = self.command_windows(window)?;
         let id = self.resolve_named(reference)?;
+        let active = self.command_window_key(tabs[0]);
         for &tab in &tabs {
             if let Some(desc) = self.window_desc(tab) {
-                _ = self.contexts.move_window(id, &desc);
+                _ = self.contexts.move_window(active, id, &desc);
                 self.added_since_switch.remove(&tab);
             }
         }
@@ -369,7 +380,7 @@ impl Reactor {
         window: Option<WindowId>,
     ) -> Result<(), String> {
         let tabs = self.command_windows(window)?;
-        let ContextKey::Named(id) = self.contexts.active() else {
+        let ContextKey::Named(id) = self.command_window_key(tabs[0]) else {
             return Err("No named context is active to remove the window from".to_string());
         };
         for &tab in &tabs {
@@ -409,8 +420,8 @@ impl Reactor {
         if !self.contexts_in_use() {
             return;
         }
-        let spaces = self.shown_spaces(self.contexts.active());
-        let park: Vec<WindowId> = plan_switch(&self.switch_input(&spaces))
+        let spaces = self.shown_spaces(Apply::Again);
+        let park: Vec<WindowId> = plan_switch(&self.switch_input(&spaces, None))
             .park
             .into_iter()
             .filter(|wid| wids.contains(wid))
@@ -431,7 +442,7 @@ impl Reactor {
         for pid in pids {
             self.send_visible_windows_to_layout(pid);
         }
-        let focus = plan_switch(&self.switch_input(&spaces)).focus;
+        let focus = plan_switch(&self.switch_input(&spaces, None)).focus;
         self.focus_after_parking(Default::default(), focus, false, &parked);
     }
 
@@ -444,9 +455,9 @@ impl Reactor {
         if !self.contexts_in_use() || self.pending_exit.is_some() {
             return;
         }
-        let spaces = self.shown_spaces(self.contexts.active());
+        let spaces = self.shown_spaces(Apply::Again);
         let main_window = self.main_window();
-        let park: Vec<WindowId> = plan_switch(&self.switch_input(&spaces))
+        let park: Vec<WindowId> = plan_switch(&self.switch_input(&spaces, None))
             .park
             .into_iter()
             .filter(|wid| wid.pid == pid && Some(*wid) != main_window)

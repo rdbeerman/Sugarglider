@@ -14,7 +14,7 @@ use super::main_window::FocusSource;
 use crate::actor::app::{Quiet, Request, WindowId, pid_t};
 use crate::actor::layout::{EventResponse, LayoutEvent};
 use crate::collections::HashSet;
-use crate::model::contexts::ContextKey;
+use crate::model::contexts::{ContextKey, Scope};
 
 const FINDER: &str = "com.apple.finder";
 
@@ -108,7 +108,9 @@ impl Reactor {
     /// Applies focus that waited for windows the reactor sees for the first
     /// time, now that their membership is decided.
     pub(super) fn focus_windows_seen(&mut self, wids: &[WindowId]) {
-        let Some((waiting, source)) = self.focus_waiting else { return };
+        let Some((waiting, source)) = self.focus_waiting else {
+            return;
+        };
         if !wids.contains(&waiting) {
             return;
         }
@@ -139,8 +141,11 @@ impl Reactor {
         if wid.pid == own_pid || self.layout.is_untracked(&info) {
             return FocusOutcome::Stays;
         }
-        let shown = match self.best_space_for_window(&info.frame) {
-            Some(space) => self.shown_context(space),
+        // R26. The screen the window was last shown on, which the switch
+        // changes in `per_screen` scope.
+        let screen = self.best_screen_idx_for_window(&info.frame);
+        let shown = match screen {
+            Some(screen) => self.screen_shown_key(screen),
             None => self.contexts.active(),
         };
         if self.shows_under(shown, wid) {
@@ -164,9 +169,18 @@ impl Reactor {
                 return FocusOutcome::Ignored;
             }
         }
-        let target = self.contexts.focus_target(self.membership_window(wid));
-        info!(?wid, ?target, "Focus from outside the active context; switching");
-        _ = self.switch_context_focusing(target, Some(wid));
+        let target = self.contexts.focus_target_on(shown, self.membership_window(wid));
+        let on = match self.scope() {
+            Scope::Global => None,
+            Scope::PerScreen => Some(screen.unwrap_or_else(|| self.focused_screen_index())),
+        };
+        info!(
+            ?wid,
+            ?target,
+            ?on,
+            "Focus from outside the active context; switching"
+        );
+        _ = self.switch_context_on(on, target, Some(wid));
         FocusOutcome::Switched
     }
 
@@ -226,7 +240,11 @@ impl Reactor {
         let guard = &mut self.switch_guard;
         match raise {
             Some((sequence_id, focus)) => {
-                guard.raise = Some(RaiseWait { sequence_id, focus, sent: false });
+                guard.raise = Some(RaiseWait {
+                    sequence_id,
+                    focus,
+                    sent: false,
+                });
             }
             None => guard.echoes.extend(parked),
         }

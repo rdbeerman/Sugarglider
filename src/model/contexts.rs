@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::collections::{HashMap, HashSet};
+use crate::sys::screen::ScreenId;
 use crate::sys::window_server::WindowServerId;
 
 /// Identifies a named context. Ids are never reused.
@@ -34,6 +35,18 @@ pub enum ContextKey {
     /// Shows the windows that belong to no named context.
     Unsorted,
     Named(ContextId),
+}
+
+/// Which screens a switch changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// A switch changes every screen.
+    #[default]
+    Global,
+    /// A switch changes only the focused screen, and takes the target's
+    /// members along from the other screens (R8, R9).
+    PerScreen,
 }
 
 /// How a member record relates to a live window.
@@ -139,6 +152,23 @@ pub enum ContextError {
 pub const EVERYTHING_NAME: &str = "Everything";
 pub const UNSORTED_NAME: &str = "Unsorted";
 
+/// What one screen shows in `per_screen` scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenState {
+    pub active: ContextKey,
+    /// The context the screen used before its active one (R18).
+    pub previous: Option<ContextKey>,
+}
+
+impl Default for ScreenState {
+    fn default() -> Self {
+        ScreenState {
+            active: ContextKey::Everything,
+            previous: None,
+        }
+    }
+}
+
 /// The most empty member records that a context, or the pinned list, keeps.
 /// An empty record's window is gone, and the record waits for a window to
 /// match it.
@@ -146,7 +176,10 @@ pub const MAX_EMPTY_RECORDS: usize = 50;
 
 /// The user's contexts, their members, and the active context.
 ///
-/// Scope is global: one active context covers every screen.
+/// Scope is global: one active context covers every screen. In `per_screen`
+/// scope, which the reactor turns on with the config and applies through the
+/// `switch_to_on` and `active_on` methods, each screen has its own active
+/// context.
 ///
 /// Serializes to the shape of `contexts.json`. Live windows, pending
 /// states, the previous context, and focus order are not saved.
@@ -160,6 +193,8 @@ pub struct Contexts {
     use_seq: u64,
     active: ContextKey,
     previous: Option<ContextKey>,
+    /// The active context of each screen, in `per_screen` scope (R8).
+    screens: HashMap<ScreenId, ScreenState>,
     unsorted_last_used: u64,
     everything_last_used: u64,
     focus_seq: u64,
@@ -175,6 +210,7 @@ impl Default for Contexts {
             use_seq: 0,
             active: ContextKey::Everything,
             previous: None,
+            screens: HashMap::default(),
             unsorted_last_used: 0,
             everything_last_used: 0,
             focus_seq: 0,
@@ -218,9 +254,20 @@ impl Contexts {
         self.active
     }
 
+    /// The context a screen shows in `per_screen` scope. A screen with no
+    /// entry shows Everything.
+    pub fn active_on(&self, screen: ScreenId) -> ContextKey {
+        self.screens.get(&screen).map_or(ContextKey::Everything, |state| state.active)
+    }
+
     /// The context that was active before the current one.
     pub fn previous(&self) -> Option<ContextKey> {
         self.previous
+    }
+
+    /// The context a screen used before its active one (R18).
+    pub fn previous_on(&self, screen: ScreenId) -> Option<ContextKey> {
+        self.screens.get(&screen).and_then(|state| state.previous)
     }
 
     pub fn last_used(&self, key: ContextKey) -> u64 {
@@ -360,10 +407,10 @@ impl Contexts {
     }
 
     /// Deletes a context. Its windows stay open; the ones that were only in
-    /// this context become unsorted. If it was active, Unsorted becomes
-    /// active so that those windows stay visible. That counts as a use of
-    /// Unsorted, and the context before the deleted one stays the previous
-    /// context unless it is Unsorted.
+    /// this context become unsorted. If it was active, on any screen or in
+    /// global scope, Unsorted becomes active so that those windows stay
+    /// visible. That counts as a use of Unsorted, and the context before the
+    /// deleted one stays the previous context unless it is Unsorted.
     pub fn delete(&mut self, id: ContextId) -> Result<Context, ContextError> {
         let idx = self
             .contexts
@@ -372,8 +419,21 @@ impl Contexts {
             .ok_or(ContextError::NoSuchContext)?;
         let context = self.contexts.remove(idx);
         let key = ContextKey::Named(id);
-        if self.active == key {
+        let was_global = self.active == key;
+        let mut screen_became_unsorted = false;
+        for state in self.screens.values_mut() {
+            if state.active == key {
+                state.active = ContextKey::Unsorted;
+                screen_became_unsorted = true;
+            }
+            if state.previous == Some(key) || state.previous == Some(state.active) {
+                state.previous = None;
+            }
+        }
+        if was_global {
             self.active = ContextKey::Unsorted;
+        }
+        if was_global || screen_became_unsorted {
             self.unsorted_last_used = self.take_use();
         }
         if self.previous == Some(key) || self.previous == Some(self.active) {
@@ -419,14 +479,15 @@ impl Contexts {
         Ok(records.remove(index))
     }
 
-    /// Moves a window out of the active context and into `target`.
+    /// Moves a window out of its screen's active context and into `target`.
     pub fn move_window(
         &mut self,
+        active: ContextKey,
         target: ContextId,
         window: &WindowDesc,
     ) -> Result<(), ContextError> {
         self.get_mut(target)?;
-        if let ContextKey::Named(active) = self.active
+        if let ContextKey::Named(active) = active
             && active != target
         {
             self.remove_window(active, window.wid)?;
@@ -457,9 +518,9 @@ impl Contexts {
         self.pinned.len() != len
     }
 
-    /// Records a switch to `key`. Switching to the active context again
-    /// counts as a use but leaves the previous context alone.
-    pub fn switch_to(&mut self, key: ContextKey) -> Result<(), ContextError> {
+    /// Records that a context is used: it exists and its use number becomes
+    /// the newest. Switching to the active context again is a use.
+    fn note_use_of(&mut self, key: ContextKey) -> Result<(), ContextError> {
         if let ContextKey::Named(id) = key {
             self.get_mut(id)?;
         }
@@ -469,11 +530,56 @@ impl Contexts {
             ContextKey::Unsorted => self.unsorted_last_used = seq,
             ContextKey::Named(id) => self.get_mut(id)?.last_used = seq,
         }
+        Ok(())
+    }
+
+    /// Records a switch to `key`. Switching to the active context again
+    /// counts as a use but leaves the previous context alone.
+    pub fn switch_to(&mut self, key: ContextKey) -> Result<(), ContextError> {
+        self.note_use_of(key)?;
         if self.active != key {
             self.previous = Some(self.active);
             self.active = key;
         }
         Ok(())
+    }
+
+    /// Records a switch on one screen (R8). Like [`Contexts::switch_to`],
+    /// switching to the screen's active context again counts as a use.
+    pub fn switch_to_on(&mut self, screen: ScreenId, key: ContextKey) -> Result<(), ContextError> {
+        self.note_use_of(key)?;
+        let state = self.screens.entry(screen).or_default();
+        if state.active != key {
+            state.previous = Some(state.active);
+            state.active = key;
+        }
+        Ok(())
+    }
+
+    /// Gives each screen the context `key`, without counting a use. This is
+    /// R11's change from `global` scope to `per_screen`: every screen starts
+    /// on the context that was global.
+    pub fn set_screen_actives(
+        &mut self,
+        screens: impl IntoIterator<Item = ScreenId>,
+        key: ContextKey,
+    ) {
+        for screen in screens {
+            self.screens.insert(
+                screen,
+                ScreenState {
+                    active: key,
+                    previous: self.previous,
+                },
+            );
+        }
+    }
+
+    /// Forgets the per-screen contexts. This is R11's change from
+    /// `per_screen` scope to `global`: the focused screen's context becomes
+    /// the global one, and a later change back gives it to every screen.
+    pub fn forget_screen_actives(&mut self) {
+        self.screens.clear();
     }
 
     /// The named contexts that hold a record of this open window. Pinning is
@@ -501,8 +607,14 @@ impl Contexts {
     /// outside the active context: the most recently used context that holds
     /// it, or Unsorted.
     pub fn focus_target(&self, wid: WindowId) -> ContextKey {
-        if self.is_member(self.active, wid) {
-            return self.active;
+        self.focus_target_on(self.active, wid)
+    }
+
+    /// [`Contexts::focus_target`] for a screen that shows `active`. In
+    /// `per_screen` scope each screen has its own active context (R8, R26).
+    pub fn focus_target_on(&self, active: ContextKey, wid: WindowId) -> ContextKey {
+        if self.is_member(active, wid) {
+            return active;
         }
         self.contexts
             .iter()
@@ -1232,6 +1344,20 @@ impl SwitchWindow {
         }
     }
 
+    /// Whether a switch to `key` takes the window along to the screen that
+    /// switched (R8, R9). A pinned window shows on every screen but stays
+    /// where it is, and Everything changes no screen's members.
+    fn comes_with(&self, key: ContextKey) -> bool {
+        if self.pinned {
+            return false;
+        }
+        match key {
+            ContextKey::Everything => false,
+            ContextKey::Unsorted => self.contexts.is_empty(),
+            ContextKey::Named(id) => self.contexts.contains(&id),
+        }
+    }
+
     /// Whether the user can see and use the window, and Sugarglider may move it.
     fn in_play(&self) -> bool {
         !(self.own || self.untracked || self.invisible)
@@ -1241,21 +1367,38 @@ impl SwitchWindow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwitchInput {
     pub screens: Vec<SwitchScreen>,
+    /// `Some(i)` when the switch changes only the screen at `i`, as
+    /// `per_screen` scope does: the members of its context move there from
+    /// the other screens (R8, R9). `None` changes every screen, and windows
+    /// stay on the screen they're on (R7).
+    pub only: Option<usize>,
 }
 
-/// What a switch does to windows. Windows keep the screen they're on.
+/// A window a switch moves to another screen, and that screen's place in
+/// [`SwitchInput::screens`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwitchMove {
+    pub wid: WindowId,
+    pub screen: usize,
+}
+
+/// What a switch does to windows. In `global` scope windows keep the screen
+/// they're on; a `per_screen` switch moves members to the screen it changes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SwitchPlan {
     /// Windows to park, which must be written to the journal first.
     pub park: Vec<WindowId>,
     /// Parked windows to put back.
     pub unpark: Vec<WindowId>,
+    /// Windows to move to another screen (R8, R9). A parked one is also in
+    /// `unpark`, because it must show at its destination.
+    pub moves: Vec<SwitchMove>,
     /// The window to focus with a quiet raise.
     pub focus: Option<WindowId>,
 }
 
-/// Plans a switch: which windows to park, which to put back, and which to
-/// focus.
+/// Plans a switch: which windows to park, which to put back, which to move
+/// to another screen, and which to focus.
 ///
 /// A window must show when it is a member of its screen's active context;
 /// under Everything every window must show. Windows that must show and are
@@ -1264,23 +1407,45 @@ pub struct SwitchPlan {
 /// showing Everything, quitting, and turning Sugarglider off restore windows
 /// (R27, R32, R33). The others are parked, except Sugarglider's own windows,
 /// untracked windows, and windows that aren't in the reactor's set of visible
-/// windows. Windows that are parked already stay parked. The
-/// focus goes to the most recently focused window that shows and that the
-/// user can see.
+/// windows. Windows that are parked already stay parked.
+///
+/// With [`SwitchInput::only`] set, the windows of the target context that are
+/// on the other screens move to the screen that switched, and that screen's
+/// focus goes to the most recently focused window that shows there or moves
+/// there. Otherwise the focus goes to the most recently focused window that
+/// shows and that the user can see, on any screen.
 pub fn plan_switch(input: &SwitchInput) -> SwitchPlan {
     let mut plan = SwitchPlan::default();
     let mut focus: Option<&SwitchWindow> = None;
-    for screen in &input.screens {
+    let taking = input.only.and_then(|idx| input.screens.get(idx).map(|taking| (idx, taking)));
+    for (idx, screen) in input.screens.iter().enumerate() {
         for window in &screen.windows {
-            if window.shows_under(screen.active) {
+            let moves_here = taking.is_some_and(|(taker, taker_screen)| {
+                idx != taker && window.in_play() && window.comes_with(taker_screen.active)
+            });
+            if taking.is_some_and(|(taker, _)| idx != taker) && !moves_here {
+                continue;
+            }
+            if moves_here {
+                let taker = taking.expect("checked above").0;
                 if window.parked {
                     plan.unpark.push(window.wid);
                 }
-                if window.in_play() && focus.is_none_or(|f| window.last_focus > f.last_focus) {
-                    focus = Some(window);
+                plan.moves.push(SwitchMove { wid: window.wid, screen: taker });
+            } else if window.shows_under(screen.active) {
+                if window.parked {
+                    plan.unpark.push(window.wid);
                 }
             } else if !window.parked && window.in_play() {
                 plan.park.push(window.wid);
+                continue;
+            }
+            let shows_on_the_taker = taking.is_none_or(|(taker, _)| idx == taker);
+            if window.in_play()
+                && (moves_here || shows_on_the_taker && window.shows_under(screen.active))
+                && focus.is_none_or(|f| window.last_focus > f.last_focus)
+            {
+                focus = Some(window);
             }
         }
     }
@@ -1324,15 +1489,22 @@ struct ContextsFile {
     active: Option<SavedActive>,
 }
 
-/// `{ "global": <key> }`. Anything else loads as Everything.
+/// `{ "global": <key> }` or `{ "per_screen": { "<display id>": <key> } }`.
+/// Anything else loads as Everything.
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum SavedActive {
-    Global {
-        global: SavedKey,
-    },
+    Known(SavedActives),
     #[serde(skip_serializing)]
     Unknown(IgnoredAny),
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedActives {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    global: Option<SavedKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    per_screen: Option<std::collections::BTreeMap<ScreenId, SavedKey>>,
 }
 
 /// A context id, or `"everything"` or `"unsorted"`.
@@ -1352,12 +1524,37 @@ enum BuiltinKey {
     Unsorted,
 }
 
+/// A context key in the shape `contexts.json` stores it.
+fn saved_key(key: ContextKey) -> SavedKey {
+    match key {
+        ContextKey::Everything => SavedKey::Builtin(BuiltinKey::Everything),
+        ContextKey::Unsorted => SavedKey::Builtin(BuiltinKey::Unsorted),
+        ContextKey::Named(id) => SavedKey::Named(id),
+    }
+}
+
+/// Reads a stored key. A named context that doesn't exist, or a value of
+/// another shape, loads as Everything.
+fn read_saved_key(key: SavedKey, contexts: &Contexts) -> ContextKey {
+    match key {
+        SavedKey::Builtin(BuiltinKey::Unsorted) => ContextKey::Unsorted,
+        SavedKey::Named(id) if contexts.get(id).is_some() => ContextKey::Named(id),
+        _ => ContextKey::Everything,
+    }
+}
+
 impl From<Contexts> for ContextsFile {
     fn from(contexts: Contexts) -> Self {
-        let global = match contexts.active {
-            ContextKey::Everything => SavedKey::Builtin(BuiltinKey::Everything),
-            ContextKey::Unsorted => SavedKey::Builtin(BuiltinKey::Unsorted),
-            ContextKey::Named(id) => SavedKey::Named(id),
+        let per_screen = (!contexts.screens.is_empty()).then(|| {
+            contexts
+                .screens
+                .iter()
+                .map(|(&screen, state)| (screen, saved_key(state.active)))
+                .collect()
+        });
+        let active = SavedActives {
+            global: per_screen.is_none().then(|| saved_key(contexts.active)),
+            per_screen,
         };
         ContextsFile {
             version: CONTEXTS_FILE_VERSION,
@@ -1365,7 +1562,7 @@ impl From<Contexts> for ContextsFile {
             use_seq: contexts.use_seq,
             contexts: contexts.contexts,
             pinned: contexts.pinned,
-            active: Some(SavedActive::Global { global }),
+            active: Some(SavedActive::Known(active)),
         }
     }
 }
@@ -1425,17 +1622,18 @@ impl TryFrom<ContextsFile> for Contexts {
             }
             contexts.contexts.push(context);
         }
-        contexts.active = match file.active {
-            Some(SavedActive::Global {
-                global: SavedKey::Builtin(BuiltinKey::Unsorted),
-            }) => ContextKey::Unsorted,
-            Some(SavedActive::Global { global: SavedKey::Named(id) })
-                if contexts.get(id).is_some() =>
-            {
-                ContextKey::Named(id)
-            }
-            _ => ContextKey::Everything,
+        let (global, per_screen) = match file.active {
+            Some(SavedActive::Known(active)) => (active.global, active.per_screen),
+            Some(SavedActive::Unknown(_)) | None => (None, None),
         };
+        contexts.active =
+            global.map_or(ContextKey::Everything, |key| read_saved_key(key, &contexts));
+        if let Some(per_screen) = per_screen {
+            for (screen, key) in per_screen {
+                let active = read_saved_key(key, &contexts);
+                contexts.screens.insert(screen, ScreenState { active, previous: None });
+            }
+        }
         Ok(contexts)
     }
 }
@@ -1722,10 +1920,10 @@ mod tests {
         cx.add_window(a, &w).unwrap();
         cx.add_window(c, &w).unwrap();
         cx.switch_to(named(a)).unwrap();
-        cx.move_window(b, &w).unwrap();
+        cx.move_window(named(a), b, &w).unwrap();
         assert_eq!(cx.contexts_of(w.wid), vec![b, c]);
         assert_eq!(
-            cx.move_window(ContextId(99), &w),
+            cx.move_window(named(a), ContextId(99), &w),
             Err(ContextError::NoSuchContext)
         );
     }
@@ -1737,7 +1935,7 @@ mod tests {
         let b = cx.create("B").unwrap();
         let w = window(1, 1, "App", "W");
         cx.add_window(a, &w).unwrap();
-        cx.move_window(b, &w).unwrap();
+        cx.move_window(ContextKey::Everything, b, &w).unwrap();
         assert_eq!(cx.contexts_of(w.wid), vec![a, b]);
     }
 
@@ -2251,6 +2449,7 @@ mod tests {
     fn one_screen(active: ContextKey, windows: Vec<SwitchWindow>) -> SwitchInput {
         SwitchInput {
             screens: vec![SwitchScreen { active, windows }],
+            only: None,
         }
     }
 
@@ -2433,10 +2632,240 @@ mod tests {
                     ],
                 },
             ],
+            only: None,
         };
         let plan = plan_switch(&input);
         assert_eq!(plan.park, vec![wid(1, 2), wid(2, 1)]);
         assert_eq!(plan.unpark, vec![wid(2, 2)]);
+    }
+
+    /// R8. In `per_screen` scope only the screen that switched changes: its
+    /// own non-members are parked, and the members of its context come to it
+    /// from the other screens.
+    #[test]
+    fn r8_a_per_screen_switch_takes_the_targets_members_to_that_screen() {
+        let input = SwitchInput {
+            screens: vec![
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![member_of(wid(1, 1), &[A]), member_of(wid(1, 2), &[B])],
+                },
+                SwitchScreen {
+                    active: ContextKey::Named(B),
+                    windows: vec![
+                        member_of(wid(2, 1), &[A]),
+                        member_of(wid(2, 2), &[B]),
+                        SwitchWindow {
+                            pinned: true,
+                            ..member_of(wid(2, 3), &[])
+                        },
+                    ],
+                },
+            ],
+            only: Some(0),
+        };
+
+        let plan = plan_switch(&input);
+
+        assert_eq!(plan.park, vec![wid(1, 2)]);
+        assert_eq!(plan.unpark, vec![]);
+        // The other screen's member of A comes along. Its own member of B
+        // stays, and the pinned window stays on both screens.
+        assert_eq!(plan.moves, vec![SwitchMove { wid: wid(2, 1), screen: 0 }]);
+    }
+
+    /// R8. A parked member of the target on another screen moves and shows
+    /// again, so it is put back as well as moved.
+    #[test]
+    fn r8_a_parked_member_of_another_screen_is_moved_and_put_back() {
+        let input = SwitchInput {
+            screens: vec![
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![],
+                },
+                SwitchScreen {
+                    active: ContextKey::Named(B),
+                    windows: vec![SwitchWindow {
+                        parked: true,
+                        ..member_of(wid(2, 1), &[A])
+                    }],
+                },
+            ],
+            only: Some(0),
+        };
+
+        let plan = plan_switch(&input);
+
+        assert_eq!(plan.moves, vec![SwitchMove { wid: wid(2, 1), screen: 0 }]);
+        assert_eq!(plan.unpark, vec![wid(2, 1)]);
+        assert_eq!(plan.park, vec![]);
+    }
+
+    #[test]
+    fn r8_a_switch_does_not_reconcile_windows_that_stay_on_another_screen() {
+        let input = SwitchInput {
+            screens: vec![
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![],
+                },
+                SwitchScreen {
+                    active: ContextKey::Named(B),
+                    windows: vec![
+                        member_of(wid(2, 1), &[]),
+                        SwitchWindow {
+                            parked: true,
+                            ..member_of(wid(2, 2), &[B])
+                        },
+                    ],
+                },
+            ],
+            only: Some(0),
+        };
+
+        let plan = plan_switch(&input);
+        assert!(plan.park.is_empty());
+        assert!(plan.unpark.is_empty());
+        assert!(plan.moves.is_empty());
+    }
+
+    /// R14. A window the user can't use stays where it is, whatever context
+    /// it is a member of.
+    #[test]
+    fn r8_r14_a_window_that_cant_be_used_is_not_moved() {
+        let input = SwitchInput {
+            screens: vec![
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![],
+                },
+                SwitchScreen {
+                    active: ContextKey::Named(B),
+                    windows: vec![
+                        SwitchWindow {
+                            own: true,
+                            ..member_of(wid(2, 1), &[A])
+                        },
+                        SwitchWindow {
+                            untracked: true,
+                            ..member_of(wid(2, 2), &[A])
+                        },
+                        SwitchWindow {
+                            invisible: true,
+                            ..member_of(wid(2, 3), &[A])
+                        },
+                    ],
+                },
+            ],
+            only: Some(0),
+        };
+
+        let plan = plan_switch(&input);
+
+        assert_eq!(plan.moves, vec![]);
+        assert_eq!(plan.park, vec![]);
+    }
+
+    /// R12. A per-screen switch focuses a window that shows on the screen it
+    /// changed, or one that moves there, and never one that stays elsewhere.
+    #[test]
+    fn r12_a_per_screen_switch_focuses_on_the_screen_that_switched() {
+        let input = SwitchInput {
+            screens: vec![
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![SwitchWindow {
+                        last_focus: Some(5),
+                        ..member_of(wid(1, 1), &[A])
+                    }],
+                },
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![
+                        SwitchWindow {
+                            last_focus: Some(9),
+                            ..member_of(wid(2, 1), &[A])
+                        },
+                        SwitchWindow {
+                            last_focus: Some(20),
+                            ..member_of(wid(2, 2), &[B])
+                        },
+                    ],
+                },
+            ],
+            only: Some(0),
+        };
+
+        let plan = plan_switch(&input);
+
+        assert_eq!(plan.focus, Some(wid(2, 1)));
+        assert_eq!(plan.moves, vec![SwitchMove { wid: wid(2, 1), screen: 0 }]);
+    }
+
+    /// R9. A window that two screens' contexts share goes to whichever
+    /// screen switched last.
+    #[test]
+    fn r9_a_shared_window_goes_to_the_screen_that_switched_last() {
+        let shared = member_of(wid(1, 1), &[A, B]);
+        let right_switches = SwitchInput {
+            screens: vec![
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![shared.clone()],
+                },
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![],
+                },
+            ],
+            only: Some(1),
+        };
+        let plan = plan_switch(&right_switches);
+        assert_eq!(plan.moves, vec![SwitchMove { wid: wid(1, 1), screen: 1 }]);
+
+        // The window is on the right screen now. The left screen switches,
+        // and takes it back.
+        let left_switches = SwitchInput {
+            screens: vec![
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![],
+                },
+                SwitchScreen {
+                    active: ContextKey::Named(A),
+                    windows: vec![shared],
+                },
+            ],
+            only: Some(0),
+        };
+        let plan = plan_switch(&left_switches);
+        assert_eq!(plan.moves, vec![SwitchMove { wid: wid(1, 1), screen: 0 }]);
+        assert_eq!(plan.park, vec![]);
+    }
+
+    /// R27. Showing Everything on one screen moves nothing: everything is a
+    /// member of nothing and shows everywhere it is active.
+    #[test]
+    fn r27_showing_everything_on_one_screen_moves_nothing() {
+        let input = SwitchInput {
+            screens: vec![
+                SwitchScreen {
+                    active: ContextKey::Everything,
+                    windows: vec![member_of(wid(1, 1), &[A])],
+                },
+                SwitchScreen {
+                    active: ContextKey::Named(B),
+                    windows: vec![member_of(wid(2, 1), &[A, B])],
+                },
+            ],
+            only: Some(0),
+        };
+
+        let plan = plan_switch(&input);
+
+        assert_eq!(plan.moves, vec![]);
+        assert_eq!(plan.park, vec![]);
     }
 
     #[test]
@@ -2592,6 +3021,121 @@ mod tests {
         doc.as_object_mut().unwrap().remove("active");
         let cx: Contexts = serde_json::from_value(doc).unwrap();
         assert_eq!(cx.active(), ContextKey::Everything);
+    }
+
+    /// M9, R8. `contexts.json` holds each screen's active context next to
+    /// the global one, and a restart restores them. A screen with no entry
+    /// shows Everything.
+    #[test]
+    fn m9_contexts_json_holds_the_active_context_of_each_screen() {
+        let mut cx = Contexts::new();
+        let comms = cx.create("Comms").unwrap();
+        let build = cx.create("Build").unwrap();
+        cx.switch_to(ContextKey::Named(comms)).unwrap();
+        cx.switch_to_on(ScreenId::new(1), ContextKey::Named(comms)).unwrap();
+        cx.switch_to_on(ScreenId::new(2), ContextKey::Named(build)).unwrap();
+
+        let written = serde_json::to_value(&cx).unwrap();
+        assert_eq!(
+            written["active"],
+            serde_json::json!({ "per_screen": { "1": 1, "2": 2 } })
+        );
+
+        let restored = round_trip(&cx);
+        assert_eq!(restored.active(), ContextKey::Everything);
+        assert_eq!(restored.active_on(ScreenId::new(1)), ContextKey::Named(comms));
+        assert_eq!(restored.active_on(ScreenId::new(2)), ContextKey::Named(build));
+        assert_eq!(restored.active_on(ScreenId::new(3)), ContextKey::Everything);
+        // The global value alone keeps the old shape.
+        let mut global = Contexts::new();
+        global.switch_to(ContextKey::Unsorted).unwrap();
+        assert_eq!(
+            serde_json::to_value(&global).unwrap()["active"],
+            serde_json::json!({ "global": "unsorted" })
+        );
+    }
+
+    /// M9, R8. A screen's saved context that no longer exists, and a saved
+    /// value of another shape, load as Everything. Built-ins load as
+    /// themselves.
+    #[test]
+    fn m9_a_screens_saved_context_that_is_gone_loads_as_everything() {
+        let doc = serde_json::json!({
+            "version": 1,
+            "next_id": 2,
+            "contexts": [{ "id": 1, "name": "A" }],
+            "active": {
+                "global": 1,
+                "per_screen": { "1": 9, "2": "unsorted", "3": "everything", "4": "nonsense" }
+            }
+        });
+
+        let cx: Contexts = serde_json::from_value(doc).unwrap();
+
+        assert_eq!(cx.active_on(ScreenId::new(1)), ContextKey::Everything);
+        assert_eq!(cx.active_on(ScreenId::new(2)), ContextKey::Unsorted);
+        assert_eq!(cx.active_on(ScreenId::new(3)), ContextKey::Everything);
+        assert_eq!(cx.active_on(ScreenId::new(4)), ContextKey::Everything);
+        assert_eq!(cx.active_on(ScreenId::new(5)), ContextKey::Everything);
+    }
+
+    /// R6. Deleting the context a screen shows makes that screen show
+    /// Unsorted, which counts as a use of it. Other screens are untouched.
+    #[test]
+    fn r6_deleting_the_active_context_of_a_screen_shows_unsorted_there() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let left = ScreenId::new(1);
+        cx.switch_to_on(left, ContextKey::Named(a)).unwrap();
+        cx.switch_to_on(ScreenId::new(2), ContextKey::Named(b)).unwrap();
+        let before = cx.last_used(ContextKey::Unsorted);
+
+        cx.delete(a).unwrap();
+
+        assert_eq!(cx.active_on(left), ContextKey::Unsorted);
+        assert_eq!(cx.active_on(ScreenId::new(2)), ContextKey::Named(b));
+        assert!(cx.last_used(ContextKey::Unsorted) > before);
+        assert_eq!(cx.active(), ContextKey::Everything);
+        // The screen's first switch was from Everything.
+        assert_eq!(cx.previous_on(left), Some(ContextKey::Everything));
+    }
+
+    /// R18. Each screen remembers the context it used before its active one.
+    #[test]
+    fn r18_previous_contexts_are_per_screen() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        let b = cx.create("B").unwrap();
+        let left = ScreenId::new(1);
+        cx.switch_to_on(left, ContextKey::Named(a)).unwrap();
+        cx.switch_to_on(left, ContextKey::Named(b)).unwrap();
+        // A switch to the active context again leaves the previous alone.
+        cx.switch_to_on(left, ContextKey::Named(b)).unwrap();
+
+        assert_eq!(cx.previous_on(left), Some(ContextKey::Named(a)));
+        assert_eq!(cx.previous_on(ScreenId::new(2)), None);
+        assert_eq!(cx.previous(), None);
+    }
+
+    /// R11. Going from `global` to `per_screen` gives every screen the
+    /// global context without counting a use. Going back forgets them.
+    #[test]
+    fn r11_screen_actives_are_adopted_and_forgotten() {
+        let mut cx = Contexts::new();
+        let a = cx.create("A").unwrap();
+        cx.switch_to(ContextKey::Named(a)).unwrap();
+        let used = cx.last_used(ContextKey::Named(a));
+
+        cx.set_screen_actives([ScreenId::new(1), ScreenId::new(2)], ContextKey::Named(a));
+
+        assert_eq!(cx.active_on(ScreenId::new(1)), ContextKey::Named(a));
+        assert_eq!(cx.active_on(ScreenId::new(2)), ContextKey::Named(a));
+        assert_eq!(cx.active_on(ScreenId::new(3)), ContextKey::Everything);
+        assert_eq!(used, cx.last_used(ContextKey::Named(a)));
+        cx.forget_screen_actives();
+        assert_eq!(cx.active_on(ScreenId::new(1)), ContextKey::Everything);
+        assert_eq!(cx.active(), ContextKey::Named(a));
     }
 
     #[test]
@@ -2983,6 +3527,7 @@ mod tests {
         assert_eq!(
             plan,
             SwitchPlan {
+                moves: vec![],
                 park: vec![wid(1, 1)],
                 unpark: vec![wid(1, 2)],
                 focus: Some(wid(1, 2)),
@@ -2994,7 +3539,7 @@ mod tests {
     #[test]
     fn r12_a_switch_without_windows_plans_nothing() {
         assert_eq!(
-            plan_switch(&SwitchInput { screens: vec![] }),
+            plan_switch(&SwitchInput { screens: vec![], only: None }),
             SwitchPlan::default()
         );
         for active in [
@@ -3011,6 +3556,7 @@ mod tests {
     #[test]
     fn r12_focus_is_the_most_recently_focused_member_on_any_screen() {
         let input = SwitchInput {
+            only: None,
             screens: vec![
                 SwitchScreen {
                     active: ContextKey::Named(A),
@@ -3045,6 +3591,7 @@ mod tests {
         assert_eq!(
             plan_switch(&input),
             SwitchPlan {
+                moves: vec![],
                 park: vec![wid(1, 2)],
                 unpark: vec![wid(2, 1)],
                 focus: Some(wid(2, 1)),
@@ -4016,6 +4563,7 @@ mod tests {
     #[test]
     fn r32_everything_puts_back_parked_windows_on_every_screen_and_space() {
         let input = SwitchInput {
+            only: None,
             screens: vec![
                 SwitchScreen {
                     active: ContextKey::Everything,
@@ -4057,6 +4605,7 @@ mod tests {
         assert_eq!(
             plan_switch(&input),
             SwitchPlan {
+                moves: vec![],
                 park: vec![],
                 unpark: vec![wid(1, 2), wid(2, 1), wid(2, 2), wid(2, 3)],
                 focus: Some(wid(2, 3)),

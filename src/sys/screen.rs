@@ -248,13 +248,51 @@ pub struct ScreenInfo {
     pub scale_factor: f64,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy, Serialize)]
+#[serde(transparent)]
 pub struct ScreenId(CGDirectDisplayID);
 
-#[cfg(test)]
 impl ScreenId {
     pub fn new(id: u32) -> ScreenId {
         ScreenId(id)
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Reads a display id written as an integer or as the string form of one,
+/// since JSON object keys are strings and the contexts file keys screens by
+/// display id.
+impl<'de> Deserialize<'de> for ScreenId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ScreenIdVisitor;
+
+        impl serde::de::Visitor<'_> for ScreenIdVisitor {
+            type Value = ScreenId;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a display id as an integer or as a string")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<ScreenId, E> {
+                u32::try_from(value).map(ScreenId).map_err(E::custom)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<ScreenId, E> {
+                u32::try_from(value).map(ScreenId).map_err(E::custom)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<ScreenId, E> {
+                value.trim().parse::<u32>().map(ScreenId).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(ScreenIdVisitor)
     }
 }
 

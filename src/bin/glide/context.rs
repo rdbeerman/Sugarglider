@@ -339,6 +339,7 @@ mod tests {
             enabled: true,
             scope: Scope::Global,
             active: ContextKey::Named(id(1)),
+            focused_screen: None,
             screens: vec![ScreenContext {
                 id: 1,
                 shows: ContextKey::Named(id(1)),

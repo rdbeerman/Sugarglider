@@ -96,6 +96,38 @@ impl OwnedNode {
         OwnedNode(Some(node), name.to_owned())
     }
 
+    /// Unlinks `node` from the tree and keeps it out of it, without
+    /// forgetting it. Call [`OwnedNode::reattach`] to put it back, or
+    /// [`OwnedNode::remove`] to drop it for good.
+    pub(super) fn stash<O: Observer>(
+        tree: &mut Tree<O>,
+        node: NodeId,
+        name: &'static str,
+    ) -> OwnedNode {
+        let parent = tree.map[node].parent.expect("can't stash a root node");
+        tree.data.removing_from_parent(&tree.map, node);
+        tree.map.unlink(node);
+        tree.map[node].parent = None;
+        O::removed_child(tree, parent);
+        OwnedNode::own(node, name)
+    }
+
+    /// Puts the node back at `position`, firing the observer events an
+    /// insertion fires.
+    pub(super) fn reattach<O: Observer>(
+        &mut self,
+        tree: &mut Tree<O>,
+        position: StashPosition,
+    ) -> NodeId {
+        let id = self.0.take().expect("can't reattach a removed node");
+        let node = UnattachedNode { id, tree };
+        match position {
+            StashPosition::After(sibling) => node.insert_after(sibling),
+            StashPosition::Before(sibling) => node.insert_before(sibling),
+            StashPosition::LastChild(parent) => node.push_back(parent),
+        }
+    }
+
     pub fn id(&self) -> NodeId {
         self.0.unwrap()
     }
@@ -324,6 +356,17 @@ impl<'a, O: Observer> UnattachedNode<'a, O> {
 pub struct DetachedNode<'a, O> {
     id: NodeId,
     tree: &'a mut Tree<O>,
+}
+
+/// Where a stashed node goes when it returns to the tree.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum StashPosition {
+    /// After this sibling.
+    After(NodeId),
+    /// Before this sibling.
+    Before(NodeId),
+    /// As the last child of this parent.
+    LastChild(NodeId),
 }
 
 impl<'a, O: Observer> DetachedNode<'a, O> {

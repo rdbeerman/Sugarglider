@@ -262,7 +262,7 @@ mod tests {
             id: 1,
             shows: ContextKey::Named(comms),
         }];
-        let snapshot = ContextsSnapshot::new(&contexts, screens, 2);
+        let snapshot = ContextsSnapshot::new(&contexts, Scope::Global, screens, 2);
         (contexts, snapshot)
     }
 
@@ -571,6 +571,7 @@ mod tests {
             enabled: true,
             scope: Scope::Global,
             active: ContextKey::Named(context_id(2)),
+            focused_screen: None,
             screens: vec![
                 ScreenContext {
                     id: 1,

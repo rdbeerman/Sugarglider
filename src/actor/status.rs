@@ -335,7 +335,7 @@ mod tests {
 
     use super::*;
     use crate::actor::contexts_snapshot::ScreenContext;
-    use crate::model::contexts::Contexts;
+    use crate::model::contexts::{Contexts, Scope};
 
     /// Comms and Relax, with `active` active.
     fn snapshot(active: Option<&str>) -> ContextsSnapshot {
@@ -351,7 +351,7 @@ mod tests {
         };
         contexts.switch_to(key).unwrap();
         let screens = vec![ScreenContext { id: 1, shows: key }];
-        ContextsSnapshot::new(&contexts, screens, 1)
+        ContextsSnapshot::new(&contexts, Scope::Global, screens, 1)
     }
 
     fn title(space_number: Option<usize>, snapshot: &ContextsSnapshot) -> String {
@@ -414,7 +414,7 @@ mod tests {
             id: 1,
             shows: contexts.active(),
         }];
-        ContextsSnapshot::new(contexts, screens, unsorted)
+        ContextsSnapshot::new(contexts, Scope::Global, screens, unsorted)
     }
 
     /// Menu bar, R29. The title in each state of the contexts, without and
@@ -454,7 +454,7 @@ mod tests {
             id: 2,
             shows: ContextKey::Named(comms),
         }];
-        let snapshot = ContextsSnapshot::new(&contexts, screens, 0);
+        let snapshot = ContextsSnapshot::new(&contexts, Scope::Global, screens, 0);
 
         assert_eq!("Comms", title(None, &snapshot));
         assert_eq!("2 · Comms", title(Some(2), &snapshot));
@@ -475,7 +475,7 @@ mod tests {
             ContextKey::Everything,
         ] {
             contexts.switch_to(key).unwrap();
-            let unmanaged = ContextsSnapshot::new(&contexts, Vec::new(), 0);
+            let unmanaged = ContextsSnapshot::new(&contexts, Scope::Global, Vec::new(), 0);
 
             assert_eq!("", title(None, &unmanaged), "{key:?}");
             assert_eq!("2", title(Some(2), &unmanaged), "{key:?}");
@@ -499,7 +499,7 @@ mod tests {
             id: 1,
             shows: ContextKey::Everything,
         }];
-        let everything_shown = ContextsSnapshot::new(&contexts, screens, 0);
+        let everything_shown = ContextsSnapshot::new(&contexts, Scope::Global, screens, 0);
 
         assert_eq!("", title(None, &everything_shown));
         assert_eq!("2", title(Some(2), &everything_shown));
@@ -522,7 +522,7 @@ mod tests {
                 ScreenContext { id: 1, shows: shows[0] },
                 ScreenContext { id: 2, shows: shows[1] },
             ];
-            let mixed = ContextsSnapshot::new(&contexts, screens, 0);
+            let mixed = ContextsSnapshot::new(&contexts, Scope::Global, screens, 0);
 
             assert_eq!("Comms", title(None, &mixed), "{shows:?}");
             assert_eq!("2 · Comms", title(Some(2), &mixed), "{shows:?}");

@@ -9,6 +9,7 @@ use super::Reactor;
 use crate::actor::contexts_snapshot::{
     CommandResult, ContextsSnapshot, MAX_COMMAND_RESULTS, RequestId, ScreenContext,
 };
+use crate::model::contexts::Scope;
 
 impl Reactor {
     /// The contexts as the command line and the switcher see them, with the
@@ -29,15 +30,25 @@ impl Reactor {
         let screens = self
             .screens
             .iter()
-            .zip(1..)
-            .filter_map(|(screen, id)| {
+            .filter_map(|screen| {
                 Some(ScreenContext {
-                    id,
+                    id: screen.id.get(),
                     shows: self.shown_context(screen.space?),
                 })
             })
             .collect();
-        ContextsSnapshot::new(&self.contexts, screens, self.unsorted_windows().len())
+        let mut snapshot = ContextsSnapshot::new(
+            &self.contexts,
+            self.scope(),
+            screens,
+            self.unsorted_windows().len(),
+        );
+        if self.scope() == Scope::PerScreen {
+            let focused = self.screens.get(self.focused_screen_index());
+            snapshot.focused_screen = focused.map(|screen| screen.id.get());
+            snapshot.active = self.screen_key(self.focused_screen_index());
+        }
+        snapshot
     }
 
     /// Keeps the result of a command from the command line for the next
@@ -83,9 +94,9 @@ mod tests {
     use crate::actor::parked_journal::FailingWrites;
     use crate::actor::server::{ContextRequest, Response, answer_context_request};
     use crate::model::Direction;
-    use crate::model::contexts::{ContextId, ContextKey, WindowDesc};
+    use crate::model::contexts::{ContextId, ContextKey, Scope, WindowDesc};
     use crate::sys::app::WindowInfo;
-    use crate::sys::screen::SpaceId;
+    use crate::sys::screen::{ScreenId, SpaceId};
     use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
 
     type Published = Arc<Mutex<Vec<Arc<ContextsSnapshot>>>>;
@@ -109,6 +120,43 @@ mod tests {
 
     fn shows(key: ContextKey) -> Vec<ScreenContext> {
         vec![ScreenContext { id: 1, shows: key }]
+    }
+
+    /// Per-screen snapshots use stable display ids and report the focused
+    /// display's context as active for the menu and command line.
+    #[test]
+    fn a_per_screen_snapshot_follows_the_focused_display() {
+        let mut s = Setup::on(
+            vec![screen(), rect(1200., 0., 1200., 1000.)],
+            vec![Some(space()), Some(SpaceId::new(2))],
+        );
+        let mut per_screen = crate::config::Config::default();
+        per_screen.settings.default_disable = false;
+        per_screen.settings.experimental.contexts.enable = true;
+        per_screen.settings.experimental.contexts.scope = Scope::PerScreen;
+        s.reactor.handle_event(Event::ConfigChanged(Arc::new(per_screen)));
+        s.reactor.screens[0].id = ScreenId::new(17);
+        s.reactor.screens[1].id = ScreenId::new(42);
+        let c = s.reactor.contexts.create("C").unwrap();
+        s.reactor
+            .contexts
+            .switch_to_on(ScreenId::new(42), ContextKey::Named(c))
+            .unwrap();
+        s.reactor.active_screen_idx = Some(1);
+
+        let snapshot = s.reactor.contexts_state();
+
+        assert_eq!(Some(42), snapshot.focused_screen);
+        assert_eq!(ContextKey::Named(c), snapshot.active);
+        assert_eq!(Some(ContextKey::Named(c)), snapshot.shown());
+        assert_eq!(
+            vec![17, 42],
+            snapshot.screens.iter().map(|screen| screen.id).collect::<Vec<_>>()
+        );
+        s.reactor.active_screen_idx = Some(0);
+        let snapshot = s.reactor.contexts_state();
+        assert_eq!(ContextKey::Everything, snapshot.active);
+        assert_eq!(Some(ContextKey::Everything), snapshot.shown());
     }
 
     /// A window server snapshot that lists app 1's windows at their frames.

@@ -273,6 +273,10 @@ scroll.single_column_aspect_ratio = ""
 # Named window sets you switch between. See docs/specs/contexts.md.
 contexts.enable = false
 
+# "global": a switch changes every screen. "per_screen": only the focused
+# screen, and the members of the context come along from the other screens.
+contexts.scope = "global"
+
 # Per-app/window rules overriding how windows are managed when first observed.
 #
 # Each rule nests its conditions under `if` and carries a `float` action. All

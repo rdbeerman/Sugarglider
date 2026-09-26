@@ -62,7 +62,7 @@ use crate::sys::app::Process;
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
 use crate::sys::geometry::{CGRectDef, CGRectExt, SameAs, round_to_physical};
-use crate::sys::screen::{CoordinateConverter, SpaceId};
+use crate::sys::screen::{CoordinateConverter, ScreenId, SpaceId};
 use crate::sys::timer::Timer;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
 use crate::ui::swift_bridge;
@@ -82,6 +82,8 @@ pub enum Event {
     ///
     /// `frames` holds the visible frame of each screen, and `bounds` the full
     /// bounds of its display. The main screen is always first in both lists.
+    /// `ids` names each display, main screen first; a recording made before
+    /// M9 has none, and the screens then count from 1.
     ///
     /// See the `SpaceChanged` event for an explanation of the other parameters.
     ScreenParametersChanged {
@@ -90,6 +92,8 @@ pub enum Event {
         #[serde_as(as = "Vec<CGRectDef>")]
         #[serde(default)]
         bounds: Vec<CGRect>,
+        #[serde(default)]
+        ids: Vec<ScreenId>,
         spaces: Vec<Option<SpaceId>>,
         scale_factors: Vec<f64>,
         converter: CoordinateConverter,
@@ -417,6 +421,10 @@ pub struct Reactor {
     hidden_windows: HashSet<WindowServerId>,
     /// Windows parked in a screen corner.
     parked: HashMap<WindowId, Parked>,
+    /// Windows a per-screen switch moved off a Space, with the Space they
+    /// left, until their frame lands on the new screen. The Space they left
+    /// doesn't take them back into its layouts until then.
+    moving_away: HashMap<WindowId, SpaceId>,
     /// How many times each parked window was parked again since the last
     /// switch or Space change, to stop fighting an app that moves it back.
     repark_counts: HashMap<WindowId, u32>,
@@ -532,6 +540,9 @@ struct ResponseContext {
 
 #[derive(Copy, Clone, Debug)]
 struct Screen {
+    /// The display's id, which names the screen in the saved per-screen
+    /// contexts. It stays the same while a display is connected.
+    id: ScreenId,
     /// The part of the display that the menu bar and the Dock leave free.
     frame: CGRect,
     /// The whole display, including its menu bar and Dock.
@@ -693,6 +704,7 @@ impl Reactor {
             startup_complete: false,
             hidden_windows: HashSet::default(),
             parked: HashMap::default(),
+            moving_away: HashMap::default(),
             repark_counts: HashMap::default(),
             pending_first_seen: HashSet::default(),
             journal,
@@ -874,6 +886,7 @@ impl Reactor {
                 self.app_terminated(pid);
                 self.guarded_app_gone(pid);
                 self.apps.remove(&pid);
+                self.moving_away.retain(|wid, _| wid.pid != pid);
                 self.forget_parked_app(pid);
                 self.send_layout_event(LayoutEvent::AppClosed(pid));
             }
@@ -975,11 +988,8 @@ impl Reactor {
                 self.in_drag = false;
                 self.resizing_window = None;
                 // Clean up hidden_windows tracking for this window.
-                if let Some(wsid) = self
-                    .window_ids
-                    .iter()
-                    .find(|(_, w)| **w == wid)
-                    .map(|(wsid, _)| *wsid)
+                if let Some(wsid) =
+                    self.window_ids.iter().find(|(_, w)| **w == wid).map(|(wsid, _)| *wsid)
                 {
                     self.hidden_windows.remove(&wsid);
                 }
@@ -1008,6 +1018,7 @@ impl Reactor {
                 self.window_closed(wid);
                 self.guarded_window_gone(wid);
                 self.frame_attempts.remove(&wid);
+                self.moving_away.remove(&wid);
                 self.forget_parked_window(wid, window.and_then(|window| window.window_server_id));
                 // Only send WindowRemoved if no sibling will take its place.
                 // For tabs, the sibling window already represents this position.
@@ -1034,6 +1045,13 @@ impl Reactor {
                         self.repark_moved_windows();
                     }
                     return;
+                }
+                if let Some(left) = self.moving_away.get(&wid).copied()
+                    && self.best_space_for_window(&new_frame) != Some(left)
+                {
+                    // A window a per-screen switch moved has arrived when its
+                    // frame is no longer on the Space it left.
+                    self.moving_away.remove(&wid);
                 }
                 let window = self.windows.get_mut(&wid).unwrap();
                 if last_seen != window.last_sent_txid {
@@ -1222,6 +1240,7 @@ impl Reactor {
             Event::ScreenParametersChanged {
                 frames,
                 bounds,
+                ids,
                 spaces,
                 converter,
                 scale_factors,
@@ -1237,6 +1256,9 @@ impl Reactor {
                     .zip(scale_factors)
                     .enumerate()
                     .map(|(idx, ((frame, space), scale_factor))| Screen {
+                        // A recording made before displays had ids numbers
+                        // the screens from 1, like the snapshot does.
+                        id: ids.get(idx).copied().unwrap_or_else(|| ScreenId::new(idx as u32 + 1)),
                         frame,
                         // Recordings made before displays reported their bounds
                         // have none, so the visible frame stands in.
@@ -1634,10 +1656,15 @@ impl Reactor {
             }
             Event::ConfigChanged(config) => {
                 let contexts_were_enabled = self.contexts_enabled();
+                let scope = self.config.settings.experimental.contexts.scope;
                 self.layout.set_config(&config);
                 self.config = config;
                 if self.contexts_enabled() != contexts_were_enabled {
                     self.contexts_turned_on_or_off();
+                } else if self.contexts_enabled()
+                    && self.config.settings.experimental.contexts.scope != scope
+                {
+                    self.scope_changed(scope);
                 }
             }
             Event::ContextsRead(contexts) => self.contexts_read(*contexts),
@@ -1689,10 +1716,7 @@ impl Reactor {
         // with Cmd+W). The window server might still show them as visible, but
         // we should not include them in the layout.
         self.visible_windows.extend(
-            on_screen
-                .visible
-                .into_iter()
-                .filter(|wsid| !self.hidden_windows.contains(wsid)),
+            on_screen.visible.into_iter().filter(|wsid| !self.hidden_windows.contains(wsid)),
         );
         self.window_server_info
             .extend(on_screen.info.into_iter().map(|info| (info.id, info)));
@@ -1828,6 +1852,12 @@ impl Reactor {
             let Some(space) = self.best_space_for_window(&layout_info.frame) else {
                 continue;
             };
+            // A window a per-screen switch just moved away is not on the
+            // Space it left any more, even though its frame still says so
+            // until the write lands.
+            if self.moving_away.get(&wid) == Some(&space) {
+                continue;
+            }
             // A parked window stays in the list of a layout it belongs to, at
             // its frame from before parking, so that parking never removes
             // its node.
@@ -2319,6 +2349,7 @@ pub mod tests {
         let mut apps = Apps::new();
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
@@ -2352,6 +2383,7 @@ pub mod tests {
         let (mut reactor, mut animation_rx) =
             Reactor::new_for_test_with_animation(LayoutManager::new_for_test(), true);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
@@ -2383,6 +2415,7 @@ pub mod tests {
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let wid = WindowId::new(1, 1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -2440,6 +2473,7 @@ pub mod tests {
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let wid = WindowId::new(1, 1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -2473,6 +2507,7 @@ pub mod tests {
         let mut apps = Apps::new();
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
@@ -2513,6 +2548,7 @@ pub mod tests {
         let mut apps = Apps::new();
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
@@ -2557,6 +2593,7 @@ pub mod tests {
         let mut apps = Apps::new();
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
@@ -2608,6 +2645,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
@@ -2632,6 +2670,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
@@ -2679,6 +2718,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
@@ -2703,6 +2743,7 @@ pub mod tests {
         let visible = CGRect::new(CGPoint::new(0., 25.), CGSize::new(1000., 975.));
         let bounds = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let event = Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![visible],
             bounds: vec![bounds],
             spaces: vec![Some(SpaceId::new(1))],
@@ -2721,6 +2762,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let visible = CGRect::new(CGPoint::new(0., 25.), CGSize::new(1000., 975.));
         let event = Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![visible],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
@@ -2742,6 +2784,7 @@ pub mod tests {
         let main_bounds = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let right = CGRect::new(CGPoint::new(1000., 25.), CGSize::new(1000., 975.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![main, right],
             bounds: vec![main_bounds],
             spaces: vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
@@ -2776,6 +2819,7 @@ pub mod tests {
         );
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![screen],
             spaces: vec![Some(SpaceId::new(1))],
@@ -2854,6 +2898,7 @@ pub mod tests {
         reactor.open_contexts(store, Some("boot".into()), std::time::SystemTime::now());
         reactor.record_launch_state();
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![screen],
             spaces: vec![Some(SpaceId::new(1))],
@@ -2932,6 +2977,7 @@ pub mod tests {
             })
             .collect::<Vec<_>>();
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
             bounds: vec![],
             spaces: vec![None],
@@ -2973,6 +3019,7 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -2985,6 +3032,7 @@ pub mod tests {
         while raise_manager_rx.try_recv().is_ok() {}
 
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3003,6 +3051,7 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3023,6 +3072,7 @@ pub mod tests {
             frame: CGRect::new(CGPoint::new(0., 0.), CGSize::new(100., 100.)),
         }];
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3041,6 +3091,7 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3071,6 +3122,7 @@ pub mod tests {
             })
             .collect();
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3089,6 +3141,7 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3115,6 +3168,7 @@ pub mod tests {
             frame: window.frame_monotonic,
         }));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3133,6 +3187,7 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3177,6 +3232,7 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3222,6 +3278,7 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3274,6 +3331,7 @@ pub mod tests {
     fn filter_response_clears_matching_focus_and_raise_windows() {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.screens = vec![Screen {
+            id: ScreenId::new(1),
             frame: CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.)),
             bounds: CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.)),
             space: Some(SpaceId::new(1)),
@@ -3370,6 +3428,7 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
         let space = SpaceId::new(1);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3423,6 +3482,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
             bounds: vec![],
             spaces: vec![None],
@@ -3454,6 +3514,7 @@ pub mod tests {
         let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen1, screen2],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
@@ -3487,6 +3548,7 @@ pub mod tests {
         let space1 = SpaceId::new(1);
         let space2 = SpaceId::new(2);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen1, screen2],
             bounds: vec![],
             spaces: vec![Some(space1), Some(space2)],
@@ -3565,6 +3627,7 @@ pub mod tests {
         let space1 = SpaceId::new(1);
         let space2 = SpaceId::new(2);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen1, screen2],
             bounds: vec![],
             spaces: vec![Some(space1), Some(space2)],
@@ -3617,6 +3680,7 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3694,6 +3758,7 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3761,6 +3826,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
@@ -3804,6 +3870,7 @@ pub mod tests {
         let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen1, screen2],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
@@ -3888,6 +3955,7 @@ pub mod tests {
         let space = SpaceId::new(1);
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3916,6 +3984,7 @@ pub mod tests {
         assert_ne!(default, modified);
 
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::ZERO],
             bounds: vec![],
             spaces: vec![None],
@@ -3924,6 +3993,7 @@ pub mod tests {
             on_screen: Default::default(),
         });
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -3979,6 +4049,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
             bounds: vec![],
             spaces: vec![Some(SpaceId::new(1))],
@@ -3999,6 +4070,7 @@ pub mod tests {
         // Simulate the system resizing a window after it recognizes an old
         // configurations. Resize events are not sent in this case.
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![
                 full_screen,
                 CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.)),
@@ -4038,6 +4110,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -4072,6 +4145,7 @@ pub mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -4114,6 +4188,7 @@ pub mod tests {
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -4171,6 +4246,7 @@ pub mod tests {
         // First reactor: simulate the state before shutdown with three apps running
         let mut reactor1 = Reactor::new_for_test(LayoutManager::new_for_test());
         reactor1.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -4196,6 +4272,7 @@ pub mod tests {
         let mut apps2 = Apps::new();
         let mut reactor2 = Reactor::new_for_test(restored_layout);
         reactor2.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![full_screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -4242,6 +4319,7 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -4268,6 +4346,7 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1200., 1200.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -4400,6 +4479,7 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -4449,6 +4529,7 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -4497,6 +4578,7 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -4554,6 +4636,7 @@ pub mod tests {
         let space = SpaceId::new(1);
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -4603,6 +4686,7 @@ pub mod tests {
         let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
         let shorter = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.));
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![screen],
             bounds: vec![],
             spaces: vec![Some(space1)],
@@ -4618,6 +4702,7 @@ pub mod tests {
         ));
         apps.simulate_until_quiet(&mut reactor);
         reactor.handle_event(Event::ScreenParametersChanged {
+            ids: vec![],
             frames: vec![shorter],
             bounds: vec![],
             spaces: vec![Some(space1)],

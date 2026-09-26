@@ -188,6 +188,7 @@ mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -252,6 +253,7 @@ mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -322,6 +324,7 @@ mod tests {
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::ZERO, CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],
@@ -370,6 +373,7 @@ mod tests {
         let windows = make_windows(2);
         let space = SpaceId::new(1);
         reactor.handle_event(ScreenParametersChanged {
+            ids: vec![],
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             bounds: vec![],
             spaces: vec![Some(space)],

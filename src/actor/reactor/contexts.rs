@@ -8,19 +8,19 @@
 use std::io;
 use std::time::{Instant, SystemTime};
 
-use objc2_core_foundation::CGSize;
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use tracing::{debug, error, info, warn};
 
-use super::{ContextCommand, ContextRef, Event, Reactor};
+use super::{ContextCommand, ContextRef, Event, Reactor, fit_frame_to_screen};
 use crate::actor::app::{Request, WindowId, pid_t};
 use crate::actor::contexts_snapshot::CONTEXTS_OFF;
 use crate::actor::contexts_store::{ContextsStore, Loaded, empty_contexts_after};
 use crate::actor::layout::{ActiveContext, EventResponse, LayoutEvent};
 use crate::model::contexts::{
-    ContextError, ContextId, ContextKey, Contexts, MatchPass, SwitchInput, SwitchPlan,
-    SwitchScreen, SwitchWindow, WindowDesc, plan_switch, resolve,
+    ContextError, ContextId, ContextKey, Contexts, MatchPass, Scope, SwitchInput, SwitchMove,
+    SwitchPlan, SwitchScreen, SwitchWindow, WindowDesc, plan_switch, resolve,
 };
-use crate::sys::screen::SpaceId;
+use crate::sys::screen::{ScreenId, SpaceId};
 
 /// Why a context command does nothing while a quit waits for parked windows.
 const QUITTING: &str = "Sugarglider is quitting";
@@ -40,10 +40,14 @@ pub(super) struct ShownSpace {
 
 /// Why contexts are applied.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Apply {
-    /// The user switches to this context. If the journal can't be written,
-    /// nothing changes.
-    Switch(ContextKey),
+pub(super) enum Apply {
+    /// The user switches to this context: every screen in `global` scope, or
+    /// only `screen` in `per_screen` scope, which takes the context's
+    /// members along from the other screens (R7, R8).
+    Switch {
+        target: ContextKey,
+        screen: Option<usize>,
+    },
     /// The active context is applied again. If the journal can't be written,
     /// the Spaces still show their contexts, and nothing is parked.
     Again,
@@ -52,6 +56,11 @@ enum Apply {
 impl Reactor {
     pub(super) fn contexts_enabled(&self) -> bool {
         self.config.settings.experimental.contexts.enable
+    }
+
+    /// Whether a switch changes every screen or only the focused one (R7, R8).
+    pub(super) fn scope(&self) -> Scope {
+        self.config.settings.experimental.contexts.scope
     }
 
     /// Whether applying contexts can change anything. Without contexts and
@@ -85,9 +94,37 @@ impl Reactor {
         active
     }
 
-    /// The context the Space shows.
+    /// The context the screen at `screen` shows before the switch being
+    /// applied: the global context in `global` scope, and the screen's own in
+    /// `per_screen` scope.
+    pub(super) fn screen_key(&self, screen: usize) -> ContextKey {
+        match self.scope() {
+            Scope::Global => self.contexts.active(),
+            Scope::PerScreen => self
+                .screens
+                .get(screen)
+                .map_or(ContextKey::Everything, |shown| self.contexts.active_on(shown.id)),
+        }
+    }
+
+    /// The context the screen shows, or its own active context while it shows
+    /// no Space.
+    pub(super) fn screen_shown_key(&self, screen: usize) -> ContextKey {
+        match self.screens.get(screen).and_then(|shown| shown.space) {
+            Some(space) => self.shown_context(space),
+            None => self.screen_key(screen),
+        }
+    }
+
+    /// The context the Space shows. A Space that no visible screen shows
+    /// falls back to the global context.
     pub(super) fn shown_context(&self, space: SpaceId) -> ContextKey {
-        self.shown_with(space, self.contexts.active())
+        let key = self
+            .screens
+            .iter()
+            .position(|screen| screen.space == Some(space))
+            .map_or_else(|| self.contexts.active(), |screen| self.screen_key(screen));
+        self.shown_with(space, key)
     }
 
     /// Whether the window is one the Space shows. Under Everything
@@ -97,17 +134,14 @@ impl Reactor {
     }
 
     /// Whether the window shows when `key` is shown. A window added to a
-    /// context since the last switch counts as a member of the active
-    /// context until the next switch. A tab shows with its group's
+    /// context since the last switch counts as a member of the context its
+    /// screen shows until the next switch (R37). A tab shows with its group's
     /// main tab.
     pub(super) fn shows_under(&self, key: ContextKey, wid: WindowId) -> bool {
         let wid = self.membership_window(wid);
         match key {
             ContextKey::Everything => true,
-            key => {
-                self.contexts.is_member(key, wid)
-                    || key == self.contexts.active() && self.added_since_switch.contains(&wid)
-            }
+            key => self.contexts.is_member(key, wid) || self.added_since_switch.contains(&wid),
         }
     }
 
@@ -119,22 +153,41 @@ impl Reactor {
         !self.parked.contains_key(&wid) && self.shows_on(space, wid)
     }
 
-    /// The visible screens and the contexts they show when `active` is the
-    /// active context.
-    pub(super) fn shown_spaces(&self, active: ContextKey) -> Vec<ShownSpace> {
+    /// The visible screens and the contexts they show after `apply`. A
+    /// switch that names a screen changes only that screen in `per_screen`
+    /// scope; the others keep what they show.
+    pub(super) fn shown_spaces(&self, apply: Apply) -> Vec<ShownSpace> {
         self.screens
             .iter()
             .enumerate()
             .filter_map(|(screen, info)| {
                 let space = info.space?;
+                let key = match apply {
+                    Apply::Switch { target, screen: only }
+                        if only.is_none_or(|only| only == screen) =>
+                    {
+                        target
+                    }
+                    Apply::Switch { .. } | Apply::Again => self.screen_key(screen),
+                };
                 Some(ShownSpace {
                     screen,
                     space,
                     size: info.frame.size,
-                    key: self.shown_with(space, active),
+                    key: self.shown_with(space, key),
                 })
             })
             .collect()
+    }
+
+    /// The place of the screen a switch changes in `spaces`, which is what
+    /// the plan names. `None` when the switch changes every screen, and also
+    /// when the changed screen shows no Space.
+    fn only_position(apply: Apply, spaces: &[ShownSpace]) -> Option<usize> {
+        let Apply::Switch { screen: Some(screen), .. } = apply else {
+            return None;
+        };
+        spaces.iter().position(|shown| shown.screen == screen)
     }
 
     /// The context and its open members, as the layout needs it.
@@ -184,7 +237,7 @@ impl Reactor {
         if self.contexts_in_use() && self.lists_known_windows() {
             return self.apply(Apply::Again).ok().and_then(|(_, response)| response);
         }
-        let spaces = self.shown_spaces(self.contexts.active());
+        let spaces = self.shown_spaces(Apply::Again);
         self.expose(&spaces)
     }
 
@@ -210,12 +263,8 @@ impl Reactor {
     /// window that has the focus, the switch's focus step runs, so that
     /// keystrokes don't go to a parked window.
     fn finish_apply(&mut self, plan: SwitchPlan, response: Option<EventResponse>) {
-        let parked: Vec<WindowId> = plan
-            .park
-            .iter()
-            .copied()
-            .filter(|wid| self.parked.contains_key(wid))
-            .collect();
+        let parked: Vec<WindowId> =
+            plan.park.iter().copied().filter(|wid| self.parked.contains_key(wid)).collect();
         let main_parked = self.main_window().is_some_and(|main| parked.contains(&main));
         if !main_parked {
             if let Some(response) = response {
@@ -231,8 +280,9 @@ impl Reactor {
     /// window on no screen counts as on the first visible screen. So does a
     /// parked window on a screen that shows a Space Sugarglider doesn't
     /// manage, so that the plan puts it back when it must show. The other
-    /// windows on such a screen are left out.
-    pub(super) fn switch_input(&self, spaces: &[ShownSpace]) -> SwitchInput {
+    /// windows on such a screen are left out. `only` names the screen a
+    /// `per_screen` switch changes, as a place in `spaces`.
+    pub(super) fn switch_input(&self, spaces: &[ShownSpace], only: Option<usize>) -> SwitchInput {
         let mut input = SwitchInput {
             screens: spaces
                 .iter()
@@ -241,6 +291,7 @@ impl Reactor {
                     windows: vec![],
                 })
                 .collect(),
+            only,
         };
         if spaces.is_empty() {
             return input;
@@ -282,8 +333,9 @@ impl Reactor {
                 ..self.contexts.switch_window(decides)
             };
             if self.added_since_switch.contains(&decides) {
-                // It counts as a member of the active context.
-                match self.contexts.active() {
+                // It counts as a member of the context the screen it is on
+                // shows (R37).
+                match spaces[slot].key {
                     ContextKey::Named(id) if !window.contexts.contains(&id) => {
                         window.contexts.push(id)
                     }
@@ -304,30 +356,33 @@ impl Reactor {
 
     /// Applies contexts to the visible Spaces in the order a switch takes:
     /// the journal entries of the windows it parks, then the layouts, then
-    /// the members put back and laid out, then the parking. Parked windows
-    /// that are no longer in their corners, for example because their app
-    /// moved them, are parked again, except while quitting and with contexts
-    /// off. Returns the plan and the layout's response to the exposure,
-    /// which the caller handles.
+    /// the members put back and laid out, then the parking. A per-screen
+    /// switch moves the target's members on other screens over first. Parked
+    /// windows that are no longer in their corners, for example because their
+    /// app moved them, are parked again, except while quitting and with
+    /// contexts off. Returns the plan and the layout's response to the
+    /// exposure, which the caller handles.
     fn apply(&mut self, apply: Apply) -> io::Result<(SwitchPlan, Option<EventResponse>)> {
-        let active = match apply {
-            Apply::Switch(target) => target,
-            Apply::Again => self.contexts.active(),
-        };
-        let spaces = self.shown_spaces(active);
-        let plan = plan_switch(&self.switch_input(&spaces));
+        let spaces = self.shown_spaces(apply);
+        let only = Self::only_position(apply, &spaces);
+        let plan = plan_switch(&self.switch_input(&spaces, only));
         let parking = match self.journal_parking(&plan.park) {
             Ok(parking) => parking,
-            Err(err) if matches!(apply, Apply::Switch(_)) => return Err(err),
+            Err(err) if matches!(apply, Apply::Switch { .. }) => return Err(err),
             Err(err) => {
                 error!("Could not write the parked-window journal, so nothing is parked: {err}");
                 vec![]
             }
         };
-        if let Apply::Switch(target) = apply
-            && let Err(err) = self.contexts.switch_to(target)
-        {
-            error!(?target, "Could not switch: {err}");
+        if let Apply::Switch { target, screen } = apply {
+            let shown = screen.and_then(|screen| self.screens.get(screen)).map(|shown| shown.id);
+            let result = match shown {
+                Some(screen) => self.contexts.switch_to_on(screen, target),
+                None => self.contexts.switch_to(target),
+            };
+            if let Err(err) = result {
+                error!(?target, "Could not switch: {err}");
+            }
         }
         let response = self.expose(&spaces);
         // Windows put back still count as parked here, so that the layout
@@ -339,6 +394,7 @@ impl Reactor {
             self.send_visible_windows_to_layout(pid);
         }
         let released = self.release_parked(&plan.unpark);
+        self.move_windows(&plan.moves, &spaces);
         self.put_back_unplaced(&released);
         self.update_layout(&[], true);
         self.move_to_corners(parking);
@@ -348,20 +404,80 @@ impl Reactor {
         Ok((plan, response))
     }
 
-    /// Switches to `target` on every screen. The switch focuses the most
+    /// Moves the windows a per-screen switch takes with it to their new
+    /// screen (R8, R9). A window keeps the place it had in each layout of the
+    /// Space it leaves, so it returns there when it comes back. Until its
+    /// frame lands on the new screen, the layout it left doesn't take it
+    /// back.
+    fn move_windows(&mut self, moves: &[SwitchMove], spaces: &[ShownSpace]) {
+        for moved in moves {
+            let Some(target) = spaces.get(moved.screen) else {
+                continue;
+            };
+            let Some(from) = self
+                .layout_frame(moved.wid)
+                .and_then(|frame| self.best_space_for_window(&frame))
+            else {
+                continue;
+            };
+            if from == target.space {
+                continue;
+            }
+            self.layout.move_window_to_space(moved.wid, from, target.space);
+            self.moving_away.insert(moved.wid, from);
+            if self.layout.is_floating_window(moved.wid) {
+                self.place_floating_on_screen(moved.wid, target.screen);
+            }
+        }
+    }
+
+    /// Puts a floating window in the middle of the screen it moved to.
+    fn place_floating_on_screen(&mut self, wid: WindowId, screen: usize) {
+        let Some(screen) = self.screens.get(screen) else { return };
+        let Some(window) = self.windows.get(&wid) else { return };
+        let size = window.frame_monotonic.size;
+        let frame = CGRect::new(
+            CGPoint::new(
+                screen.frame.origin.x + (screen.frame.size.width - size.width) / 2.0,
+                screen.frame.origin.y + (screen.frame.size.height - size.height) / 2.0,
+            ),
+            size,
+        );
+        let frame = fit_frame_to_screen(frame, CGSize::new(0.0, 0.0), screen.frame);
+        self.pending_frame_overrides.insert(wid, frame);
+    }
+
+    /// Switches to `target`: on every screen in `global` scope, and on the
+    /// focused screen in `per_screen` scope. The switch focuses the most
     /// recently focused window that shows. If the journal can't be written,
     /// the old context stays.
     pub(super) fn switch_context(&mut self, target: ContextKey) -> Result<(), String> {
-        self.switch_context_focusing(target, None)
+        self.switch_context_on(self.switch_screen(), target, None)
     }
 
-    /// Switches to `target` on every screen, and focuses `focused`, the
-    /// window whose focus started the switch, or else the most
-    /// recently focused window that shows. When no window can take focus,
-    /// Finder is activated. Focus from outside counts again
-    /// when the switch ends. Returns why nothing changed.
-    pub(super) fn switch_context_focusing(
+    /// The screen a per-screen switch changes: the focused one (R8).
+    fn switch_screen(&self) -> Option<usize> {
+        match self.scope() {
+            Scope::Global => None,
+            Scope::PerScreen => Some(self.focused_screen_index()),
+        }
+    }
+
+    /// The screen the focused window is on, or the first screen when that is
+    /// unknown.
+    pub(super) fn focused_screen_index(&self) -> usize {
+        self.active_screen_idx
+            .map_or(0, usize::from)
+            .min(self.screens.len().saturating_sub(1))
+    }
+
+    /// Switches to `target` on `screen` in per-screen scope, or on every
+    /// screen in global scope. `focused` is the window whose focus started
+    /// the switch; otherwise the most recent member takes focus. Finder is
+    /// activated when no window can take focus.
+    pub(super) fn switch_context_on(
         &mut self,
+        screen: Option<usize>,
         target: ContextKey,
         focused: Option<WindowId>,
     ) -> Result<(), String> {
@@ -389,7 +505,7 @@ impl Reactor {
         let added = std::mem::take(&mut self.added_since_switch);
         let contexts = self.contexts.clone();
         self.rejoin_for_switch(target);
-        match self.apply(Apply::Switch(target)) {
+        match self.apply(Apply::Switch { target, screen }) {
             Ok((plan, response)) => {
                 self.save_contexts();
                 let parked: Vec<WindowId> =
@@ -405,8 +521,10 @@ impl Reactor {
                 }
                 info!(
                     ?target,
+                    ?screen,
                     parked = plan.park.len(),
                     put_back = plan.unpark.len(),
+                    moved = plan.moves.len(),
                     elapsed = ?start.elapsed(),
                     "Switched context"
                 );
@@ -490,7 +608,16 @@ impl Reactor {
             }
             ContextCommand::ShowEverything => self.switch_context(ContextKey::Everything),
             ContextCommand::PreviousContext => {
-                let key = self.contexts.previous().ok_or("There is no previous context")?;
+                let key = match self.scope() {
+                    Scope::Global => self.contexts.previous(),
+                    Scope::PerScreen => {
+                        let screen = self.focused_screen_index();
+                        self.screens
+                            .get(screen)
+                            .and_then(|shown| self.contexts.previous_on(shown.id))
+                    }
+                };
+                let key = key.ok_or("There is no previous context")?;
                 self.switch_context(key)
             }
             ContextCommand::AddWindowToContext(reference) => {
@@ -577,6 +704,38 @@ impl Reactor {
         }
     }
 
+    /// Applies a change of scope (R11). Going from `global` to `per_screen`
+    /// gives every screen the global context. Going the other way makes the
+    /// focused screen's context the global one, and the other screens follow
+    /// it.
+    pub(super) fn scope_changed(&mut self, from: Scope) {
+        match (from, self.scope()) {
+            (Scope::Global, Scope::PerScreen) => {
+                let key = self.contexts.active();
+                let screens: Vec<ScreenId> = self.screens.iter().map(|screen| screen.id).collect();
+                info!(?key, screens = screens.len(), "Changing to per-screen scope");
+                self.contexts.set_screen_actives(screens, key);
+            }
+            (Scope::PerScreen, Scope::Global) => {
+                let screen = self.focused_screen_index();
+                let key = self
+                    .screens
+                    .get(screen)
+                    .map_or(self.contexts.active(), |shown| self.contexts.active_on(shown.id));
+                info!(?key, "Changing to global scope");
+                self.contexts.forget_screen_actives();
+                if let Err(err) = self.contexts.switch_to(key) {
+                    error!(?key, "Could not make the focused screen's context global: {err}");
+                }
+            }
+            _ => return,
+        }
+        if self.contexts_in_use() {
+            self.apply_again_focusing_parked_main();
+        }
+        self.save_contexts();
+    }
+
     /// Deletes a context. Its windows stay open, and the ones that were only
     /// in it become unsorted. When it was active, Unsorted shows first, and
     /// then the context's layouts go.
@@ -585,7 +744,13 @@ impl Reactor {
         expect(dead_code, reason = "no command deletes a context yet")
     )]
     pub(super) fn delete_context(&mut self, id: ContextId) -> Result<(), ContextError> {
-        let was_active = self.contexts.active() == ContextKey::Named(id);
+        let was_active = match self.scope() {
+            Scope::Global => self.contexts.active() == ContextKey::Named(id),
+            Scope::PerScreen => self
+                .screens
+                .iter()
+                .any(|screen| self.contexts.active_on(screen.id) == ContextKey::Named(id)),
+        };
         self.contexts.delete(id)?;
         if was_active {
             self.apply_again();
@@ -777,10 +942,10 @@ mod tests {
     use crate::actor::raise;
     use crate::config::Config;
     use crate::model::Direction;
-    use crate::model::contexts::{ContextId, ContextKey, RecordLink, WindowDesc};
+    use crate::model::contexts::{ContextId, ContextKey, RecordLink, Scope, WindowDesc};
     use crate::sys::app::WindowInfo;
     use crate::sys::event::MouseState;
-    use crate::sys::screen::{CoordinateConverter, SpaceId};
+    use crate::sys::screen::{CoordinateConverter, ScreenId, SpaceId};
     use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
 
     mod focus;
@@ -788,6 +953,7 @@ mod tests {
     mod membership;
     mod membership_rules;
     mod replay_rules;
+    mod scope;
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
@@ -825,7 +991,9 @@ mod tests {
     }
 
     fn screens(frames: Vec<CGRect>, spaces: Vec<Option<SpaceId>>) -> Event {
+        let ids = (1..=frames.len() as u32).map(ScreenId::new).collect();
         Event::ScreenParametersChanged {
+            ids,
             bounds: frames.clone(),
             scale_factors: vec![1.0; frames.len()],
             frames,
@@ -958,6 +1126,36 @@ mod tests {
             ParkedJournal::open(self.dir.path().join("parked.json"), SystemTime::now())
                 .entries()
                 .to_vec()
+        }
+
+        /// Config with contexts on, in `scope`.
+        fn scope(&mut self, scope: Scope) {
+            let mut config = Config::default();
+            config.settings.default_disable = false;
+            config.settings.animate = false;
+            config.settings.experimental.contexts.enable = true;
+            config.settings.experimental.contexts.scope = scope;
+            self.reactor.handle_event(Event::ConfigChanged(Arc::new(config)));
+            self.apps.simulate_until_quiet(&mut self.reactor);
+        }
+
+        /// The context the screen with display id `screen` shows.
+        fn active_on(&self, screen: u32) -> ContextKey {
+            self.reactor.contexts.active_on(ScreenId::new(screen))
+        }
+
+        /// The context the screen with display id `screen` shows, as saved.
+        fn saved_active_on(&self, screen: u32) -> ContextKey {
+            match ContextsStore::new(self.dir.path().join("contexts.json")).load(SystemTime::now())
+            {
+                Loaded::Read { contexts, .. } => contexts.active_on(ScreenId::new(screen)),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// Makes `screen` the focused one, as a main window there does.
+        fn focus_screen(&mut self, screen: usize) {
+            self.reactor.active_screen_idx = Some(screen as u16);
         }
 
         fn saved_active(&self) -> ContextKey {
@@ -2294,6 +2492,7 @@ mod tests {
             Event::ScreenParametersChanged {
                 frames,
                 bounds,
+                ids,
                 spaces,
                 scale_factors,
                 converter,
@@ -2301,6 +2500,7 @@ mod tests {
             } => Event::ScreenParametersChanged {
                 frames,
                 bounds,
+                ids,
                 spaces,
                 scale_factors,
                 converter,
@@ -2816,6 +3016,7 @@ mod tests {
         wids: &[WindowId],
     ) -> Event {
         Event::ScreenParametersChanged {
+            ids: (1..=frames.len() as u32).map(ScreenId::new).collect(),
             bounds: frames.clone(),
             scale_factors: vec![1.0; frames.len()],
             frames,
@@ -4044,6 +4245,7 @@ mod tests {
         let space2 = SpaceId::new(2);
         let displays =
             |frames: Vec<CGRect>, spaces: Vec<Option<SpaceId>>| Event::ScreenParametersChanged {
+                ids: vec![],
                 scale_factors: vec![2.0; frames.len()],
                 frames,
                 bounds: vec![],
@@ -5124,7 +5326,10 @@ mod tests {
         s.reactor
             .handle_event(Event::WindowsOnScreenUpdated { pid: None, on_screen: listed });
         s.reactor.contexts.add_window(id_of(c), &s.desc(quitting)).unwrap();
-        assert!(!s.reactor.contexts.is_member(c, panel), "the panel is in no context");
+        assert!(
+            !s.reactor.contexts.is_member(c, panel),
+            "the panel is in no context"
+        );
         assert!(!s.reactor.lists_unsorted(), "only the panel is in no context");
 
         s.reactor.contexts.remove_window(id_of(c), quitting).unwrap();

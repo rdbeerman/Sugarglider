@@ -205,7 +205,8 @@ impl EventResponse {
         self.frame_overrides.extend(other.frame_overrides);
         self.raise_windows.extend(other.raise_windows);
         self.size_share_feedback = self.size_share_feedback.or(other.size_share_feedback);
-        self.focused_window_floating = other.focused_window_floating.or(self.focused_window_floating);
+        self.focused_window_floating =
+            other.focused_window_floating.or(self.focused_window_floating);
         match (self.focus_window, other.focus_window) {
             (Some(focus_window), Some(other_focus)) => {
                 self.focus_window = Some(focus_window);
@@ -1399,8 +1400,7 @@ impl LayoutManager {
                     _ => None, // 0 or 2+ siblings: don't auto-pull
                 };
                 // Create a container around the selected node
-                self.tree
-                    .nest_in_container(layout, selection, ContainerKind::from(orientation));
+                self.tree.nest_in_container(layout, selection, ContainerKind::from(orientation));
                 // Move the only sibling into the new container (after the selected node)
                 if let Some(sibling) = only_sibling {
                     self.tree.move_node_after(selection, sibling);
@@ -1756,8 +1756,15 @@ impl LayoutManager {
             self.tree.remove_window_from(self.layout(space), wid);
             return;
         }
-        let layouts: Vec<LayoutId> = self
-            .layout_mapping
+        for layout in self.space_layouts(space) {
+            self.tree.remove_window_from(layout, wid);
+        }
+    }
+
+    /// Every layout of the Space: the layout it shows and the layout of every
+    /// context, for every screen size.
+    fn space_layouts(&self, space: SpaceId) -> Vec<LayoutId> {
+        self.layout_mapping
             .get(&space)
             .into_iter()
             .chain(
@@ -1767,9 +1774,35 @@ impl LayoutManager {
                     .map(|(_, mapping)| mapping),
             )
             .flat_map(|mapping| mapping.layouts())
-            .collect();
-        for layout in layouts {
-            self.tree.remove_window_from(layout, wid);
+            .collect()
+    }
+
+    /// Whether the window floats, which keeps it out of the tile layouts.
+    pub fn is_floating_window(&self, wid: WindowId) -> bool {
+        self.floating_windows.contains(&wid)
+    }
+
+    /// Moves the window from the Space `from` to the Space `to`, which a
+    /// `per_screen` switch gives the screen it changed (R8, R9). The window
+    /// keeps its place in every layout of the Space it leaves, so it returns
+    /// there, while those layouts close the gap. A floating window moves its
+    /// floating bookkeeping instead; the reactor places it.
+    pub fn move_window_to_space(&mut self, wid: WindowId, from: SpaceId, to: SpaceId) {
+        if from == to {
+            return;
+        }
+        if self.floating_windows.contains(&wid) {
+            self.active_floating_windows.remove(from, wid);
+            self.add_floating_window(wid, Some(to));
+            return;
+        }
+        for layout in self.space_layouts(from) {
+            self.tree.stash_window(layout, wid);
+        }
+        let layout = self.layout(to);
+        if self.tree.window_node(layout, wid).is_none() {
+            let selection = self.tree.selection(layout);
+            self.tree.add_window_after(layout, selection, wid);
         }
     }
 }
@@ -5434,6 +5467,37 @@ mod tests {
             vec![(w(3), rect(0, 0, 120, 120))],
             restored.layout_sorted(space, screen)
         );
+    }
+
+    /// R9. A window away on another display has no gap in its old layout,
+    /// and a layout save while it is away keeps its tile for the return.
+    #[test]
+    fn a_moved_window_keeps_its_tile_through_a_layout_save() {
+        let mut mgr = LayoutManager::new_for_test();
+        let left = SpaceId::new(1);
+        let right = SpaceId::new(2);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+        let [c, d] = named_contexts(["C", "D"]);
+
+        switch(&mut mgr, right, screen.size, ContextKey::Everything, &all);
+        switch(&mut mgr, right, screen.size, c, &all);
+        switch(&mut mgr, left, screen.size, d, &[]);
+        let before = mgr.layout_sorted(right, screen);
+
+        mgr.move_window_to_space(w(2), right, left);
+        switch(&mut mgr, right, screen.size, c, &[w(1), w(3)]);
+        switch(&mut mgr, left, screen.size, d, &[w(2)]);
+        assert_eq!(2, mgr.layout_sorted(right, screen).len());
+
+        let mut restored: LayoutManager = ron::from_str(&mgr.serialize_to_string()).unwrap();
+        switch(&mut restored, right, screen.size, c, &[w(1), w(3)]);
+        switch(&mut restored, left, screen.size, d, &[w(2)]);
+        restored.move_window_to_space(w(2), left, right);
+        switch(&mut restored, right, screen.size, c, &all);
+
+        assert_eq!(before, restored.layout_sorted(right, screen));
     }
 
     /// How `layout.ron` stores the layouts of a named context and of
