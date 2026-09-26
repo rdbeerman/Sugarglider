@@ -1973,4 +1973,408 @@ mod tests {
         assert_eq!(vec![wid(3)], s.parked());
         assert_eq!(corner(CGSize::new(400., 1000.)), s.frame(wid(3)));
     }
+
+    fn id_of(key: ContextKey) -> ContextId {
+        let ContextKey::Named(id) = key else { panic!("{key:?}") };
+        id
+    }
+
+    /// Reports the windows as the window server lists them, and asks every
+    /// app for its visible windows, as the periodic refresh does.
+    fn report_visible(s: &mut Setup, wids: &[WindowId]) {
+        let snapshot = on_screen(s, wids);
+        s.reactor
+            .handle_event(Event::WindowsOnScreenUpdated { pid: None, on_screen: snapshot });
+        s.reactor.update_visible_windows();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+    }
+
+    /// Sends `previous_context`, as a key binding does.
+    fn previous(s: &mut Setup) {
+        s.reactor
+            .handle_event(Event::Command(Command::Context(ContextCommand::PreviousContext)));
+    }
+
+    /// The frame writes in `requests`, in order.
+    fn all_frame_writes(requests: Vec<Request>) -> Vec<(WindowId, CGRect)> {
+        requests
+            .into_iter()
+            .filter_map(|request| match request {
+                Request::SetWindowFrame(wid, frame, _) => Some((wid, frame)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// R12, R13, R14, R27, H3, L6, L8. The sequence A, B, A, Everything, B
+    /// with a floating window, tiled windows, a window in two contexts, a
+    /// window in none, and a member that the user minimizes.
+    #[test]
+    fn m5a_a_b_a_everything_b_with_floating_tiled_shared_and_minimized_windows() {
+        let mut s = Setup::new(5);
+        float_window_1(&mut s);
+        let floating = rect(100., 100., 50., 50.);
+        assert_eq!(
+            vec![
+                (wid(2), rect(0., 0., 300., 1000.)),
+                (wid(3), rect(300., 0., 300., 1000.)),
+                (wid(4), rect(600., 0., 300., 1000.)),
+                (wid(5), rect(900., 0., 300., 1000.)),
+            ],
+            s.tiles()
+        );
+        // Window 2 is in both contexts, and window 5 is in none.
+        let a = s.create("A", &[wid(1), wid(2), wid(4)]);
+        let b = s.create("B", &[wid(2), wid(3)]);
+
+        s.switch(a);
+        let in_a = vec![
+            (wid(2), rect(0., 0., 600., 1000.)),
+            (wid(4), rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(in_a, s.tiles());
+        assert_eq!(in_a, s.frames(&[wid(2), wid(4)]));
+        assert_eq!(floating, s.frame(wid(1)));
+        assert_eq!(vec![wid(3), wid(5)], s.parked());
+        assert_eq!(corner(CGSize::new(300., 1000.)), s.frame(wid(3)));
+        assert_eq!(corner(CGSize::new(300., 1000.)), s.frame(wid(5)));
+        assert_eq!(
+            vec![
+                entry(3, rect(300., 0., 300., 1000.)),
+                entry(5, rect(900., 0., 300., 1000.)),
+            ],
+            s.journal_on_disk()
+        );
+
+        // The user minimizes window 4.
+        report_visible(&mut s, &[wid(1), wid(2), wid(3), wid(5)]);
+        let minimized = rect(600., 0., 600., 1000.);
+        assert_eq!(vec![(wid(2), screen())], s.tiles());
+        assert_eq!(screen(), s.frame(wid(2)));
+        assert_eq!(minimized, s.frame(wid(4)));
+
+        s.switch(b);
+        let in_b = vec![
+            (wid(2), rect(0., 0., 600., 1000.)),
+            (wid(3), rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(in_b, s.tiles());
+        assert_eq!(in_b, s.frames(&[wid(2), wid(3)]));
+        assert_eq!(vec![wid(1), wid(5)], s.parked());
+        assert_eq!(corner(floating.size), s.frame(wid(1)));
+        assert_eq!(minimized, s.frame(wid(4)), "a minimized window is never parked");
+        assert_eq!(
+            vec![entry(5, rect(900., 0., 300., 1000.)), entry(1, floating)],
+            s.journal_on_disk()
+        );
+
+        s.switch(a);
+        assert_eq!(vec![(wid(2), screen())], s.tiles());
+        assert_eq!(screen(), s.frame(wid(2)));
+        assert_eq!(floating, s.frame(wid(1)));
+        assert_eq!(vec![wid(3), wid(5)], s.parked());
+        assert_eq!(corner(CGSize::new(600., 1000.)), s.frame(wid(3)));
+        assert_eq!(minimized, s.frame(wid(4)));
+        assert!(s.reactor.contexts.is_member(a, wid(4)));
+        assert_eq!(
+            vec![
+                entry(5, rect(900., 0., 300., 1000.)),
+                entry(3, rect(600., 0., 600., 1000.)),
+            ],
+            s.journal_on_disk()
+        );
+
+        s.switch(ContextKey::Everything);
+        let everything = vec![
+            (wid(2), rect(0., 0., 400., 1000.)),
+            (wid(3), rect(400., 0., 400., 1000.)),
+            (wid(5), rect(800., 0., 400., 1000.)),
+        ];
+        assert_eq!(everything, s.tiles());
+        assert_eq!(everything, s.frames(&[wid(2), wid(3), wid(5)]));
+        assert_eq!(floating, s.frame(wid(1)));
+        assert_eq!(minimized, s.frame(wid(4)));
+        assert!(s.parked().is_empty());
+        assert!(s.journal_on_disk().is_empty());
+
+        s.switch(b);
+        assert_eq!(in_b, s.tiles());
+        assert_eq!(in_b, s.frames(&[wid(2), wid(3)]));
+        assert_eq!(vec![wid(1), wid(5)], s.parked());
+        assert_eq!(corner(floating.size), s.frame(wid(1)));
+        assert_eq!(corner(CGSize::new(400., 1000.)), s.frame(wid(5)));
+        assert_eq!(minimized, s.frame(wid(4)));
+        assert_eq!(
+            vec![entry(1, floating), entry(5, rect(800., 0., 400., 1000.))],
+            s.journal_on_disk()
+        );
+        assert_eq!(b, s.saved_active());
+    }
+
+    /// R6, L3. Unsorted's first layout is a copy of the layout that shows
+    /// when the active context is deleted, so the windows stay in the order
+    /// they had. That layout must still exist when Unsorted shows, so the
+    /// deleted context's layouts go only after Unsorted shows.
+    #[test]
+    fn r6_deleting_the_active_context_keeps_the_arrangement_it_showed() {
+        let mut s = Setup::new(3);
+        let c = s.create("C", &[wid(1), wid(2), wid(3)]);
+        s.create("D", &[wid(3)]);
+        s.switch(c);
+        s.move_window(wid(1), Direction::Right);
+        let in_c = vec![
+            (wid(1), rect(400., 0., 400., 1000.)),
+            (wid(2), rect(0., 0., 400., 1000.)),
+            (wid(3), rect(800., 0., 400., 1000.)),
+        ];
+        assert_eq!(in_c, s.tiles());
+        assert_eq!(in_c, s.frames(&[wid(1), wid(2), wid(3)]));
+
+        let errors = count_errors(|| s.reactor.delete_context(id_of(c)).unwrap());
+        s.apps.simulate_until_quiet(&mut s.reactor);
+
+        assert_eq!(0, errors);
+        assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+        // Window 3 is in D, so it is parked. Window 2 stays left of window 1,
+        // as in C.
+        let unsorted = vec![
+            (wid(1), rect(600., 0., 600., 1000.)),
+            (wid(2), rect(0., 0., 600., 1000.)),
+        ];
+        assert_eq!(unsorted, s.tiles());
+        assert_eq!(unsorted, s.frames(&[wid(1), wid(2)]));
+        assert_eq!(vec![wid(3)], s.parked());
+        assert_eq!(vec![entry(3, rect(800., 0., 400., 1000.))], s.journal_on_disk());
+        assert!(s.reactor.layout.context_ids().all(|id| id != id_of(c)));
+    }
+
+    /// R12, R30. A switch from one context to another whose journal write
+    /// fails leaves the first context exactly as it was.
+    #[test]
+    fn r12_r30_a_failed_journal_write_from_c_to_d_keeps_c_as_it_was() {
+        let mut s = Setup::new(3);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        let d = s.create("D", &[wid(2), wid(3)]);
+        s.switch(c);
+        let in_c = vec![
+            (wid(1), rect(0., 0., 600., 1000.)),
+            (wid(2), rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(in_c, s.tiles());
+        let all = [wid(1), wid(2), wid(3)];
+        let frames = s.frames(&all);
+        let journal = s.journal_on_disk();
+        assert_eq!(vec![entry(3, rect(800., 0., 400., 1000.))], journal);
+        let saved = fs::read(s.dir.path().join("contexts.json")).unwrap();
+        let txids = all.map(|wid| s.reactor.windows[&wid].last_sent_txid);
+        let used = s.reactor.contexts.last_used(d);
+
+        let failing = FailingWrites::start(s.dir.path());
+        s.command(d);
+        drop(failing);
+
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(c, s.reactor.contexts.active());
+        assert_eq!(Some(ContextKey::Everything), s.reactor.contexts.previous());
+        assert_eq!(used, s.reactor.contexts.last_used(d));
+        assert_eq!(vec![wid(3)], s.parked());
+        assert_eq!(in_c, s.tiles());
+        assert_eq!(frames, s.frames(&all));
+        assert_eq!(txids, all.map(|wid| s.reactor.windows[&wid].last_sent_txid));
+        assert!(s.reactor.layout.context_ids().all(|id| ContextKey::Named(id) == c));
+        assert_eq!(journal, s.journal_on_disk());
+        assert_eq!(saved, fs::read(s.dir.path().join("contexts.json")).unwrap());
+
+        s.switch(d);
+        assert_eq!(d, s.reactor.contexts.active());
+        assert_eq!(Some(c), s.reactor.contexts.previous());
+        let in_d = vec![
+            (wid(2), rect(0., 0., 600., 1000.)),
+            (wid(3), rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(in_d, s.tiles());
+        assert_eq!(in_d, s.frames(&[wid(2), wid(3)]));
+        assert_eq!(vec![wid(1)], s.parked());
+        assert_eq!(vec![entry(1, rect(0., 0., 600., 1000.))], s.journal_on_disk());
+    }
+
+    /// R12, steps 3 and 4. The frames that put the target's members back go
+    /// out before the frames that park the other windows.
+    #[test]
+    fn r12_a_switch_puts_members_back_before_it_parks_the_others() {
+        let mut s = Setup::new(4);
+        let c = s.create("C", &[wid(1), wid(2)]);
+        let d = s.create("D", &[wid(3), wid(4)]);
+        s.switch(c);
+        assert_eq!(vec![wid(3), wid(4)], s.parked());
+
+        s.command(d);
+
+        assert_eq!(
+            vec![
+                (wid(3), rect(0., 0., 600., 1000.)),
+                (wid(4), rect(600., 0., 600., 1000.)),
+                (wid(1), corner(CGSize::new(600., 1000.))),
+                (wid(2), corner(CGSize::new(600., 1000.))),
+            ],
+            all_frame_writes(s.apps.requests())
+        );
+    }
+
+    /// `switch_context` by number, by name with the switcher's ranking, and
+    /// by id. Equal matches go to the most recently used context (R19). The
+    /// reserved names name the built-in entries. A reference that names no
+    /// context changes nothing.
+    #[test]
+    fn switch_context_resolves_numbers_ranked_names_reserved_names_and_ids() {
+        let mut s = Setup::new(3);
+        let comms = s.create("Comms", &[wid(1)]);
+        let community = s.create("Community", &[wid(2)]);
+        let client = s.create("Client work", &[wid(3)]);
+        let send = |s: &mut Setup, reference: ContextRef| {
+            s.reactor.handle_event(Event::Command(Command::Context(
+                ContextCommand::SwitchContext(reference),
+            )));
+        };
+        let run = |s: &mut Setup, reference: ContextRef| {
+            send(s, reference);
+            s.apps.simulate_until_quiet(&mut s.reactor);
+            s.reactor.contexts.active()
+        };
+        let name = |text: &str| ContextRef::Name(text.into());
+
+        assert_eq!(community, run(&mut s, ContextRef::Number(2)));
+        assert_eq!(comms, run(&mut s, ContextRef::Number(1)));
+        assert_eq!(comms, run(&mut s, name("comm")));
+        assert_eq!(community, run(&mut s, name("community")));
+        assert_eq!(community, run(&mut s, name("comm")));
+        assert_eq!(client, run(&mut s, name("clïent")));
+        assert_eq!(client, run(&mut s, name("CW")));
+        assert_eq!(comms, run(&mut s, ContextRef::Id(id_of(comms))));
+        assert_eq!(vec![wid(2), wid(3)], s.parked());
+
+        let unknown_id: ContextId = serde_json::from_value(serde_json::json!(99)).unwrap();
+        for reference in [
+            ContextRef::Number(0),
+            ContextRef::Number(4),
+            ContextRef::Number(10),
+            ContextRef::Id(unknown_id),
+            name(""),
+            name("   "),
+            name("-"),
+            name("xyz"),
+        ] {
+            send(&mut s, reference.clone());
+            assert!(s.apps.requests().is_empty(), "{reference:?}");
+            assert_eq!(comms, s.reactor.contexts.active(), "{reference:?}");
+        }
+
+        assert_eq!(ContextKey::Everything, run(&mut s, name("EVERYTHING")));
+        assert!(s.parked().is_empty());
+        assert_eq!(ContextKey::Unsorted, run(&mut s, name(" unsorted ")));
+        assert_eq!(vec![wid(1), wid(2), wid(3)], s.parked());
+    }
+
+    /// R18, R6. Deleting the active context keeps the context used before it
+    /// as the previous context.
+    #[test]
+    fn r18_after_deleting_the_active_context_previous_goes_to_the_one_before() {
+        let mut s = Setup::new(3);
+        let a = s.create("A", &[wid(1)]);
+        let b = s.create("B", &[wid(2)]);
+        let c = s.create("C", &[wid(3)]);
+        s.switch(a);
+        s.switch(b);
+        s.switch(c);
+
+        s.reactor.delete_context(id_of(c)).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+        assert_eq!(Some(b), s.reactor.contexts.previous());
+        // Window 3 was only in C, so it is unsorted now.
+        assert_eq!(vec![(wid(3), screen())], s.tiles());
+        assert_eq!(vec![wid(1), wid(2)], s.parked());
+
+        previous(&mut s);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(b, s.reactor.contexts.active());
+        assert_eq!(Some(ContextKey::Unsorted), s.reactor.contexts.previous());
+        assert_eq!(vec![(wid(2), screen())], s.tiles());
+        assert_eq!(screen(), s.frame(wid(2)));
+        assert_eq!(vec![wid(1), wid(3)], s.parked());
+
+        previous(&mut s);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+        assert_eq!(Some(b), s.reactor.contexts.previous());
+        assert_eq!(vec![(wid(3), screen())], s.tiles());
+        assert_eq!(screen(), s.frame(wid(3)));
+        assert_eq!(vec![wid(1), wid(2)], s.parked());
+    }
+
+    /// R18. Deleting the previous context leaves no previous context, and
+    /// `previous_context` then changes nothing.
+    #[test]
+    fn r18_deleting_the_previous_context_leaves_no_previous_context() {
+        let mut s = Setup::new(2);
+        let a = s.create("A", &[wid(1)]);
+        let b = s.create("B", &[wid(2)]);
+        s.switch(a);
+        s.switch(b);
+        assert_eq!(Some(a), s.reactor.contexts.previous());
+
+        s.reactor.delete_context(id_of(a)).unwrap();
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(None, s.reactor.contexts.previous());
+        previous(&mut s);
+
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(b, s.reactor.contexts.active());
+        assert_eq!(vec![wid(1)], s.parked());
+        assert_eq!(vec![(wid(2), screen())], s.tiles());
+        assert_eq!(b, s.saved_active());
+    }
+
+    /// R18, R6. When deleting the active context makes Unsorted active, a
+    /// previous Unsorted is dropped, and a previous Everything stays.
+    #[test]
+    fn r18_deleting_the_active_context_drops_a_previous_unsorted_and_keeps_everything() {
+        let mut s = Setup::new(3);
+        let everything = s.frames(&[wid(1), wid(2), wid(3)]);
+        let a = s.create("A", &[wid(1)]);
+        let b = s.create("B", &[wid(2)]);
+        s.switch(ContextKey::Unsorted);
+        assert_eq!(vec![(wid(3), screen())], s.tiles());
+        s.switch(a);
+        assert_eq!(Some(ContextKey::Unsorted), s.reactor.contexts.previous());
+
+        s.reactor.delete_context(id_of(a)).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+        assert_eq!(None, s.reactor.contexts.previous());
+        // Window 1 joins Unsorted's layout, whose columns follow the order of
+        // the windows' first frames.
+        let unsorted = vec![
+            (wid(1), rect(0., 0., 600., 1000.)),
+            (wid(3), rect(600., 0., 600., 1000.)),
+        ];
+        assert_eq!(unsorted, s.tiles());
+        assert_eq!(unsorted, s.frames(&[wid(1), wid(3)]));
+        previous(&mut s);
+        assert!(s.apps.requests().is_empty());
+        assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+
+        s.switch(ContextKey::Everything);
+        s.switch(b);
+        s.reactor.delete_context(id_of(b)).unwrap();
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(ContextKey::Unsorted, s.reactor.contexts.active());
+        assert_eq!(Some(ContextKey::Everything), s.reactor.contexts.previous());
+        previous(&mut s);
+        s.apps.simulate_until_quiet(&mut s.reactor);
+        assert_eq!(ContextKey::Everything, s.reactor.contexts.active());
+        assert_eq!(everything, s.frames(&[wid(1), wid(2), wid(3)]));
+        assert!(s.parked().is_empty());
+        assert!(s.journal_on_disk().is_empty());
+    }
 }
