@@ -5700,6 +5700,34 @@ mod tests {
         );
     }
 
+    /// L9. With no context active, unfloating a window that got a tile while
+    /// it floated reuses that tile instead of adding a second one.
+    #[test]
+    fn unfloating_under_everything_reuses_a_tile_the_window_got_while_floating() {
+        use LayoutCommand::*;
+        use LayoutEvent::*;
+        let mut mgr = LayoutManager::new_for_test();
+        let space = SpaceId::new(1);
+        let screen = rect(0, 0, 120, 120);
+        let w = |idx| WindowId::new(1, idx);
+        let all = [w(1), w(2), w(3)];
+
+        switch(&mut mgr, space, screen.size, ContextKey::Everything, &all);
+        _ = mgr.handle_event(WindowFocused(vec![space], w(2)));
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        _ = mgr.handle_event(WindowAdded(space, w(2), win_info()));
+        _ = mgr.handle_command(Some(space), &[space], ToggleWindowFloating);
+        assert!(mgr.floating_windows_in_space(space).is_empty());
+        assert_eq!(
+            vec![
+                (w(1), rect(0, 0, 40, 120)),
+                (w(2), rect(80, 0, 40, 120)),
+                (w(3), rect(40, 0, 40, 120)),
+            ],
+            mgr.layout_sorted(space, screen),
+        );
+    }
+
     /// L7. A window has one floating frame, whichever context it floats in.
     #[test]
     fn a_shared_window_floats_at_the_same_frame_in_every_context() {
