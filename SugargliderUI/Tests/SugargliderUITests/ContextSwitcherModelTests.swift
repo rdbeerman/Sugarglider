@@ -300,6 +300,35 @@ final class ContextSwitcherModelTests: XCTestCase {
     XCTAssertEqual(backend.sent, [.switchTo(.everything)])
   }
 
+  /// A click on a row acts only in the list, not under the delete
+  /// confirmation or in the rename view.
+  func testClickingARowOutsideTheListDoesNothing() throws {
+    let model = try makeModel()
+    model.handle(.commandDelete)
+    model.click(row: 3)
+    XCTAssertEqual(model.mode, .confirmDelete(Fixtures.clientWork))
+    XCTAssertEqual(model.highlight, 1)
+
+    model.handle(.escape)
+    model.handle(.commandR)
+    model.click(row: 3)
+    XCTAssertEqual(model.mode, .rename(Fixtures.clientWork))
+    XCTAssertEqual(model.highlight, 1)
+    XCTAssertEqual(backend.sent, [])
+    XCTAssertEqual(closed, 0)
+  }
+
+  /// The delete confirmation takes only ↩ and Esc. Space is used up, so it
+  /// neither types into the search field nor cancels the confirmation.
+  func testSpaceDuringTheDeleteConfirmationDoesNothing() throws {
+    let model = try makeModel()
+    model.handle(.commandDelete)
+    XCTAssertTrue(model.handle(.space))
+    XCTAssertEqual(model.mode, .confirmDelete(Fixtures.clientWork))
+    XCTAssertEqual(model.query, "")
+    XCTAssertEqual(backend.sent, [])
+  }
+
   func testCommandEnterAddsTheTargetWindowToTheHighlightedContext() throws {
     let model = try makeModel()
     model.handle(.commandEnter)
