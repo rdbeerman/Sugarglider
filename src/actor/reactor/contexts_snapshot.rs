@@ -170,23 +170,7 @@ mod tests {
         s.create("Work");
         let work = s.id("Work");
         let created = last(&published);
-        let member = |idx: u32| MemberSummary {
-            app: "TestApp1".into(),
-            title: format!("Window{idx}"),
-            window: Some(wid(idx)),
-        };
-        assert_eq!(
-            vec![ContextSummary {
-                id: work,
-                name: "Work".into(),
-                number: Some(1),
-                last_used: 1,
-                apps: vec!["TestApp1".into()],
-                windows: 3,
-                members: vec![member(1), member(2), member(3)],
-            }],
-            created.contexts
-        );
+        assert_eq!(vec![summary(&s, "Work", 3)], created.contexts);
         assert_eq!(ContextKey::Named(work), created.active);
         assert_eq!(shows(ContextKey::Named(work)), created.screens);
         assert_eq!(0, created.unsorted.windows);
@@ -288,13 +272,17 @@ mod tests {
                 vec![]
             },
             windows,
+            // The counts are what these tests pin; the records are the
+            // model's, as `ContextSummary::new` projects them.
             members: context
                 .members
                 .iter()
-                .map(|record| MemberSummary {
-                    app: app_name(record),
-                    title: record.title.clone(),
-                    window: record.window(),
+                .enumerate()
+                .map(|(record, member)| MemberSummary {
+                    record,
+                    app: app_name(member),
+                    title: member.title.clone(),
+                    window: member.window(),
                 })
                 .collect(),
         }

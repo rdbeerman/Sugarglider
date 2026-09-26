@@ -118,21 +118,26 @@ pub struct ContextSummary {
     /// context and count too.
     #[serde(default)]
     pub windows: usize,
-    /// Every member record, in the model's order. The switcher's edit view
-    /// and its `remove_records` check read these.
+    /// Every member record, in the model's order. This is what the switcher
+    /// edits, and what `sugarglider context forget` names by index.
     #[serde(default)]
     pub members: Vec<MemberSummary>,
 }
 
-/// A member record of a context, as the switcher reads it.
+/// One member record of a context, as the command line and the switcher see
+/// it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemberSummary {
-    /// The app name, as [`app_name`] derives it.
+    /// The record's index in `Context.members`, which the edit command and
+    /// `sugarglider context forget` take.
+    pub record: usize,
+    /// The record's app name, or its bundle id when the name is unknown, or
+    /// [`UNKNOWN_APP`].
     pub app: String,
-    /// The record's title.
     pub title: String,
-    /// The record's open window, or `None` when the window is gone.
+    /// The record's open window, or `None` when its window is gone: the
+    /// record is empty or pending (R23).
     pub window: Option<WindowId>,
 }
 
@@ -262,7 +267,7 @@ impl ContextsSnapshot {
 impl ContextSummary {
     /// The summary of `context`, whose members include the `pinned`
     /// windows.
-    fn new(context: &Context, pinned: &[MemberRecord]) -> Self {
+    pub(crate) fn new(context: &Context, pinned: &[MemberRecord]) -> Self {
         let mut open: Vec<WindowId> = Vec::new();
         let mut apps: Vec<String> = Vec::new();
         for record in context.members.iter().chain(pinned) {
@@ -279,10 +284,12 @@ impl ContextSummary {
         let members = context
             .members
             .iter()
-            .map(|record| MemberSummary {
-                app: app_name(record),
-                title: record.title.clone(),
-                window: record.window(),
+            .enumerate()
+            .map(|(record, member)| MemberSummary {
+                record,
+                app: app_name(member),
+                title: member.title.clone(),
+                window: member.window(),
             })
             .collect();
         ContextSummary {
@@ -370,7 +377,8 @@ mod tests {
 
     /// The apps are the open members' apps, each once, by name, bundle id,
     /// or "Unknown app". Closed and gone windows count toward neither the
-    /// apps nor the windows.
+    /// apps nor the windows. Every record, open or not, is listed with the
+    /// index that names it.
     #[test]
     fn a_context_lists_the_apps_and_the_number_of_its_open_windows() {
         let mut contexts = Contexts::new();
@@ -407,31 +415,37 @@ mod tests {
                 windows: 4,
                 members: vec![
                     MemberSummary {
+                        record: 0,
                         app: "WhatsApp".into(),
                         title: "Window1".into(),
                         window: Some(WindowId::new(1, 1)),
                     },
                     MemberSummary {
+                        record: 1,
                         app: "com.microsoft.teams2".into(),
                         title: "Window2".into(),
                         window: Some(WindowId::new(2, 2)),
                     },
                     MemberSummary {
+                        record: 2,
                         app: "WhatsApp".into(),
                         title: "Window3".into(),
                         window: Some(WindowId::new(1, 3)),
                     },
                     MemberSummary {
+                        record: 3,
                         app: UNKNOWN_APP.into(),
                         title: "Window4".into(),
                         window: Some(WindowId::new(3, 4)),
                     },
                     MemberSummary {
+                        record: 4,
                         app: "Mail".into(),
                         title: "Window5".into(),
                         window: None,
                     },
                     MemberSummary {
+                        record: 5,
                         app: "Calendar".into(),
                         title: "Window6".into(),
                         window: None,
@@ -616,7 +630,9 @@ mod tests {
     }
 
     /// A snapshot from a newer server, with fields this version doesn't
-    /// know, reads without them.
+    /// know, reads without them. A member record that names only some of
+    /// its keys reads with the rest at their defaults, because a server
+    /// and a client can be different versions.
     #[test]
     fn a_snapshot_from_a_newer_server_reads_without_its_new_fields() {
         let newer = r#"(
@@ -624,7 +640,8 @@ mod tests {
             scope: global,
             active: Unsorted,
             screens: [(id: 1, shows: Unsorted, display_id: 42)],
-            contexts: [(id: 2, name: "Comms", members: [(title: "Inbox")])],
+            contexts: [(id: 2, name: "Comms", hotkey: "⌃⌥1",
+                        members: [(record: 1, title: "Inbox")])],
             unsorted: (listed: true, windows: 1, last_used: 4, titles: ["Notes"]),
             everything: (last_used: 0),
             results: [(request: 9, error: None, finished_at: 12)],
@@ -639,10 +656,9 @@ mod tests {
             ("Comms", 0),
             (&*snapshot.contexts[0].name, snapshot.contexts[0].windows)
         );
-        // The newer server's member records read, with the keys this version
-        // doesn't know left at their defaults.
         assert_eq!(
             vec![MemberSummary {
+                record: 1,
                 app: String::new(),
                 title: "Inbox".into(),
                 window: None,

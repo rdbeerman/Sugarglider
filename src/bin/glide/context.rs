@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use serde::Serialize;
-use sugarglider::actor::contexts_snapshot::{ContextsSnapshot, RequestId, Scope};
+use sugarglider::actor::contexts_snapshot::{ContextsSnapshot, MemberSummary, RequestId, Scope};
 use sugarglider::actor::reactor::{ContextCommand, ContextRef};
 use sugarglider::actor::server::{ContextRequest, Request, Response};
 use sugarglider::model::contexts::ContextKey;
@@ -265,6 +265,8 @@ struct ContextJson<'a> {
     /// How many member windows are open, wherever they are, pinned windows
     /// included.
     windows: usize,
+    /// Every member record, with the index that `context forget` takes.
+    members: &'a [MemberSummary],
 }
 
 fn json(snapshot: &ContextsSnapshot) -> String {
@@ -288,6 +290,7 @@ fn json(snapshot: &ContextsSnapshot) -> String {
                 active: snapshot.active == ContextKey::Named(context.id),
                 apps: &context.apps,
                 windows: context.windows,
+                members: &context.members,
             })
             .collect(),
         unsorted: snapshot.unsorted.windows,
@@ -308,12 +311,14 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde::Deserialize;
     use serde_json::json;
+    use sugarglider::actor::app::WindowId;
     use sugarglider::actor::contexts_snapshot::{
         ContextSummary, EverythingSummary, ScreenContext, UnsortedSummary,
     };
     use sugarglider::config::Config;
     use sugarglider::model::contexts::ContextId;
     use sugarglider::sys::message_port::{LocalMessagePort, RemoteMessagePort};
+    use sugarglider::sys::window_server::WindowServerId;
 
     use super::*;
     use crate::{Client, Command, Opt};
@@ -322,7 +327,13 @@ mod tests {
         serde_json::from_value(json!(id)).unwrap()
     }
 
-    fn summary(id: u32, name: &str, apps: &[&str], windows: usize) -> ContextSummary {
+    fn summary(
+        id: u32,
+        name: &str,
+        apps: &[&str],
+        windows: usize,
+        members: Vec<MemberSummary>,
+    ) -> ContextSummary {
         ContextSummary {
             id: self::id(id),
             name: name.into(),
@@ -330,10 +341,29 @@ mod tests {
             last_used: 0,
             apps: apps.iter().map(|app| app.to_string()).collect(),
             windows,
+            members,
         }
     }
 
+    /// A member record that `context list --json` prints with its index,
+    /// app, and title, and with `window` null when the window is gone.
+    fn member(record: usize, app: &str, title: &str, window: Option<WindowId>) -> MemberSummary {
+        MemberSummary {
+            record,
+            app: app.into(),
+            title: title.into(),
+            window,
+        }
+    }
+
+    /// The window of a record, as a real window server id names it.
+    fn window(pid: i32, idx: u32) -> Option<WindowId> {
+        Some(WindowId::with_wsid(pid, WindowServerId::new(idx)))
+    }
+
     /// The spec's example: Comms is active, and 3 windows are unsorted.
+    /// Comms holds two open records and the record of a window that is
+    /// gone, and Relax holds none.
     fn snapshot() -> ContextsSnapshot {
         ContextsSnapshot {
             enabled: true,
@@ -344,8 +374,18 @@ mod tests {
                 shows: ContextKey::Named(id(1)),
             }],
             contexts: vec![
-                summary(1, "Comms", &["WhatsApp", "Microsoft Teams"], 2),
-                summary(2, "Relax", &["WhatsApp", "Google Chrome"], 2),
+                summary(
+                    1,
+                    "Comms",
+                    &["WhatsApp", "Microsoft Teams"],
+                    2,
+                    vec![
+                        member(0, "WhatsApp", "WhatsApp", window(903, 9201)),
+                        member(1, "Microsoft Teams", "Team", window(904, 9202)),
+                        member(2, "Mail", "Inbox", None),
+                    ],
+                ),
+                summary(2, "Relax", &["WhatsApp", "Google Chrome"], 2, vec![]),
             ],
             unsorted: UnsortedSummary {
                 listed: true,
@@ -611,9 +651,17 @@ mod tests {
               "screens": [{ "id": 1, "active": "Comms" }],
               "contexts": [
                 { "name": "Comms", "number": 1, "active": true,
-                  "apps": ["WhatsApp", "Microsoft Teams"], "windows": 2 },
+                  "apps": ["WhatsApp", "Microsoft Teams"], "windows": 2,
+                  "members": [
+                    { "record": 0, "app": "WhatsApp", "title": "WhatsApp",
+                      "window": { "pid": 903, "idx": 9201 } },
+                    { "record": 1, "app": "Microsoft Teams", "title": "Team",
+                      "window": { "pid": 904, "idx": 9202 } },
+                    { "record": 2, "app": "Mail", "title": "Inbox", "window": null }
+                  ] },
                 { "name": "Relax", "number": 2, "active": false,
-                  "apps": ["WhatsApp", "Google Chrome"], "windows": 2 }
+                  "apps": ["WhatsApp", "Google Chrome"], "windows": 2,
+                  "members": [] }
               ],
               "unsorted": 3
             }),
@@ -1040,7 +1088,8 @@ mod tests {
 
     /// The JSON is the shape in the spec's "Command line" section when no
     /// named context is active: a context without a number has a null
-    /// number, every screen is listed, and each names what it shows.
+    /// number, every screen is listed, and each names what it shows. Every
+    /// member record is listed with the index that `forget` takes.
     #[test]
     fn list_json_under_everything_and_without_a_number() {
         assert_eq!(
@@ -1053,9 +1102,16 @@ mod tests {
               ],
               "contexts": [
                 { "name": "Comms", "number": 1, "active": false,
-                  "apps": ["WhatsApp", "Microsoft Teams"], "windows": 2 },
+                  "apps": ["WhatsApp", "Microsoft Teams"], "windows": 2,
+                  "members": [
+                    { "record": 0, "app": "WhatsApp", "title": "WhatsApp",
+                      "window": { "pid": 903, "idx": 9201 } },
+                    { "record": 1, "app": "Microsoft Teams", "title": "Team",
+                      "window": { "pid": 904, "idx": 9202 } },
+                    { "record": 2, "app": "Mail", "title": "Inbox", "window": null }
+                  ] },
                 { "name": "Relax", "number": null, "active": false,
-                  "apps": [], "windows": 0 }
+                  "apps": [], "windows": 0, "members": [] }
               ],
               "unsorted": 0
             }),
@@ -1105,7 +1161,14 @@ mod tests {
               "screens": [{ "id": 1, "active": "Comms" }],
               "contexts": [
                 { "name": "Comms", "number": 1, "active": true,
-                  "apps": ["WhatsApp", "Microsoft Teams"], "windows": 2 }
+                  "apps": ["WhatsApp", "Microsoft Teams"], "windows": 2,
+                  "members": [
+                    { "record": 0, "app": "WhatsApp", "title": "WhatsApp",
+                      "window": { "pid": 903, "idx": 9201 } },
+                    { "record": 1, "app": "Microsoft Teams", "title": "Team",
+                      "window": { "pid": 904, "idx": 9202 } },
+                    { "record": 2, "app": "Mail", "title": "Inbox", "window": null }
+                  ] }
               ],
               "unsorted": 3
             }),
