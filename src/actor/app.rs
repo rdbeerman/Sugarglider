@@ -29,7 +29,7 @@ use accessibility_sys::{
     kAXWindowMovedNotification, kAXWindowResizedNotification, kAXWindowRole,
 };
 use objc2::rc::Retained;
-use objc2_app_kit::NSRunningApplication;
+use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 use objc2_core_foundation::{CFRetained, CFRunLoop, CFString, CGRect};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{
@@ -163,6 +163,11 @@ pub enum Request {
     /// Sent by WindowServer actor when a window is destroyed.
     /// See [`actor::window_server::Event::RegisterWindow`].
     WindowDestroyed(WindowId),
+
+    /// Activate the app without raising a window. The activation, and the
+    /// main window change that comes with it, are reported with the given
+    /// [`Quiet`].
+    Activate(Quiet),
 }
 
 struct RaiseRequest(Vec<WindowId>, CancellationToken, u64, Quiet);
@@ -710,6 +715,25 @@ impl State {
             }
             &mut Request::WindowDestroyed(wid) => {
                 self.on_window_destroyed(wid);
+            }
+            &mut Request::Activate(quiet) => {
+                let main_window = match optional(self.app.main_window()) {
+                    Ok(Some(elem)) => self.id(&elem).ok(),
+                    _ => None,
+                };
+                let quiet_window_change = (quiet == Quiet::Yes).then_some(main_window).flatten();
+                // Nothing waits for this activation; the marker only labels
+                // the events it causes.
+                let (tx, _) = oneshot::channel();
+                self.last_activated = Some((
+                    Instant::now() + ACTIVATION_TIMEOUT,
+                    quiet,
+                    quiet_window_change,
+                    tx,
+                ));
+                if !self.running_app.activateWithOptions(NSApplicationActivationOptions::empty()) {
+                    warn!(?self.pid, "Failed to activate app");
+                }
             }
         }
         Ok(false)

@@ -9,6 +9,7 @@
 
 mod animation;
 mod contexts;
+mod focus;
 mod main_window;
 mod membership;
 mod parking;
@@ -395,6 +396,11 @@ pub struct Reactor {
     /// Visible Spaces that show every window until the next space change,
     /// because Sugarglider is about to stop managing them.
     showing_everything: HashSet<SpaceId>,
+    /// What the last switch waits for before focus from outside counts
+    /// again.
+    switch_guard: focus::SwitchGuard,
+    /// A window that took focus before the reactor saw it.
+    focus_waiting: Option<WindowId>,
     /// Where the layout is saved when Sugarglider quits. `None` saves nothing.
     layout_file: Option<PathBuf>,
     /// Ends the process with an exit code.
@@ -624,6 +630,8 @@ impl Reactor {
             boot_id: None,
             pending_exit: None,
             showing_everything: HashSet::default(),
+            switch_guard: Default::default(),
+            focus_waiting: None,
             layout_file: None,
             exit: Box::new(|code| info!(code, "Not quitting a reactor that has no exit")),
         }
@@ -742,6 +750,7 @@ impl Reactor {
             }
             Event::ApplicationThreadTerminated(pid) => {
                 self.app_terminated(pid);
+                self.guarded_app_gone(pid);
                 self.apps.remove(&pid);
                 self.forget_parked_app(pid);
                 self.send_layout_event(LayoutEvent::AppClosed(pid));
@@ -751,6 +760,7 @@ impl Reactor {
                 if quiet == Quiet::No {
                     self.app_still_running(pid);
                 }
+                self.app_activated(pid);
             }
             Event::ApplicationDeactivated(..)
             | Event::ApplicationGloballyActivated(..)
@@ -779,6 +789,7 @@ impl Reactor {
                 self.app_still_running(wid.pid);
                 if first_seen {
                     self.windows_seen(&[wid]);
+                    self.focus_windows_seen(&[wid]);
                 }
                 if mouse_state == MouseState::Down {
                     self.in_drag = true;
@@ -867,6 +878,7 @@ impl Reactor {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
                 self.window_closed(wid);
+                self.guarded_window_gone(wid);
                 self.frame_attempts.remove(&wid);
                 self.forget_parked_window(wid, window.and_then(|window| window.window_server_id));
                 // Only send WindowRemoved if no sibling will take its place.
@@ -939,6 +951,7 @@ impl Reactor {
                     }
                     self.observe_parked(wid, new_frame, last_seen);
                     self.confirm_unparked(wid, new_frame);
+                    self.frame_write_echoed(wid);
                     return;
                 }
                 let old_frame = mem::replace(&mut window.frame_monotonic, new_frame);
@@ -1384,10 +1397,12 @@ impl Reactor {
             Event::RaiseCompleted { window_id, sequence_id } => {
                 let msg = raise::Event::RaiseCompleted { window_id, sequence_id };
                 _ = self.raise_manager_tx.send((Span::current(), msg));
+                self.raise_ended(sequence_id, Some(window_id));
             }
             Event::RaiseRequestFailed { windows, sequence_id, quiet } => {
                 let msg = raise::Event::RaiseRequestFailed { windows, sequence_id };
                 _ = self.raise_manager_tx.send((Span::current(), msg));
+                self.raise_ended(sequence_id, None);
                 if quiet == Quiet::No
                     && let Some(main_window) = self.main_window()
                 {
@@ -1400,6 +1415,7 @@ impl Reactor {
             Event::RaiseTimeout { sequence_id } => {
                 let msg = raise::Event::RaiseTimeout { sequence_id };
                 _ = self.raise_manager_tx.send((Span::current(), msg));
+                self.raise_ended(sequence_id, None);
             }
             Event::ScrollWheel { delta_x, delta_y, alt_held } => {
                 if !self.config.settings.experimental.scroll.enable {
@@ -1486,9 +1502,7 @@ impl Reactor {
             let spaces = self.screens.iter().flat_map(|screen| screen.space).collect();
             self.send_layout_event(LayoutEvent::WindowFocused(spaces, raised_window));
             self.update_active_screen();
-            if self.contexts_enabled() {
-                self.contexts.window_focused(raised_window);
-            }
+            self.focus_changed(raised_window);
         }
         if !self.in_drag {
             self.update_layout(&animation_focus_wids, is_resize);
@@ -1638,6 +1652,7 @@ impl Reactor {
         if self.startup_complete {
             self.park_what_must_not_show(pid);
         }
+        self.focus_windows_seen(&first_seen);
     }
 
     /// Sends the current list of visible windows for the given app to the

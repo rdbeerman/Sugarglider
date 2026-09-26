@@ -107,6 +107,11 @@ impl MainWindowTracker {
         None
     }
 
+    /// The app that the window server last reported frontmost.
+    pub fn frontmost_app(&self) -> Option<pid_t> {
+        self.global_frontmost
+    }
+
     /// The main window that the app last reported, whether or not it is
     /// active.
     pub fn app_main_window(&self, pid: pid_t) -> Option<WindowId> {

@@ -346,6 +346,8 @@ impl Apps {
                 }
                 Request::Raise(..) => todo!(),
                 Request::WindowDestroyed(..) => todo!(),
+                // A test sends the activation events itself.
+                Request::Activate(_) => {}
             }
         }
         debug!(?events);

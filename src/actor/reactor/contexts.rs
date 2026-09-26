@@ -273,6 +273,19 @@ impl Reactor {
     /// recently focused window that shows. If the journal can't be written,
     /// the old context stays.
     fn switch_context(&mut self, target: ContextKey) {
+        self.switch_context_focusing(target, None);
+    }
+
+    /// Switches to `target` on every screen, and focuses `focused`, the
+    /// window whose focus started the switch (R24), or else the most
+    /// recently focused window that shows. When no window can take focus,
+    /// Finder is activated (R12, step 6). Focus from outside counts again
+    /// when the switch ends (R25).
+    pub(super) fn switch_context_focusing(
+        &mut self,
+        target: ContextKey,
+        focused: Option<WindowId>,
+    ) {
         if !self.contexts_enabled() {
             debug!(?target, "Ignoring a context switch while contexts are off");
             return;
@@ -296,12 +309,25 @@ impl Reactor {
             Ok((plan, response)) => {
                 self.save_contexts();
                 let mut response = response.unwrap_or_default();
-                if let Some(focus) = plan.focus
-                    && self.main_window() != Some(focus)
+                let focus = focused.or(plan.focus);
+                if let Some(focus) = focus
+                    && (focused.is_some() || self.main_window() != Some(focus))
                 {
                     response.focus_window = Some(focus);
                 }
-                self.handle_layout_response(response);
+                let raised = response.focus_window;
+                let sequence = self.handle_layout_response(response);
+                if let Some(focused) = focused {
+                    self.select_in_layout(focused);
+                    self.contexts.window_focused(focused);
+                }
+                let parked: Vec<WindowId> =
+                    plan.park.iter().copied().filter(|wid| self.parked.contains_key(wid)).collect();
+                let finder = match focus {
+                    Some(_) => None,
+                    None => self.activate_finder(),
+                };
+                self.guard_switch(sequence.zip(raised), &parked, finder);
                 info!(
                     ?target,
                     parked = plan.park.len(),
@@ -585,6 +611,7 @@ mod tests {
     use crate::sys::screen::{CoordinateConverter, SpaceId};
     use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
 
+    mod focus;
     mod membership;
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
