@@ -307,12 +307,27 @@ fn shown_context_name(snapshot: &ContextsSnapshot) -> Option<&str> {
 /// or both, as in "2 · Comms".
 fn status_title(space_number: Option<usize>, context_name: Option<&str>) -> String {
     match (space_number, context_name) {
-        (Some(number), Some(name)) => format!("{number} · {name}"),
+        (Some(number), Some(name)) => format!("{number} · {}", short_name(name)),
         (Some(number), None) => number.to_string(),
-        (None, Some(name)) => name.to_string(),
+        (None, Some(name)) => short_name(name),
         (None, None) => String::new(),
     }
 }
+
+/// The context name as the status item shows it. A long name could push the
+/// item off the menu bar, where macOS hides it together with Quit and the
+/// other items, so it is cut to `MAX_STATUS_NAME` characters.
+fn short_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let mut shown: String = chars.by_ref().take(MAX_STATUS_NAME).collect();
+    if chars.next().is_some() {
+        shown.push('…');
+    }
+    shown
+}
+
+/// The longest context name the status item shows.
+const MAX_STATUS_NAME: usize = 20;
 
 #[cfg(test)]
 mod tests {
@@ -359,6 +374,23 @@ mod tests {
     fn the_title_shows_the_space_number_before_the_context() {
         assert_eq!("2 · Comms", title(Some(2), &snapshot(Some("Comms"))));
         assert_eq!("2", title(Some(2), &snapshot(None)));
+    }
+
+    /// A long context name is cut to 20 characters and an ellipsis, so the
+    /// status item stays on the menu bar. Exactly 20 characters are not cut.
+    #[test]
+    fn a_long_context_name_is_cut() {
+        let twenty = "A".repeat(20);
+        let twenty_one = "A".repeat(21);
+        let long = "A".repeat(40);
+
+        assert_eq!(twenty, short_name(&twenty));
+        assert_eq!(format!("{twenty}…"), short_name(&twenty_one));
+        assert_eq!(format!("{twenty}…"), short_name(&long));
+        assert_eq!(format!("2 · {twenty}…"), status_title(Some(2), Some(&long)));
+        assert_eq!(format!("{twenty}…"), status_title(None, Some(&long)));
+        // The cut counts characters, not bytes.
+        assert_eq!(format!("{}…", "ä".repeat(20)), short_name(&"ä".repeat(21)));
     }
 
     /// R28. With contexts off, the title is the Space's number while the
