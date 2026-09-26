@@ -448,4 +448,105 @@ mod tests {
         assert!(journal.remove_app(1));
         assert!(journal.entries().is_empty());
     }
+
+    /// Opens a journal file holding `contents`. The file must be moved aside
+    /// unchanged, and the journal must start empty and write a new file.
+    fn assert_moved_aside(contents: &[u8]) {
+        let dir = TempDir::new().unwrap();
+        fs::write(journal_path(&dir), contents).unwrap();
+
+        let mut journal = ParkedJournal::open(journal_path(&dir), now());
+
+        assert!(journal.entries().is_empty());
+        assert!(journal.unrestored(812).is_empty());
+        let aside = dir.path().join("parked.unreadable-1790000000.json");
+        assert_eq!(vec!["parked.unreadable-1790000000.json"], file_names(dir.path()));
+        assert_eq!(contents, fs::read(&aside).unwrap());
+
+        journal.record(vec![entry(1, 10)]).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(journal_path(&dir)).unwrap()).unwrap();
+        assert_eq!(serde_json::json!(1), written["version"]);
+        assert_eq!(
+            &[entry(1, 10)],
+            ParkedJournal::open(journal_path(&dir), now()).entries()
+        );
+        assert_eq!(contents, fs::read(&aside).unwrap());
+    }
+
+    #[test]
+    fn r34_a_journal_cut_off_mid_entry_is_moved_aside_unchanged() {
+        assert_moved_aside(
+            br#"{ "version": 1, "entries": [ { "pid": 812, "bundle_id": "com.google.Chrome", "window_server_id": 9123, "title": "Docs", "frame": { "x": 0, "y": 25, "w": 14"#,
+        );
+        assert_moved_aside(br#"{ "version": 1, "entries": ["#);
+        assert_moved_aside(br#"{ "version": 1"#);
+    }
+
+    #[test]
+    fn r34_an_empty_journal_file_is_moved_aside() {
+        assert_moved_aside(b"");
+    }
+
+    #[test]
+    fn r34_journals_of_other_or_missing_versions_are_moved_aside_unchanged() {
+        assert_moved_aside(br#"{ "version": 0, "entries": [] }"#);
+        assert_moved_aside(
+            br#"{ "version": 2, "entries": [ { "pid": 812, "window_server_id": 9123, "frame": { "x": 0, "y": 25, "w": 1440, "h": 875 } } ] }"#,
+        );
+        assert_moved_aside(br#"{ "entries": [] }"#);
+    }
+
+    #[test]
+    fn r34_a_journal_whose_entry_has_no_frame_is_moved_aside() {
+        assert_moved_aside(
+            br#"{ "version": 1, "entries": [ { "pid": 812, "window_server_id": 9123 } ] }"#,
+        );
+    }
+
+    #[test]
+    fn r30_a_write_that_cannot_replace_the_file_changes_nothing_and_leaves_no_temporary_file() {
+        let dir = TempDir::new().unwrap();
+        let mut journal = ParkedJournal::open(journal_path(&dir), now());
+        journal.record(vec![entry(1, 10)]).unwrap();
+        // A directory now stands where the journal file was.
+        fs::remove_file(journal_path(&dir)).unwrap();
+        fs::create_dir(journal_path(&dir)).unwrap();
+        fs::write(journal_path(&dir).join("in-the-way"), "").unwrap();
+
+        assert!(journal.record(vec![entry(1, 11), entry(2, 20)]).is_err());
+
+        assert_eq!(&[entry(1, 10)], journal.entries());
+        assert_eq!(vec!["parked.json"], file_names(dir.path()));
+        fs::remove_dir_all(journal_path(&dir)).unwrap();
+        journal.record(vec![entry(2, 20)]).unwrap();
+        assert_eq!(
+            &[entry(1, 10), entry(2, 20)],
+            ParkedJournal::open(journal_path(&dir), now()).entries()
+        );
+    }
+
+    #[test]
+    fn r31_a_removal_that_could_not_be_written_is_written_with_the_next_change() {
+        let dir = TempDir::new().unwrap();
+        let mut journal = ParkedJournal::open(journal_path(&dir), now());
+        journal.record(vec![entry(1, 10), entry(2, 20)]).unwrap();
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let removed = journal.remove_window(1, WindowServerId::new(10));
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(removed);
+        assert_eq!(&[entry(2, 20)], journal.entries());
+        assert_eq!(
+            &[entry(1, 10), entry(2, 20)],
+            ParkedJournal::open(journal_path(&dir), now()).entries(),
+            "the file keeps the entry until a write succeeds"
+        );
+        journal.record(vec![entry(3, 30)]).unwrap();
+        assert_eq!(
+            &[entry(2, 20), entry(3, 30)],
+            ParkedJournal::open(journal_path(&dir), now()).entries()
+        );
+    }
 }

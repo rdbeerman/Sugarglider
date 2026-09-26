@@ -783,6 +783,15 @@ mod tests {
     }
 
     #[test]
+    fn the_parked_window_journal_lives_next_to_the_layout() {
+        assert_eq!(
+            restore_file().with_file_name("parked.json"),
+            parked_journal_file()
+        );
+        assert_eq!(data_dir().join("parked.json"), parked_journal_file());
+    }
+
+    #[test]
     fn toggle_global_enabled_is_default_key() {
         let config = Config::default();
         assert!(
