@@ -163,6 +163,16 @@ pub enum Request {
     /// Sent by WindowServer actor when a window is destroyed.
     /// See [`actor::window_server::Event::RegisterWindow`].
     WindowDestroyed(WindowId),
+
+    /// Activate the app without raising a window. The activation, and the
+    /// main window change that comes with it, are reported with the given
+    /// [`Quiet`].
+    Activate(Quiet),
+
+    /// Send `WindowTitleChanged` for this app's windows, or stop sending it.
+    /// The reactor turns it on while contexts are on, so that with contexts
+    /// off window rules see the same titles as before contexts existed.
+    TrackTitles(bool),
 }
 
 struct RaiseRequest(Vec<WindowId>, CancellationToken, u64, Quiet);
@@ -216,6 +226,10 @@ struct State {
     /// Latest animation frame per window, awaiting a flush. See
     /// [`Request::AnimationFrame`].
     pending_frames: HashMap<WindowId, PendingFrame>,
+    /// Whether title changes become reactor events. The reactor keeps this
+    /// off while contexts are off.
+    track_titles: bool,
+    native_tabs: crate::model::native_tabs::TabTracker<CFRetained<AXUIElement>>,
 }
 
 struct WindowState {
@@ -350,6 +364,7 @@ impl State {
             return Ok(());
         };
         let _guard = span.enter();
+        self.check_frame_target(wid)?;
         // Enhanced UI is already disabled for the animation, so there is no toggle
         // here, and we write once without retries to keep each frame cheap. The
         // deferred fixup in EndWindowAnimation corrects the final frame.
@@ -447,20 +462,25 @@ impl State {
         let _span = info_span!("init", ?info).entered();
 
         // Now that we will observe new window events, read the list of windows.
-        let Ok(initial_window_elements) = self.app.windows() else {
-            // This is probably not a normal application, or it has exited.
-            return false;
-        };
-
-        // Process the list and register notifications on all windows.
-        self.windows.reserve(initial_window_elements.len() as usize);
-        let mut windows = Vec::with_capacity(initial_window_elements.len() as usize);
-        for elem in initial_window_elements.iter() {
-            let elem = elem.clone();
-            let Some((info, wid)) = self.register_window(elem) else {
-                continue;
-            };
-            windows.push((wid, info));
+        let mut windows = Vec::new();
+        match self.app.windows() {
+            Ok(initial_window_elements) => {
+                // Process the list and register notifications on all windows.
+                self.windows.reserve(initial_window_elements.len());
+                windows.reserve(initial_window_elements.len());
+                for elem in initial_window_elements.iter() {
+                    let elem = elem.clone();
+                    let Some((info, wid)) = self.register_window(elem) else {
+                        continue;
+                    };
+                    windows.push((wid, info));
+                }
+            }
+            Err(err) => {
+                // Keep the app registered so the next visibility poll can
+                // discover windows after a transient AX failure.
+                warn!(?self.pid, ?err, "Could not list initial windows");
+            }
         }
         self.main_window = self.app.main_window().ok().and_then(|w| self.id(&w).ok());
         self.is_frontmost = self.app.frontmost().map(|b| b.value()).unwrap_or(false);
@@ -588,6 +608,7 @@ impl State {
                 for elem in window_elems.iter() {
                     let elem = elem.clone();
                     if let Ok(id) = self.id(&elem) {
+                        self.observe_native_tabs(id, &elem);
                         known_visible.push(id);
                         continue;
                     }
@@ -618,6 +639,7 @@ impl State {
                 );
             }
             &mut Request::SetWindowFrame(wid, frame, txid) => {
+                self.check_frame_target(wid)?;
                 let app_elem = &self.app.clone();
                 let window = self.window_mut(wid)?;
                 window.last_seen_txid = txid;
@@ -658,6 +680,7 @@ impl State {
                 if let Err(e) = self.flush_frames(wid) {
                     warn!(?wid, "Failed to flush animation frame on end: {e}");
                 }
+                let can_write = self.check_frame_target(wid).is_ok();
                 let remaining_animations = if self.active_window_animations == 0 {
                     warn!(?wid, "Got EndWindowAnimation without a matching begin");
                     0
@@ -679,10 +702,11 @@ impl State {
                 let last_seen_txid = window.last_seen_txid;
                 // Apply the deferred full-frame fixup while enhanced UI is still
                 // disabled and before restarting notifications.
-                if let Some(frame) = last_animation_frame {
-                    if let Err(e) = set_window_frame_with_retries(&elem, frame) {
-                        warn!("Failed to apply frame fixup after animation: {e}");
-                    }
+                if can_write
+                    && let Some(frame) = last_animation_frame
+                    && let Err(e) = set_window_frame_with_retries(&elem, frame)
+                {
+                    warn!("Failed to apply frame fixup after animation: {e}");
                 }
                 if remaining_animations == 0 && self.restore_enhanced_ui_on_last_end {
                     _ = trace("set_enhanced_user_interface", &self.app, || {
@@ -691,6 +715,9 @@ impl State {
                     self.restore_enhanced_ui_on_last_end = false;
                 }
                 self.restart_notifications_after_animation(&elem);
+                if !can_write {
+                    return Ok(false);
+                }
                 let frame = trace("frame", &elem, || elem.frame())?;
                 self.send_event(Event::WindowFrameChanged(
                     wid,
@@ -710,6 +737,37 @@ impl State {
             }
             &mut Request::WindowDestroyed(wid) => {
                 self.on_window_destroyed(wid);
+            }
+            &mut Request::TrackTitles(enabled) => self.track_titles = enabled,
+            &mut Request::Activate(quiet) => {
+                let main_window = match optional(self.app.main_window()) {
+                    Ok(Some(elem)) => self.id(&elem).ok(),
+                    _ => None,
+                };
+                let quiet_window_change = (quiet == Quiet::Yes).then_some(main_window).flatten();
+                // Nothing waits for this activation; the marker only labels
+                // the events it causes.
+                let (tx, _) = oneshot::channel();
+                self.last_activated = Some((
+                    Instant::now() + ACTIVATION_TIMEOUT,
+                    quiet,
+                    quiet_window_change,
+                    tx,
+                ));
+                // Go through the window server, so cooperative activation
+                // can't refuse the request, as it can for
+                // NSRunningApplication's activation.
+                let wsid = main_window
+                    .and_then(|wid| self.window(wid).ok())
+                    .and_then(|window| WindowServerId::try_from(&*window.elem).ok());
+                let activated = match wsid {
+                    Some(wsid) => crate::sys::window_server::make_key_window(self.pid, wsid),
+                    None => crate::sys::window_server::make_front_process(self.pid),
+                };
+                if activated.is_err() {
+                    warn!(?self.pid, "Failed to activate app");
+                    self.send_event(Event::ActivateFailed(self.pid));
+                }
             }
         }
         Ok(false)
@@ -777,7 +835,16 @@ impl State {
                 }
             }
             kAXTitleChangedNotification => {
-                // TODO
+                if !self.track_titles {
+                    return;
+                }
+                let Ok(wid) = self.id(&elem) else {
+                    return;
+                };
+                let Ok(title) = elem.title() else {
+                    return;
+                };
+                self.send_event(Event::WindowTitleChanged(wid, title.to_string().into()));
             }
             _ => {
                 error!("Unhandled notification {notif:?} on {elem:#?}");
@@ -786,6 +853,7 @@ impl State {
     }
 
     fn on_window_destroyed(&mut self, wid: WindowId) {
+        self.native_tabs.forget_window(wid);
         if self.windows.remove(&wid).is_some() {
             self.send_event(Event::WindowDestroyed(wid));
         }
@@ -1026,6 +1094,10 @@ impl State {
         };
         // Suppress redundant events. This is so we don't repeat an event that
         // was manufactured as a quiet event before.
+        if let Some(window) = self.windows.get(&wid) {
+            let elem = window.elem.clone();
+            self.observe_native_tabs(wid, &elem);
+        }
         if self.main_window == Some(wid) {
             return Some(wid);
         }
@@ -1156,6 +1228,7 @@ impl State {
             self.last_window_idx += 1;
             WindowId::with_manual_index(self.pid, self.last_window_idx)
         });
+        self.observe_native_tabs(wid, &elem);
         let old = self.windows.insert(
             wid,
             WindowState {
@@ -1192,6 +1265,63 @@ impl State {
             }
             true
         }
+    }
+
+    fn observe_native_tabs(&mut self, window: WindowId, element: &AXUIElement) {
+        let known = self.native_tabs.bar_for_window(window).map(|bar| &**bar);
+        let group = match crate::sys::native_tabs::read(element, known) {
+            Ok(Some(bar)) => {
+                match self.native_tabs.observe(window, bar.element, bar.tabs, bar.selected) {
+                    Some(group) => Some(group),
+                    None => {
+                        self.send_event(Event::NativeTabsUnavailable(window));
+                        return;
+                    }
+                }
+            }
+            Ok(None) => {
+                // Inactive native windows can expose no tab-bar children.
+                // A fresh application list must still expose this window
+                // before absence of a bar can detach it from a known group.
+                if self.native_tabs.bar_for_window(window).is_some()
+                    && !self
+                        .app
+                        .windows()
+                        .is_ok_and(|windows| windows.iter().any(|visible| &*visible == element))
+                {
+                    self.send_event(Event::NativeTabsUnavailable(window));
+                    return;
+                }
+                self.native_tabs.forget_window(window);
+                None
+            }
+            Err(err) => {
+                debug!(?window, ?err, "Native tab identity read unavailable");
+                self.send_event(Event::NativeTabsUnavailable(window));
+                return;
+            }
+        };
+        self.send_event(Event::NativeTabsChanged { window, group });
+    }
+
+    fn check_frame_target(&self, wid: WindowId) -> Result<(), accessibility::Error> {
+        let bar = self.native_tabs.bar_for_window(wid);
+        if !self.track_titles && bar.is_none() {
+            return Ok(());
+        }
+        let result = (|| {
+            let window = self.window(wid)?;
+            if !self.app.windows()?.iter().any(|visible| visible == window.elem)
+                || bar.is_some_and(|bar| !bar.window().is_ok_and(|owner| owner == window.elem))
+            {
+                return Err(accessibility::Error::NotFound);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.send_event(Event::FrameTargetUnavailable(wid));
+        }
+        result
     }
 
     fn send_event(&self, event: Event) {
@@ -1303,6 +1433,8 @@ fn app_thread_main(
         active_window_animations: 0,
         restore_enhanced_ui_on_last_end: false,
         pending_frames: HashMap::default(),
+        track_titles: false,
+        native_tabs: Default::default(),
     };
 
     Executor::run(state.run(

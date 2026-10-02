@@ -65,6 +65,8 @@ fn build_swift_ui() {
         "_sugarglider_get_config",
         "_sugarglider_save_config_to_file",
         "_sugarglider_update_config",
+        "_sugarglider_rank_contexts",
+        "_sugarglider_run_context_command",
     ] {
         println!("cargo:rustc-link-arg=-Wl,-u,{symbol}");
     }

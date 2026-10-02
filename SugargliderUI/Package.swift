@@ -26,5 +26,9 @@ let package = Package(
                 .unsafeFlags(["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"])
             ]
         ),
+        .testTarget(
+            name: "SugargliderUITests",
+            dependencies: ["SugargliderUI"]
+        ),
     ]
 )

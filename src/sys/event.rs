@@ -10,7 +10,7 @@ use objc2_core_graphics::{
     CGDisplayHideCursor, CGDisplayShowCursor, CGWarpMouseCursorPosition, kCGNullDirectDisplay,
 };
 use serde::{Deserialize, Serialize};
-use tracing::info_span;
+use tracing::{info_span, warn};
 
 use super::screen::CoordinateConverter;
 use crate::actor::reactor::Command;
@@ -34,13 +34,17 @@ impl HotkeyManager {
     pub fn register_wm(&self, modifiers: Modifiers, key_code: KeyCode, cmd: WmCommand) {
         let events_tx = self.events_tx.clone();
         let mut seq = 0;
-        self.hook
-            .register(Hotkey { modifiers, key_code }, move || {
-                seq += 1;
-                let span = info_span!("hotkey::press", ?key_code, ?seq);
-                events_tx.send((span, WmEvent::Command(cmd.clone()))).unwrap()
-            })
-            .unwrap();
+        let hotkey = Hotkey { modifiers, key_code };
+        let result = self.hook.register(hotkey, move || {
+            seq += 1;
+            let span = info_span!("hotkey::press", ?key_code, ?seq);
+            events_tx.send((span, WmEvent::Command(cmd.clone()))).unwrap()
+        });
+        if let Err(e) = result {
+            // A key that is already registered would otherwise panic and
+            // abort the process.
+            warn!("Skipping hotkey {hotkey}: {e}");
+        }
     }
 }
 

@@ -72,6 +72,14 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         interval_ms: u64,
     },
+    /// Observe native tab identities without selecting tabs or moving windows.
+    NativeTabs {
+        pid: pid_t,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        samples: u32,
+        #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(50..=10000))]
+        interval_ms: u64,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -229,16 +237,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Spaces: {:?}", sc.get_screen_spaces());
         }
         Command::App(App::SetMainWindow { pid, window_server_id, wait }) => {
-            let app = AXUIElement::application(pid);
-            let windows = app.windows()?;
-            let window = windows
-                .iter()
-                .filter(|w| {
-                    let id: Result<window_server::WindowServerId, _> = (&**w).try_into();
-                    id.is_ok_and(|id| id.as_u32() == window_server_id)
-                })
-                .next()
-                .context("Could not find matching window")?;
+            let window = find_window(pid, window_server_id)?;
             if wait {
                 println!("Press enter to complete action");
                 std::io::stdin().read_line(&mut String::new())?;
@@ -347,8 +346,55 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Inspect => inspect(MainThreadMarker::new().unwrap()),
         Command::Focus { interval_ms } => watch_focus(Duration::from_millis(interval_ms)),
+        Command::NativeTabs { pid, samples, interval_ms } => {
+            let app = AXUIElement::application(pid);
+            let mut tracker = sugarglider::model::native_tabs::TabTracker::<
+                objc2_core_foundation::CFRetained<AXUIElement>,
+            >::default();
+            for sample in 0..samples {
+                for window in app.windows()?.iter() {
+                    let id = WindowServerId::try_from(&*window)?;
+                    let wid = actor::app::WindowId::with_wsid(pid, id);
+                    let known = tracker.bar_for_window(wid).map(|bar| &**bar);
+                    match sys::native_tabs::read(&window, known) {
+                        Ok(Some(bar)) => {
+                            let group = tracker
+                                .observe(wid, bar.element, bar.tabs, bar.selected)
+                                .context("invalid native tab identities")?;
+                            println!("sample={sample} {}", serde_json::to_string(&group)?);
+                        }
+                        Ok(None) => {
+                            tracker.forget_window(wid);
+                            println!("sample={sample} standalone={wid:?}");
+                        }
+                        Err(error) => {
+                            println!("sample={sample} unavailable={wid:?} error={error}");
+                        }
+                    }
+                }
+                if sample + 1 < samples {
+                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn find_window(
+    pid: pid_t,
+    window_server_id: CGWindowID,
+) -> anyhow::Result<CFRetained<AXUIElement>> {
+    let app = AXUIElement::application(pid);
+    let windows = app.windows()?;
+    let window = windows
+        .iter()
+        .find(|w| {
+            let id: Result<window_server::WindowServerId, _> = (&**w).try_into();
+            id.is_ok_and(|id| id.as_u32() == window_server_id)
+        })
+        .context("Could not find matching window")?;
+    Ok(window.clone())
 }
 
 /// Subscribes to every window server notification event in a range and prints
@@ -745,13 +791,16 @@ async fn get_windows_with_ns(_opt: &Opt, print: bool) {
 
 async fn get_windows_with_ax(opt: &Opt, serial: bool, print: bool) {
     let (sender, mut receiver) = mpsc::unbounded_channel();
+    let targeted_list = targeted_ax_list(opt);
+    let mut matched_apps = 0;
     for (pid, bundle_id) in sys::app::running_apps(opt.bundle.clone()) {
+        matched_apps += 1;
         let sender = sender.clone();
         let verbose = opt.verbose;
         let task = move || {
             let app = AXUIElement::application(pid);
             let windows = get_windows_for_app(app, verbose);
-            sender.send((bundle_id, windows)).unwrap()
+            sender.send((pid, bundle_id, windows)).unwrap()
         };
         if serial {
             task();
@@ -760,21 +809,48 @@ async fn get_windows_with_ax(opt: &Opt, serial: bool, print: bool) {
         }
     }
     drop(sender);
-    while let Some((info, windows)) = receiver.recv().await {
+    if targeted_list && matched_apps == 0 {
+        println!("{}", ax_list_no_match(opt.bundle.as_deref().unwrap()));
+    }
+    while let Some((pid, info, windows)) = receiver.recv().await {
         //println!("{info:?}");
-        match windows {
-            Ok(windows) => {
-                if print {
-                    for (win, dbg) in windows {
-                        println!("{win:?} from {}", info.bundle_id.as_deref().unwrap_or("?"));
-                        if opt.verbose {
-                            println!("=> {dbg}");
-                        }
-                    }
+        if targeted_list {
+            let result = windows.as_ref().map(Vec::len);
+            if let Some(diagnostic) = ax_list_diagnostic(pid, &info, result) {
+                println!("{diagnostic}");
+            }
+        }
+        if print && let Ok(windows) = windows {
+            for (win, dbg) in windows {
+                println!("{win:?} from {}", info.bundle_id.as_deref().unwrap_or("?"));
+                if opt.verbose {
+                    println!("=> {dbg}");
                 }
             }
-            Err(_) => (), //println!("  * Error reading windows: {err:?}"),
         }
+    }
+}
+
+fn targeted_ax_list(opt: &Opt) -> bool {
+    opt.bundle.is_some() && matches!(opt.command, Command::List(List::Ax))
+}
+
+fn ax_list_no_match(bundle_filter: &str) -> String {
+    format!("AX list: no running app matches bundle filter {bundle_filter:?}")
+}
+
+fn ax_list_diagnostic(
+    pid: pid_t,
+    info: &AppInfo,
+    result: Result<usize, &accessibility::Error>,
+) -> Option<String> {
+    let bundle = info.bundle_id.as_deref().unwrap_or("?");
+    match result {
+        Ok(0) => Some(format!("AX list: pid={pid} bundle={bundle}: 0 windows")),
+        Err(err) => Some(format!(
+            "AX list: pid={pid} bundle={bundle}: error reading windows: {err:?}"
+        )),
+        Ok(_) => None,
     }
 }
 
@@ -782,9 +858,7 @@ fn get_windows_for_app(
     app: CFRetained<AXUIElement>,
     verbose: bool,
 ) -> Result<Vec<(WindowInfo, String)>, accessibility::Error> {
-    let Ok(windows) = &app.windows() else {
-        return Err(accessibility::Error::NotFound);
-    };
+    let windows = app.windows()?;
     windows
         .iter()
         .map(|win| {
@@ -809,4 +883,47 @@ async fn time<O, F: Future<Output = O>>(desc: &str, f: impl FnOnce() -> F) -> O 
     let end = Instant::now();
     println!("{desc} took {:?}", end - start);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use sugarglider::sys::app::AppInfo;
+
+    use super::{Opt, ax_list_diagnostic, ax_list_no_match, targeted_ax_list};
+
+    #[test]
+    fn targeted_ax_list_distinguishes_no_app_error_and_empty_windows() {
+        let opt = Opt::try_parse_from(["devtool", "--bundle", "com.apple.TextEdit", "list", "ax"])
+            .unwrap();
+        assert!(targeted_ax_list(&opt));
+        assert!(!targeted_ax_list(
+            &Opt::try_parse_from(["devtool", "list", "ax"]).unwrap()
+        ));
+        assert!(!targeted_ax_list(
+            &Opt::try_parse_from(["devtool", "--bundle", "com.apple.TextEdit", "list", "all"])
+                .unwrap()
+        ));
+        assert_eq!(
+            ax_list_no_match("com.apple.TextEdit"),
+            "AX list: no running app matches bundle filter \"com.apple.TextEdit\""
+        );
+
+        let info = AppInfo {
+            bundle_id: Some("com.apple.TextEdit".to_owned()),
+            localized_name: Some("TextEdit".to_owned()),
+        };
+        assert_eq!(
+            ax_list_diagnostic(33920, &info, Err(&accessibility::Error::NotFound)),
+            Some(
+                "AX list: pid=33920 bundle=com.apple.TextEdit: error reading windows: NotFound"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            ax_list_diagnostic(33920, &info, Ok(0)),
+            Some("AX list: pid=33920 bundle=com.apple.TextEdit: 0 windows".to_owned())
+        );
+        assert_eq!(ax_list_diagnostic(33920, &info, Ok(1)), None);
+    }
 }
