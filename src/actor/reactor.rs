@@ -255,6 +255,9 @@ pub struct Reactor {
     window_server_info: HashMap<WindowServerId, WindowServerInfo>,
     window_ids: HashMap<WindowServerId, WindowId>,
     visible_windows: HashSet<WindowServerId>,
+    /// Tracks the space each window was last assigned to. Used to prevent
+    /// accidentally reshaping windows on inactive spaces.
+    window_spaces: HashMap<WindowId, SpaceId>,
     screens: Vec<Screen>,
     active_screen_idx: Option<u16>,
     main_window_tracker: MainWindowTracker,
@@ -467,6 +470,7 @@ impl Reactor {
             window_ids: HashMap::default(),
             window_server_info: HashMap::default(),
             visible_windows: HashSet::default(),
+            window_spaces: HashMap::default(),
             screens: vec![],
             active_screen_idx: None,
             main_window_tracker: MainWindowTracker::default(),
@@ -682,6 +686,7 @@ impl Reactor {
                     warn!("Got destroyed event for unknown window {wid:?}");
                 }
                 self.frame_attempts.remove(&wid);
+                self.window_spaces.remove(&wid);
                 // Only send WindowRemoved if no sibling will take its place.
                 // For tabs, the sibling window already represents this position.
                 if !dominated_by_sibling {
@@ -1413,6 +1418,9 @@ impl Reactor {
         // and we should only include one of them in the layout.
         let mut seen_frames: HashSet<(i32, i32, i32, i32)> = HashSet::default();
         let main_window = self.main_window();
+        // Collect window space assignments to update after the loop (avoids
+        // borrow checker issues with the iterator closures).
+        let mut space_updates: Vec<(WindowId, SpaceId)> = Vec::new();
 
         for wid in self
             .visible_windows
@@ -1444,6 +1452,13 @@ impl Reactor {
             }
             seen_frames.insert(frame_key);
             app_windows.entry(space).or_default().push((wid, layout_info));
+            // Record which space this window is on to prevent reshaping windows
+            // on inactive spaces.
+            space_updates.push((wid, space));
+        }
+        // Apply space updates after the iterator loop completes.
+        for (wid, space) in space_updates {
+            self.window_spaces.insert(wid, space);
         }
         let screens = self.screens.clone();
         for screen in screens {
@@ -1675,6 +1690,10 @@ impl Reactor {
         trace!(?main_window);
         let mut anim = Animation::new();
         let mut targets = BTreeMap::new();
+        // Collect active spaces to verify window membership before applying frames.
+        // This prevents accidentally reshaping windows on inactive desktop spaces.
+        let active_spaces: HashSet<SpaceId> =
+            self.screens.iter().filter_map(|s| s.space).collect();
         for &screen in &self.screens {
             let Some(space) = screen.space else { continue };
             if !skip_anim {
@@ -1714,6 +1733,15 @@ impl Reactor {
                 // TODO: A pending frame override for this window is dropped
                 // here rather than deferred to mouse up.
                 continue;
+            }
+            // Verify this window is on an active space before applying the frame.
+            // This prevents accidentally reshaping windows on different desktop
+            // spaces (e.g., when frame_monotonic is stale after a space change).
+            if let Some(&window_space) = self.window_spaces.get(&wid) {
+                if !active_spaces.contains(&window_space) {
+                    trace!(?wid, ?window_space, "Skipping window on inactive space");
+                    continue;
+                }
             }
             let Some(window) = self.windows.get_mut(&wid) else {
                 // If we restored a saved state the window may not be available yet.
