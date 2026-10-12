@@ -1598,6 +1598,28 @@ impl Reactor {
             return;
         }
 
+        // Filter out windows on inactive spaces to prevent raises from switching
+        // the user back to a previous space when rapidly switching desktops.
+        let active_spaces: HashSet<SpaceId> =
+            self.screens.iter().filter_map(|s| s.space).collect();
+        let raise_windows: Vec<_> = raise_windows
+            .into_iter()
+            .filter(|wid| {
+                self.window_spaces
+                    .get(wid)
+                    .is_none_or(|space| active_spaces.contains(space))
+            })
+            .collect();
+        let focus_window = focus_window.filter(|wid| {
+            self.window_spaces
+                .get(wid)
+                .is_none_or(|space| active_spaces.contains(space))
+        });
+
+        if raise_windows.is_empty() && focus_window.is_none() {
+            return;
+        }
+
         let mut app_handles = HashMap::default();
         for &wid in raise_windows.iter().chain(&focus_window) {
             if let Some(app) = self.apps.get(&wid.pid) {
