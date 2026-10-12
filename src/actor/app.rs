@@ -1214,9 +1214,12 @@ impl State {
 
     fn id(&self, elem: &AXUIElement) -> Result<WindowId, accessibility::Error> {
         if let Ok(id) = WindowServerId::try_from(elem) {
+            let Some(idx) = NonZeroU32::new(id.as_u32()) else {
+                return Err(accessibility::Error::NotFound);
+            };
             let wid = WindowId {
                 pid: self.pid,
-                idx: NonZeroU32::new(id.as_u32()).expect("Window server id was 0"),
+                idx,
             };
             if self.windows.contains_key(&wid) {
                 return Ok(wid);
