@@ -660,11 +660,8 @@ impl Reactor {
                 self.in_drag = false;
                 self.resizing_window = None;
                 // Clean up hidden_windows tracking for this window.
-                if let Some(wsid) = self
-                    .window_ids
-                    .iter()
-                    .find(|(_, w)| **w == wid)
-                    .map(|(wsid, _)| *wsid)
+                if let Some(wsid) =
+                    self.window_ids.iter().find(|(_, w)| **w == wid).map(|(wsid, _)| *wsid)
                 {
                     self.hidden_windows.remove(&wsid);
                 }
@@ -1317,10 +1314,7 @@ impl Reactor {
         // with Cmd+W). The window server might still show them as visible, but
         // we should not include them in the layout.
         self.visible_windows.extend(
-            on_screen
-                .visible
-                .into_iter()
-                .filter(|wsid| !self.hidden_windows.contains(wsid)),
+            on_screen.visible.into_iter().filter(|wsid| !self.hidden_windows.contains(wsid)),
         );
         self.window_server_info
             .extend(on_screen.info.into_iter().map(|info| (info.id, info)));
@@ -1600,20 +1594,15 @@ impl Reactor {
 
         // Filter out windows on inactive spaces to prevent raises from switching
         // the user back to a previous space when rapidly switching desktops.
-        let active_spaces: HashSet<SpaceId> =
-            self.screens.iter().filter_map(|s| s.space).collect();
+        let active_spaces: HashSet<SpaceId> = self.screens.iter().filter_map(|s| s.space).collect();
         let raise_windows: Vec<_> = raise_windows
             .into_iter()
             .filter(|wid| {
-                self.window_spaces
-                    .get(wid)
-                    .is_none_or(|space| active_spaces.contains(space))
+                self.window_spaces.get(wid).is_none_or(|space| active_spaces.contains(space))
             })
             .collect();
         let focus_window = focus_window.filter(|wid| {
-            self.window_spaces
-                .get(wid)
-                .is_none_or(|space| active_spaces.contains(space))
+            self.window_spaces.get(wid).is_none_or(|space| active_spaces.contains(space))
         });
 
         if raise_windows.is_empty() && focus_window.is_none() {
@@ -1714,8 +1703,7 @@ impl Reactor {
         let mut targets = BTreeMap::new();
         // Collect active spaces to verify window membership before applying frames.
         // This prevents accidentally reshaping windows on inactive desktop spaces.
-        let active_spaces: HashSet<SpaceId> =
-            self.screens.iter().filter_map(|s| s.space).collect();
+        let active_spaces: HashSet<SpaceId> = self.screens.iter().filter_map(|s| s.space).collect();
         for &screen in &self.screens {
             let Some(space) = screen.space else { continue };
             if !skip_anim {
@@ -2298,9 +2286,9 @@ pub mod tests {
         let mut apps = Apps::new();
         let mut reactor = Reactor::new_for_test(LayoutManager::new_for_test());
         let full_screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
-        let ws_info = (1..=2)
+        let ws_info = (1..=2_u32)
             .map(|id| WindowServerInfo {
-                id: WindowServerId::new(id),
+                id: test_window_server_id(1, id),
                 pid: 1,
                 layer: 0,
                 frame: CGRect::ZERO,
@@ -3464,14 +3452,14 @@ pub mod tests {
         reactor.raise_manager_tx = raise_manager_tx;
 
         // Another process has keyboard focus, as when Spotlight is open.
-        reactor.handle_event(MouseMovedOverWindow(WindowServerId::new(2), Some(2)));
+        reactor.handle_event(MouseMovedOverWindow(test_window_server_id(1, 2), Some(2)));
         assert!(
             raise_manager_rx.try_recv().is_err(),
             "mouse move should be ignored while another process has keyboard focus"
         );
 
         // The main window's app has keyboard focus.
-        reactor.handle_event(MouseMovedOverWindow(WindowServerId::new(2), Some(1)));
+        reactor.handle_event(MouseMovedOverWindow(test_window_server_id(1, 2), Some(1)));
         let event = raise_manager_rx
             .try_recv()
             .expect("mouse move should produce a raise request")
@@ -3482,7 +3470,7 @@ pub mod tests {
         assert_eq!(focus_window.map(|(wid, _)| wid), Some(WindowId::new(1, 2)));
 
         // The key focus process could not be read.
-        reactor.handle_event(MouseMovedOverWindow(WindowServerId::new(1), None));
+        reactor.handle_event(MouseMovedOverWindow(test_window_server_id(1, 1), None));
         assert!(
             raise_manager_rx.try_recv().is_ok(),
             "mouse move should be followed when the key focus process is unknown"

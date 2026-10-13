@@ -288,6 +288,8 @@ focus_left = "alt+h"
 focus_right = "alt+l"
 focus_up = "alt+k"
 focus_down = "alt+j"
+# Held modifiers that pause focus-follows-mouse while pressed
+pause_focus_follows_mouse = "cmd"
 
 # Per-app rules - apps that should always float
 [[app_rules]]
@@ -325,6 +327,7 @@ sugarglider config update --watch
 | `general.show_menu_bar_icon` | bool | `true` | Show menu bar icon |
 | `general.enable_animations` | bool | `true` | Animate window transitions |
 | `focus.focus_follows_mouse` | bool | `false` | Focus window under cursor |
+| `hotkeys.pause_focus_follows_mouse` | modifiers | `cmd` | Pause focus-follows-mouse while held |
 | `focus.mouse_follows_focus` | bool | `false` | Move cursor to focused window |
 | `gaps.outer` | int | `8` | Gap from screen edges (px) |
 | `gaps.inner` | int | `8` | Gap between windows (px) |

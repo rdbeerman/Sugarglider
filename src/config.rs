@@ -15,14 +15,14 @@ use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use livesplit_hotkey::Hotkey;
+use livesplit_hotkey::{Hotkey, Modifiers};
 use macro_rules_attribute::derive;
 use partial::{PartialConfig, ValidationError};
 use regex::{Regex, RegexBuilder};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::actor::wm_controller::WmCommand;
+use crate::actor::wm_controller::{WmCmd, WmCommand};
 use crate::model::LayoutKind;
 
 pub fn data_dir() -> PathBuf {
@@ -60,6 +60,14 @@ pub struct Config {
     pub settings: Settings,
     pub window_rules: Vec<WindowRule>,
     pub keys: Vec<(Hotkey, WmCommand)>,
+    /// Modifier-only bindings of the `pause_focus_follows_mouse` command.
+    /// While any of these modifier sets is held, the Mouse actor pauses
+    /// focus-follows-mouse. Kept separate from `keys` because these are not
+    /// chords and must not be registered with the global hotkey hook.
+    /// Defaults to Cmd unless other bindings are present or the binding is
+    /// explicitly disabled.
+    #[serde(default)]
+    pub pause_focus_follows_mouse: Vec<Modifiers>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -397,12 +405,34 @@ impl ConfigPartial {
 
     fn validate(self) -> Result<Config, SpannedError> {
         let mut keys = Vec::new();
+        let mut pause_focus_follows_mouse = Vec::new();
+        let mut pause_default_suppressed = false;
         for (key, cmd) in self.keys.unwrap_or_default() {
             let cmd = match cmd {
                 WmCommandOrDisable::WmCommand(wm_command) => wm_command,
-                WmCommandOrDisable::Disable(_) => continue,
+                WmCommandOrDisable::Disable(_) => {
+                    // A disable on a modifier-only key string suppresses the
+                    // implicit Cmd pause binding.
+                    if parse_pause_modifiers(&key).is_some() {
+                        pause_default_suppressed = true;
+                    }
+                    continue;
+                }
             };
-            let Ok(key) = Hotkey::from_str(&key) else {
+            if matches!(cmd, WmCommand::Wm(WmCmd::PauseFocusFollowsMouse)) {
+                let Some(modifiers) = parse_pause_modifiers(&key) else {
+                    return Err(SpannedError {
+                        message: format!(
+                            "pause_focus_follows_mouse must be bound to modifier keys \
+                             (Ctrl, Alt, Shift, Cmd) only: {key}"
+                        ),
+                        span: None,
+                    });
+                };
+                pause_focus_follows_mouse.push(modifiers);
+                continue;
+            }
+            let Ok(key) = parse_chord(&key) else {
                 return Err(SpannedError {
                     message: format!("Could not parse hotkey: {key}"),
                     span: None,
@@ -410,10 +440,18 @@ impl ConfigPartial {
             };
             keys.push((key, cmd));
         }
+        // Unlike chord bindings, the pause binding defaults to Cmd even when
+        // the config's keys section excludes default bindings; otherwise an
+        // existing keys section from an older config file would silently drop
+        // the feature. Use `"Cmd" = "disable"` to turn it off.
+        if pause_focus_follows_mouse.is_empty() && !pause_default_suppressed {
+            pause_focus_follows_mouse.push(Modifiers::META);
+        }
         Ok(Config {
             settings: self.settings.validate()?,
             window_rules: self.window_rules.unwrap_or_default(),
             keys,
+            pause_focus_follows_mouse,
         })
     }
 
@@ -434,7 +472,48 @@ impl ConfigPartial {
     }
 }
 
+/// Parse a hotkey chord string like "Alt + Shift + E", accepting Cmd,
+/// Command, and Super as aliases for Meta (the ⌘ modifier).
+fn parse_chord(s: &str) -> Result<Hotkey, ()> {
+    let parts: Vec<String> = s
+        .split('+')
+        .map(str::trim)
+        .map(|part| match part.to_ascii_lowercase().as_str() {
+            "cmd" | "command" | "super" | "meta" => "Meta".to_string(),
+            _ => part.to_string(),
+        })
+        .collect();
+    Hotkey::from_str(&parts.join(" + ")).map_err(|_| ())
+}
+
+/// Parse a modifier-only binding string like "Cmd + Shift" into the set of
+/// modifiers that must be held together.
+fn parse_pause_modifiers(s: &str) -> Option<Modifiers> {
+    let mut modifiers = Modifiers::empty();
+    for part in s.split('+') {
+        match part.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => modifiers.insert(Modifiers::CONTROL),
+            "alt" | "option" => modifiers.insert(Modifiers::ALT),
+            "shift" => modifiers.insert(Modifiers::SHIFT),
+            "cmd" | "command" | "super" | "meta" => modifiers.insert(Modifiers::META),
+            _ => return None,
+        }
+    }
+    (!modifiers.is_empty()).then_some(modifiers)
+}
+
 impl Config {
+    /// The flag sets that pause focus-follows-mouse while held. Returns
+    /// [`core_graphics::event::CGEventFlags`] values to test against mouse
+    /// and modifier events.
+    pub fn focus_pause_modifiers(
+        &self,
+    ) -> impl Iterator<Item = core_graphics::event::CGEventFlags> + '_ {
+        self.pause_focus_follows_mouse
+            .iter()
+            .map(|mods| crate::sys::event::flags_for(*mods))
+    }
+
     pub fn load(custom_path: Option<&Path>) -> anyhow::Result<Config> {
         let mut buf = String::new();
         let (mut file, path) = match custom_path {
@@ -465,7 +544,7 @@ impl Config {
         ConfigPartial::default().validate().unwrap()
     }
 
-    fn parse(buf: &str) -> Result<Self, SpannedError> {
+    pub(crate) fn parse(buf: &str) -> Result<Self, SpannedError> {
         let c: ConfigPartial = toml::from_str(buf)?;
         let defaults = ConfigPartial::default();
         ConfigPartial::merge(defaults, c).validate()
@@ -491,7 +570,7 @@ fn format_toml_error(error: SpannedError, input: &str, path: &Path) -> String {
 }
 
 #[derive(Debug)]
-struct SpannedError {
+pub(crate) struct SpannedError {
     message: String,
     span: Option<Range<usize>>,
 }
@@ -619,13 +698,42 @@ pub fn write_preferences_to_file(
             }
         }
 
+        // The pause_focus_follows_mouse binding lives outside `keys` (it is a
+        // held modifier set, not a chord), so add its serialization directly.
+        let pause_cmd = WmCommand::Wm(WmCmd::PauseFocusFollowsMouse);
+        let (_, _, pause_command_id) =
+            crate::ui::preferences_json::describe_command_for_toml(&pause_cmd);
+        if let Ok(serialized) = serde_json::to_string(&pause_cmd) {
+            command_serializations.insert(pause_command_id.clone(), serialized);
+        }
+
         for hk in &prefs.hotkeys {
+            let is_pause_binding = hk.command_id == pause_command_id;
+
             // Convert macOS symbol format to TOML key format
-            let toml_key = macos_symbols_to_toml_key(&hk.key);
+            let Ok(toml_key) = (|| -> anyhow::Result<String> {
+                if is_pause_binding {
+                    macos_symbols_to_toml_modifiers(&hk.key)
+                } else {
+                    Ok(macos_symbols_to_toml_key(&hk.key))
+                }
+            })() else {
+                tracing::warn!(
+                    "Skipping invalid hotkey format for {}: '{}'",
+                    hk.command_id,
+                    hk.key
+                );
+                continue;
+            };
 
             // Validate that the hotkey can actually be parsed before writing.
             // This prevents writing invalid keys that will fail to load on restart.
-            if Hotkey::from_str(&toml_key).is_err() {
+            let valid = if is_pause_binding {
+                parse_pause_modifiers(&toml_key).is_some()
+            } else {
+                parse_chord(&toml_key).is_ok()
+            };
+            if !valid {
                 tracing::warn!(
                     "Skipping invalid hotkey format for {}: '{}' (converted from '{}')",
                     hk.command_id,
@@ -649,6 +757,14 @@ pub fn write_preferences_to_file(
                     hk.key
                 );
             }
+        }
+
+        // If the pause binding was disabled in the loaded config, persist the
+        // disable so the implicit Cmd default isn't re-applied on reload.
+        if !prefs.hotkeys.iter().any(|hk| hk.command_id == pause_command_id)
+            && current_config.pause_focus_follows_mouse.is_empty()
+        {
+            keys_table["Cmd"] = value("disable");
         }
 
         if !keys_table.is_empty() {
@@ -728,6 +844,25 @@ fn macos_symbols_to_toml_key(s: &str) -> String {
     parts.join(" + ")
 }
 
+/// Convert a modifier-only macOS symbol string (⌃⌥) to TOML key format
+/// (Ctrl + Alt), for the pause_focus_follows_mouse binding.
+fn macos_symbols_to_toml_modifiers(s: &str) -> anyhow::Result<String> {
+    let mut modifiers = Vec::new();
+    for c in s.chars() {
+        match c {
+            '⌃' => modifiers.push("Ctrl"),
+            '⌥' => modifiers.push("Alt"),
+            '⇧' => modifiers.push("Shift"),
+            '⌘' => modifiers.push("Cmd"),
+            _ => anyhow::bail!("modifier-only binding contains a key: {s}"),
+        }
+    }
+    if modifiers.is_empty() {
+        anyhow::bail!("modifier-only binding has no modifiers: {s}");
+    }
+    Ok(modifiers.join(" + "))
+}
+
 /// Convert a JSON value to a TOML value.
 fn json_to_toml_value(json: &serde_json::Value) -> toml_edit::Item {
     use toml_edit::{Item, Value, value};
@@ -776,6 +911,59 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         Config::default();
+    }
+
+    #[test]
+    fn pause_focus_follows_mouse_defaults_to_cmd() {
+        let config = Config::default();
+        assert_eq!(config.pause_focus_follows_mouse, vec![Modifiers::META]);
+        // It must not also be registered as a chord.
+        assert!(
+            config
+                .keys
+                .iter()
+                .all(|(_, cmd)| !matches!(cmd, WmCommand::Wm(WmCmd::PauseFocusFollowsMouse)))
+        );
+    }
+
+    #[test]
+    fn pause_focus_follows_mouse_accepts_modifier_aliases() {
+        let config =
+            Config::parse("[keys]\n\"Cmd + Shift\" = \"pause_focus_follows_mouse\"").unwrap();
+        assert_eq!(
+            config.pause_focus_follows_mouse,
+            vec![Modifiers::META | Modifiers::SHIFT]
+        );
+    }
+
+    #[test]
+    fn pause_focus_follows_mouse_rejects_plain_keys() {
+        let err =
+            Config::parse("[keys]\n\"Alt + KeyG\" = \"pause_focus_follows_mouse\"").unwrap_err();
+        assert!(err.message.contains("modifier keys"), "{}", err.message);
+    }
+
+    #[test]
+    fn pause_focus_follows_mouse_defaults_even_without_default_keys() {
+        // A config with its own keys section (which excludes the default
+        // chord bindings) still gets the implicit Cmd pause binding.
+        let config = Config::parse("[keys]\n\"Alt + KeyZ\" = \"toggle_global_enabled\"").unwrap();
+        assert_eq!(config.pause_focus_follows_mouse, vec![Modifiers::META]);
+    }
+
+    #[test]
+    fn cmd_is_an_alias_for_meta_in_chords() {
+        let config =
+            Config::parse("[settings]\ndefault_keys = false\n[keys]\n\"Cmd + E\" = \"ascend\"")
+                .unwrap();
+        let (hotkey, _) = &config.keys[0];
+        assert_eq!(hotkey.modifiers, Modifiers::META);
+    }
+
+    #[test]
+    fn disable_removes_pause_focus_follows_mouse_binding() {
+        let config = Config::parse("[keys]\n\"Cmd\" = \"disable\"").unwrap();
+        assert!(config.pause_focus_follows_mouse.is_empty());
     }
 
     #[test]
@@ -1221,6 +1409,19 @@ mod tests {
         assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥/")).is_ok());
         assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥=")).is_ok());
         assert!(Hotkey::from_str(&macos_symbols_to_toml_key("⌥Space")).is_ok());
+    }
+
+    #[test]
+    fn macos_symbols_to_toml_modifiers_requires_only_modifiers() {
+        assert_eq!(macos_symbols_to_toml_modifiers("⌘").unwrap(), "Cmd");
+        assert_eq!(macos_symbols_to_toml_modifiers("⌃⌥").unwrap(), "Ctrl + Alt");
+        assert!(macos_symbols_to_toml_modifiers("⌥H").is_err());
+        assert!(macos_symbols_to_toml_modifiers("").is_err());
+        // Converted modifiers should be parseable by the loader.
+        assert_eq!(
+            parse_pause_modifiers(&macos_symbols_to_toml_modifiers("⌃⌘").unwrap()),
+            Some(Modifiers::CONTROL | Modifiers::META)
+        );
     }
 
     #[test]

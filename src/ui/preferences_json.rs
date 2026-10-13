@@ -8,7 +8,7 @@
 
 use std::str::FromStr;
 
-use livesplit_hotkey::Hotkey;
+use livesplit_hotkey::{Hotkey, Modifiers};
 use serde::{Deserialize, Serialize};
 
 use crate::actor::layout::{LayoutCommand, SizeShare};
@@ -114,6 +114,23 @@ impl PreferencesJson {
                     })
                     .collect();
 
+                // pause_focus_follows_mouse bindings are held modifier sets,
+                // stored separately from the chord bindings in `keys`.
+                let pause_cmd = WmCommand::Wm(WmCmd::PauseFocusFollowsMouse);
+                let (description, category, command_id, sort_order) = describe_command(&pause_cmd);
+                let default_pause_key =
+                    default_config.pause_focus_follows_mouse.first().map(format_modifiers);
+                hotkeys.extend(config.pause_focus_follows_mouse.iter().map(|modifiers| {
+                    HotkeyBindingJson {
+                        key: format_modifiers(modifiers),
+                        command_id: command_id.clone(),
+                        description: description.clone(),
+                        category: category.clone(),
+                        default_key: default_pause_key.clone(),
+                        sort_order,
+                    }
+                }));
+
                 // Sort by category, then by sort_order within each category
                 hotkeys.sort_by(|a, b| {
                     a.category.cmp(&b.category).then_with(|| a.sort_order.cmp(&b.sort_order))
@@ -149,7 +166,37 @@ impl PreferencesJson {
         // Build new keys from hotkeys, matching by command_id
         let keys = self.build_keys_from_hotkeys(config);
 
-        Config { settings, window_rules, keys }
+        // Rebuild the held-modifier pause bindings from the hotkeys list. If
+        // the list has no such row, the binding was disabled at load time, so
+        // keep the (empty) original.
+        let pause_command_id = describe_command(&WmCommand::Wm(WmCmd::PauseFocusFollowsMouse)).2;
+        let pause_focus_follows_mouse =
+            if !self.hotkeys.iter().any(|hk| hk.command_id == pause_command_id) {
+                config.pause_focus_follows_mouse.clone()
+            } else {
+                self.hotkeys
+                    .iter()
+                    .filter(|hk| hk.command_id == pause_command_id)
+                    .filter_map(|hk| {
+                        let modifiers = parse_modifiers_symbol_string(&hk.key);
+                        if modifiers.is_none() {
+                            tracing::warn!(
+                                "Invalid modifier-only binding '{}' for command '{}', dropping",
+                                hk.key,
+                                hk.command_id
+                            );
+                        }
+                        modifiers
+                    })
+                    .collect()
+            };
+
+        Config {
+            settings,
+            window_rules,
+            keys,
+            pause_focus_follows_mouse,
+        }
     }
 
     /// Build the keys vector from hotkeys JSON, using original commands from config.
@@ -175,6 +222,14 @@ impl PreferencesJson {
         self.hotkeys
             .iter()
             .filter_map(|hk| {
+                // pause_focus_follows_mouse is handled separately; it is a
+                // held modifier set, not a chord.
+                if hk.command_id
+                    == describe_command(&WmCommand::Wm(WmCmd::PauseFocusFollowsMouse)).2
+                {
+                    return None;
+                }
+
                 // Get the original command for this command_id
                 let Some(cmd) = command_map.get(&hk.command_id) else {
                     tracing::warn!(
@@ -199,6 +254,40 @@ impl PreferencesJson {
             })
             .collect()
     }
+}
+
+/// Format a modifier-only binding (e.g. META → "⌘").
+fn format_modifiers(modifiers: &Modifiers) -> String {
+    let mut result = String::new();
+    if modifiers.contains(Modifiers::CONTROL) {
+        result.push('⌃');
+    }
+    if modifiers.contains(Modifiers::ALT) {
+        result.push('⌥');
+    }
+    if modifiers.contains(Modifiers::SHIFT) {
+        result.push('⇧');
+    }
+    if modifiers.contains(Modifiers::META) {
+        result.push('⌘');
+    }
+    result
+}
+
+/// Parse a modifier-only binding string (e.g. "⌃⌘") back to a modifier set.
+/// Any non-modifier character makes the binding invalid.
+fn parse_modifiers_symbol_string(s: &str) -> Option<Modifiers> {
+    let mut modifiers = Modifiers::empty();
+    for c in s.chars() {
+        match c {
+            '⌃' => modifiers.insert(Modifiers::CONTROL),
+            '⌥' => modifiers.insert(Modifiers::ALT),
+            '⇧' => modifiers.insert(Modifiers::SHIFT),
+            '⌘' => modifiers.insert(Modifiers::META),
+            _ => return None,
+        }
+    }
+    (!modifiers.is_empty()).then_some(modifiers)
 }
 
 /// Parse a macOS-style hotkey string (e.g., "⌥⇧H") back to a livesplit Hotkey.
@@ -344,7 +433,7 @@ fn format_hotkey(hotkey: &Hotkey) -> String {
     if s.contains("Shift") {
         result.push('⇧');
     }
-    if s.contains("Cmd") || s.contains("Super") {
+    if s.contains("Cmd") || s.contains("Super") || s.contains("Meta") {
         result.push('⌘');
     }
 
@@ -389,6 +478,12 @@ pub fn describe_command_for_toml(cmd: &WmCommand) -> (String, String, String) {
 fn describe_command(cmd: &WmCommand) -> (String, String, String, u32) {
     match cmd {
         WmCommand::Wm(wm_cmd) => match wm_cmd {
+            WmCmd::PauseFocusFollowsMouse => (
+                "Pause focus-follows-mouse while held".to_string(),
+                "Focus".to_string(),
+                "pause_focus_follows_mouse".to_string(),
+                30,
+            ),
             WmCmd::ToggleGlobalEnabled => (
                 "Toggle tiling globally".to_string(),
                 "System".to_string(),
@@ -660,6 +755,84 @@ fn group_mode_name(orientation: &Orientation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pause_focus_binding_shows_in_hotkeys_and_roundtrips() {
+        let config = Config::default();
+        let prefs = PreferencesJson::from_config(&config);
+
+        let pause_bindings: Vec<_> = prefs
+            .hotkeys
+            .iter()
+            .filter(|hk| hk.command_id == "pause_focus_follows_mouse")
+            .collect();
+        assert_eq!(pause_bindings.len(), 1);
+        let pause = pause_bindings[0];
+        assert_eq!(pause.key, "⌘");
+        assert_eq!(pause.category, "Focus");
+        assert_eq!(pause.default_key.as_deref(), Some("⌘"));
+
+        // Applying the preferences back preserves the binding as held
+        // modifiers, and never as a chord.
+        let applied = prefs.apply_to_config(&config);
+        assert_eq!(applied.pause_focus_follows_mouse, vec![Modifiers::META]);
+        assert!(
+            applied
+                .keys
+                .iter()
+                .all(|(_, cmd)| !matches!(cmd, WmCommand::Wm(WmCmd::PauseFocusFollowsMouse)))
+        );
+
+        // A re-recorded binding survives the roundtrip too.
+        let mut prefs = prefs;
+        prefs
+            .hotkeys
+            .iter_mut()
+            .find(|hk| hk.command_id == "pause_focus_follows_mouse")
+            .unwrap()
+            .key = "⌃⌥".to_string();
+        let applied = prefs.apply_to_config(&config);
+        assert_eq!(
+            applied.pause_focus_follows_mouse,
+            vec![Modifiers::CONTROL | Modifiers::ALT]
+        );
+    }
+
+    #[test]
+    fn parse_modifiers_symbol_string_requires_only_modifiers() {
+        assert_eq!(
+            parse_modifiers_symbol_string("⌃⌘"),
+            Some(Modifiers::CONTROL | Modifiers::META)
+        );
+        assert_eq!(parse_modifiers_symbol_string("⌥H"), None);
+        assert_eq!(parse_modifiers_symbol_string(""), None);
+    }
+
+    #[test]
+    fn disabled_pause_binding_survives_preferences_apply() {
+        let mut base = Config::default();
+        base.pause_focus_follows_mouse.clear(); // as produced by `"Cmd" = "disable"`
+        assert!(base.pause_focus_follows_mouse.is_empty());
+        let mut prefs = PreferencesJson::from_config(&base);
+        // No pause row is offered when the binding is disabled.
+        assert!(!prefs.hotkeys.iter().any(|hk| hk.command_id == "pause_focus_follows_mouse"));
+        // Applying preferences must not resurrect the implicit default.
+        let applied = prefs.apply_to_config(&base);
+        assert!(applied.pause_focus_follows_mouse.is_empty());
+        // Re-recording a binding for it re-enables the pause.
+        let (description, category, command_id, sort_order) =
+            describe_command(&WmCommand::Wm(WmCmd::PauseFocusFollowsMouse));
+        prefs.hotkeys.push(HotkeyBindingJson {
+            key: "⌘".to_string(),
+            command_id,
+            description,
+            category,
+            default_key: None,
+            sort_order,
+        });
+        let applied = prefs.apply_to_config(&base);
+        assert_eq!(applied.pause_focus_follows_mouse, vec![Modifiers::META]);
+    }
 
     #[test]
     fn test_preferences_json_roundtrip() {

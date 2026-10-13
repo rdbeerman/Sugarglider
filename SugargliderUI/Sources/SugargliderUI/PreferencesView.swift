@@ -266,6 +266,7 @@ struct HotkeyRow: View {
             HotkeyButton(
                 currentKey: binding.key,
                 isRecording: isRecording,
+                allowsModifierOnly: binding.isHeldModifierBinding,
                 onStartRecording: onStartRecording,
                 onStopRecording: onStopRecording,
                 onHotkeyChange: onHotkeyChange
@@ -280,6 +281,9 @@ struct HotkeyRow: View {
 struct HotkeyButton: View {
     let currentKey: String
     let isRecording: Bool
+    /// When true, the binding is a held modifier set: the recorder accepts
+    /// modifier keys only and commits when all modifiers are released.
+    let allowsModifierOnly: Bool
     let onStartRecording: () -> Void
     let onStopRecording: () -> Void
     let onHotkeyChange: (String) -> Void
@@ -292,7 +296,9 @@ struct HotkeyButton: View {
                 onStartRecording()
             }
         }) {
-            Text(isRecording ? "Press keys..." : currentKey)
+            Text(isRecording
+                ? (allowsModifierOnly ? "Press modifiers..." : "Press keys...")
+                : currentKey)
                 .font(.system(.body, design: .monospaced))
                 .foregroundColor(isRecording ? .accentColor : .secondary)
                 .padding(.horizontal, 8)
@@ -313,6 +319,7 @@ struct HotkeyButton: View {
         .background(
             HotkeyRecorderView(
                 isRecording: isRecording,
+                allowsModifierOnly: allowsModifierOnly,
                 onHotkeyRecorded: onHotkeyChange,
                 onCancel: onStopRecording
             )
@@ -323,8 +330,17 @@ struct HotkeyButton: View {
 /// NSViewRepresentable that captures keyboard events for hotkey recording
 struct HotkeyRecorderView: NSViewRepresentable {
     let isRecording: Bool
+    let allowsModifierOnly: Bool
     let onHotkeyRecorded: (String) -> Void
     let onCancel: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    final class Coordinator {
+        var wasRecording = false
+    }
 
     func makeNSView(context: Context) -> HotkeyRecorderNSView {
         let view = HotkeyRecorderNSView()
@@ -336,11 +352,19 @@ struct HotkeyRecorderView: NSViewRepresentable {
     func updateNSView(_ nsView: HotkeyRecorderNSView, context: Context) {
         nsView.onHotkeyRecorded = onHotkeyRecorded
         nsView.onCancel = onCancel
+        nsView.allowsModifierOnly = allowsModifierOnly
+        nsView.isRecording = isRecording
         if isRecording {
+            if !context.coordinator.wasRecording {
+                context.coordinator.wasRecording = true
+                nsView.resetModifierCapture()
+            }
             // Delay to allow the button click to complete
             DispatchQueue.main.async {
                 nsView.window?.makeFirstResponder(nsView)
             }
+        } else {
+            context.coordinator.wasRecording = false
         }
     }
 }
@@ -350,7 +374,36 @@ class HotkeyRecorderNSView: NSView {
     var onHotkeyRecorded: ((String) -> Void)?
     var onCancel: (() -> Void)?
 
+    /// When true, only modifier keys are recorded; the modifiers pressed
+    /// during one press-and-release cycle are committed as a binding.
+    var allowsModifierOnly = false
+    var isRecording = false
+    private var recordedModifiers: NSEvent.ModifierFlags = []
+
     override var acceptsFirstResponder: Bool { true }
+
+    func resetModifierCapture() {
+        recordedModifiers = []
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        guard allowsModifierOnly, isRecording else {
+            super.flagsChanged(with: event)
+            return
+        }
+
+        let modifiers = event.modifierFlags.intersection([.control, .option, .shift, .command])
+        if modifiers.isEmpty {
+            // All modifiers released; commit what was held.
+            if !recordedModifiers.isEmpty {
+                let hotkey = Self.formatModifiers(recordedModifiers)
+                recordedModifiers = []
+                onHotkeyRecorded?(hotkey)
+            }
+        } else {
+            recordedModifiers.formUnion(modifiers)
+        }
+    }
 
     override func keyDown(with event: NSEvent) {
         // Escape cancels recording
@@ -359,11 +412,34 @@ class HotkeyRecorderNSView: NSView {
             return
         }
 
+        // Plain keys are meaningless for a held-modifier binding.
+        if allowsModifierOnly {
+            return
+        }
+
         // Build the hotkey string
         let hotkey = formatHotkey(event: event)
         if !hotkey.isEmpty {
             onHotkeyRecorded?(hotkey)
         }
+    }
+
+    /// Format a modifier-only binding, e.g. [.control, .command] → "⌃⌘".
+    static func formatModifiers(_ flags: NSEvent.ModifierFlags) -> String {
+        var result = ""
+        if flags.contains(.control) {
+            result += "⌃"
+        }
+        if flags.contains(.option) {
+            result += "⌥"
+        }
+        if flags.contains(.shift) {
+            result += "⇧"
+        }
+        if flags.contains(.command) {
+            result += "⌘"
+        }
+        return result
     }
 
     private func formatHotkey(event: NSEvent) -> String {

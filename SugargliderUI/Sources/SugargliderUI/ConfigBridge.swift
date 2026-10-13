@@ -81,6 +81,14 @@ public struct HotkeyBinding: Codable, Identifiable, Equatable {
         return key != defaultKey
     }
 
+    /// The command whose binding is a held modifier set rather than a chord
+    public static let heldModifierCommandId = "pause_focus_follows_mouse"
+
+    /// Whether this binding records modifier keys only (held while pressed)
+    public var isHeldModifierBinding: Bool {
+        commandId == Self.heldModifierCommandId
+    }
+
     public init(key: String, commandId: String, description: String, category: String, defaultKey: String? = nil) {
         self.key = key
         self.commandId = commandId

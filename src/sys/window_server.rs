@@ -60,6 +60,11 @@ impl TryFrom<&AXUIElement> for WindowServerId {
         if let Some(err) = accessibility::AXError::from_raw(res) {
             return Err(accessibility::Error::Ax(err));
         }
+        if id == 0 {
+            return Err(accessibility::Error::Ax(
+                accessibility::AXError::InvalidUIElement,
+            ));
+        }
         Ok(WindowServerId(id))
     }
 }

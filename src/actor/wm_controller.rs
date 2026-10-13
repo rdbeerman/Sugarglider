@@ -59,6 +59,9 @@ pub enum WmCmd {
     SetGlobalEnabled(bool),
     ToggleSpaceActivated,
     Exec(ExecCmd),
+    /// Pauses focus-follows-mouse while the bound modifier keys are held.
+    /// Handled by the Mouse actor; never dispatched as an event.
+    PauseFocusFollowsMouse,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -212,6 +215,10 @@ impl WmController {
             }
             Command(Wm(Exec(cmd))) => {
                 self.exec_cmd(cmd);
+            }
+            Command(Wm(PauseFocusFollowsMouse)) => {
+                // This binding is only meaningful while held, which the Mouse
+                // actor detects itself via modifier flags on mouse events.
             }
             Command(ReactorCommand(cmd)) => {
                 self.sm_tx.send(space_manager::Event::ReactorCommand(cmd));

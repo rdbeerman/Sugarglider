@@ -80,7 +80,7 @@ pub fn make_window(idx: usize) -> WindowInfo {
             CGPoint::new(100.0 * f64::from(idx as u32), 100.0),
             CGSize::new(50.0, 50.0),
         ),
-        // TODO: This is wrong and conflicts with windows from other apps.
+        // Note: sys_id is replaced in make_app_impl to ensure uniqueness across apps
         sys_id: Some(WindowServerId::new(idx as u32)),
         ax_role: String::new(),
         ax_subrole: None,
@@ -89,6 +89,13 @@ pub fn make_window(idx: usize) -> WindowInfo {
 
 pub fn make_windows(count: usize) -> Vec<WindowInfo> {
     (1..=count).map(make_window).collect()
+}
+
+/// Generate a unique WindowServerId for testing. Uses the same formula as
+/// `Apps::make_app_impl` to ensure consistency when tests manually create
+/// `WindowServerInfo` that must match app windows.
+pub fn test_window_server_id(pid: pid_t, window_idx: u32) -> WindowServerId {
+    WindowServerId::new(((pid as u32) << 16) | window_idx)
 }
 
 pub struct Apps {
@@ -158,6 +165,17 @@ impl Apps {
         is_frontmost: bool,
         with_ws_info: bool,
     ) -> Vec<Event> {
+        // Fix sys_ids to be unique across apps by incorporating PID
+        let windows: Vec<WindowInfo> = windows
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut w)| {
+                // Use a combination of PID and window index for unique IDs across apps
+                w.sys_id = Some(WindowServerId::new(((pid as u32) << 16) | (i as u32 + 1)));
+                w
+            })
+            .collect();
+
         for (id, info) in (1..).map(|idx| WindowId::new(pid, idx)).zip(&windows) {
             self.windows.insert(
                 id,
@@ -298,8 +316,16 @@ impl Apps {
                         None,
                     ));
                 }
-                Request::Raise(..) => todo!(),
-                Request::WindowDestroyed(..) => todo!(),
+                Request::Raise(wids, _token, sequence_id, _quiet) => {
+                    // Simulate immediate raise completion for each window
+                    for wid in wids {
+                        events.push(Event::RaiseCompleted { window_id: wid, sequence_id });
+                    }
+                }
+                Request::WindowDestroyed(wid) => {
+                    // Remove the window from test state
+                    self.windows.remove(&wid);
+                }
             }
         }
         debug!(?events);

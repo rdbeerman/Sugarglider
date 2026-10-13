@@ -777,7 +777,8 @@ impl State {
                 }
             }
             kAXTitleChangedNotification => {
-                // TODO
+                // Title changes are informational only; no action needed for window management
+                trace!("Title changed");
             }
             _ => {
                 error!("Unhandled notification {notif:?} on {elem:#?}");
@@ -1217,10 +1218,7 @@ impl State {
             let Some(idx) = NonZeroU32::new(id.as_u32()) else {
                 return Err(accessibility::Error::NotFound);
             };
-            let wid = WindowId {
-                pid: self.pid,
-                idx,
-            };
+            let wid = WindowId { pid: self.pid, idx };
             if self.windows.contains_key(&wid) {
                 return Ok(wid);
             }

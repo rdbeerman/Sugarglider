@@ -48,6 +48,9 @@ struct State {
     above_window_level: NSWindowLevel,
     converter: CoordinateConverter,
     screens: Vec<CGRect>,
+    /// Whether a pause_focus_follows_mouse binding was held as of the last
+    /// modifier-key event.
+    pause_mods_held: bool,
 }
 
 pub type Sender = actor::Sender<Request>;
@@ -68,7 +71,9 @@ impl Mouse {
         let this = Rc::new(self);
 
         let events = vec![
-            // Any event we want the mouse to be shown for, plus scroll events.
+            // Any event we want the mouse to be shown for, plus scroll events,
+            // plus modifier key changes (to detect a held
+            // pause_focus_follows_mouse binding being released).
             CGEventType::LeftMouseDown,
             CGEventType::LeftMouseUp,
             CGEventType::RightMouseDown,
@@ -77,6 +82,7 @@ impl Mouse {
             CGEventType::LeftMouseDragged,
             CGEventType::RightMouseDragged,
             CGEventType::ScrollWheel,
+            CGEventType::FlagsChanged,
         ];
         let this_ = Rc::clone(&this);
         let current = CFRunLoop::get_current();
@@ -158,7 +164,10 @@ impl Mouse {
     fn on_event(self: &Rc<Self>, event_type: CGEventType, event: &CGEvent, mtm: MainThreadMarker) {
         let mut state = self.state.borrow_mut();
         let is_scroll = matches!(event_type, CGEventType::ScrollWheel);
-        if !is_scroll && state.hide_count > 0 {
+        // Modifier key changes shouldn't reveal a hidden mouse any more than
+        // typing does.
+        let keeps_mouse_hidden = is_scroll || matches!(event_type, CGEventType::FlagsChanged);
+        if !keeps_mouse_hidden && state.hide_count > 0 {
             debug!("Showing mouse");
             state.show_mouse();
         }
@@ -180,9 +189,35 @@ impl Mouse {
                 let loc = event.location();
                 #[cfg(false)]
                 tracing::trace!("Mouse moved {loc:?}");
+                let flags = event.get_flags();
+                if self.config.borrow().focus_pause_modifiers().any(|mods| flags.contains(mods)) {
+                    // A pause_focus_follows_mouse binding is held. Don't even
+                    // update which window the mouse is above, so that focus
+                    // follows as soon as the binding is released and the mouse
+                    // moves again.
+                    return;
+                }
                 if let Some(wsid) = state.track_mouse_move(loc.to_icrate(), mtm) {
                     let key_focus_pid = window_server::get_key_focus_pid();
                     self.events_tx.send(Event::MouseMovedOverWindow(wsid, key_focus_pid));
+                }
+            }
+            CGEventType::FlagsChanged => {
+                let config = self.config.borrow();
+                let flags = event.get_flags();
+                let held = config.focus_pause_modifiers().any(|mods| flags.contains(mods));
+                let was_held = replace(&mut state.pause_mods_held, held);
+                // When a held pause binding is released, resume
+                // focus-follows-mouse for whatever window the mouse is above.
+                // The mouse must actually have moved over a different window
+                // during the pause for this to change focus.
+                if was_held && !held && config.settings.focus_follows_mouse {
+                    if let Some(loc) = crate::sys::event::get_mouse_pos(state.converter) {
+                        if let Some(wsid) = state.track_mouse_move(loc, mtm) {
+                            let key_focus_pid = window_server::get_key_focus_pid();
+                            self.events_tx.send(Event::MouseMovedOverWindow(wsid, key_focus_pid));
+                        }
+                    }
                 }
             }
             CGEventType::ScrollWheel => {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use core_graphics::base::CGError;
+use core_graphics::event::CGEventFlags;
 use livesplit_hotkey::{ConsumePreference, Hook};
 pub use livesplit_hotkey::{Hotkey, KeyCode, Modifiers};
 use objc2_app_kit::NSEvent;
@@ -49,6 +50,25 @@ impl HotkeyManager {
 pub enum MouseState {
     Down,
     Up,
+}
+
+/// The [`CGEventFlags`] bits corresponding to a set of modifiers, for
+/// checking whether they are currently held against an event's flags.
+pub fn flags_for(modifiers: Modifiers) -> CGEventFlags {
+    let mut flags = CGEventFlags::empty();
+    if modifiers.contains(Modifiers::CONTROL) {
+        flags |= CGEventFlags::CGEventFlagControl;
+    }
+    if modifiers.contains(Modifiers::ALT) {
+        flags |= CGEventFlags::CGEventFlagAlternate;
+    }
+    if modifiers.contains(Modifiers::META) {
+        flags |= CGEventFlags::CGEventFlagCommand;
+    }
+    if modifiers.contains(Modifiers::SHIFT) {
+        flags |= CGEventFlags::CGEventFlagShift;
+    }
+    flags
 }
 
 pub fn get_mouse_state() -> MouseState {

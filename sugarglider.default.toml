@@ -96,6 +96,13 @@ default_keys = false
 # Clean up the current space by re-tiling all windows.
 "Alt + Shift + C" = "clean_up_space"
 
+# Pause focus-follows-mouse while the modifiers are held. This binding must
+# consist only of modifier keys (Ctrl, Alt/Option, Shift, Cmd), since the
+# pause lasts exactly as long as the keys are held. Unlike the bindings above,
+# this one stays active (as Cmd) even if you have your own keys section that
+# excludes the defaults; set "Cmd" = "disable" to turn it off.
+"Cmd" = "pause_focus_follows_mouse"
+
 # Focus the window in the specified direction.
 "Ctrl + Alt + Shift + ArrowLeft" = { move_focus = "left" }
 "Ctrl + Alt + Shift + ArrowDown" = { move_focus = "down" }
