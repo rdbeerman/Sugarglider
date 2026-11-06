@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::mem::replace;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
 use core_graphics::event::{
@@ -20,6 +21,7 @@ use crate::config::Config;
 use crate::sys::event;
 use crate::sys::geometry::{CGRectExt, ToICrate};
 use crate::sys::screen::CoordinateConverter;
+use crate::sys::timer::Timer;
 use crate::sys::window_server::{self, WindowServerId, get_window};
 use crate::{actor, trace_call};
 
@@ -41,6 +43,12 @@ pub struct Mouse {
     state: RefCell<State>,
 }
 
+/// Pending focus request with the delay duration.
+struct PendingFocus {
+    window_id: WindowServerId,
+    delay: Duration,
+}
+
 #[derive(Default)]
 struct State {
     hide_count: u32,
@@ -51,6 +59,11 @@ struct State {
     /// Whether a pause_focus_follows_mouse binding was held as of the last
     /// modifier-key event.
     pause_mods_held: bool,
+    /// Pending focus-follows-mouse request waiting to be processed by the run loop.
+    /// When set, the run loop will start a timer and send the focus event when it expires.
+    pending_focus_request: Option<PendingFocus>,
+    /// The window ID we're currently waiting to focus (after timer started).
+    waiting_to_focus: Option<WindowServerId>,
 }
 
 pub type Sender = actor::Sender<Request>;
@@ -112,8 +125,43 @@ impl Mouse {
 
         this.apply_config();
 
-        while let Some((_span, request)) = requests_rx.recv().await {
-            this.on_request(request);
+        let mut focus_delay_timer = Timer::manual();
+
+        loop {
+            // Check for new pending focus requests
+            {
+                let mut state = this.state.borrow_mut();
+                if let Some(pending) = state.pending_focus_request.take() {
+                    debug!(
+                        "Starting focus delay timer for {:?}ms on window {:?}",
+                        pending.delay.as_millis(),
+                        pending.window_id
+                    );
+                    state.waiting_to_focus = Some(pending.window_id);
+                    drop(state); // Release borrow before setting timer
+                    focus_delay_timer.set_next_fire(pending.delay);
+                }
+            }
+
+            tokio::select! {
+                Some((_span, request)) = requests_rx.recv() => {
+                    this.on_request(request);
+                }
+                _ = focus_delay_timer.next() => {
+                    // Timer fired - send pending focus event if still valid
+                    let mut state = this.state.borrow_mut();
+                    if let Some(wsid) = state.waiting_to_focus.take() {
+                        debug!("Focus delay timer fired for window {wsid:?}");
+                        // Only send if we're still over the same window
+                        if state.above_window == Some(wsid) {
+                            let key_focus_pid = window_server::get_key_focus_pid();
+                            drop(state); // Release borrow before sending
+                            this.events_tx.send(Event::MouseMovedOverWindow(wsid, key_focus_pid));
+                        }
+                    }
+                }
+                else => break,
+            }
         }
     }
 
@@ -189,17 +237,38 @@ impl Mouse {
                 let loc = event.location();
                 #[cfg(false)]
                 tracing::trace!("Mouse moved {loc:?}");
+                let config = self.config.borrow();
                 let flags = event.get_flags();
-                if self.config.borrow().focus_pause_modifiers().any(|mods| flags.contains(mods)) {
+                if config.focus_pause_modifiers().any(|mods| flags.contains(mods)) {
                     // A pause_focus_follows_mouse binding is held. Don't even
                     // update which window the mouse is above, so that focus
                     // follows as soon as the binding is released and the mouse
-                    // moves again.
+                    // moves again. Cancel any pending focus.
+                    state.pending_focus_request = None;
+                    state.waiting_to_focus = None;
                     return;
                 }
+                let delay_ms = config.settings.focus_follows_mouse_delay_ms;
+                drop(config); // Release borrow
                 if let Some(wsid) = state.track_mouse_move(loc.to_icrate(), mtm) {
                     let key_focus_pid = window_server::get_key_focus_pid();
-                    self.events_tx.send(Event::MouseMovedOverWindow(wsid, key_focus_pid));
+                    if delay_ms == 0 {
+                        // No delay - send immediately
+                        state.pending_focus_request = None;
+                        state.waiting_to_focus = None;
+                        drop(state); // Release borrow before sending
+                        self.events_tx.send(Event::MouseMovedOverWindow(wsid, key_focus_pid));
+                    } else {
+                        // Set up delayed focus - the run loop will pick this up and start the timer
+                        state.pending_focus_request = Some(PendingFocus {
+                            window_id: wsid,
+                            delay: Duration::from_millis(delay_ms),
+                        });
+                        state.waiting_to_focus = None; // Cancel any existing timer
+                    }
+                } else {
+                    // Mouse moved but still over the same window or invalid window
+                    // Keep any pending focus unchanged
                 }
             }
             CGEventType::FlagsChanged => {
@@ -212,10 +281,23 @@ impl Mouse {
                 // The mouse must actually have moved over a different window
                 // during the pause for this to change focus.
                 if was_held && !held && config.settings.focus_follows_mouse {
+                    let delay_ms = config.settings.focus_follows_mouse_delay_ms;
+                    drop(config); // Release borrow
                     if let Some(loc) = crate::sys::event::get_mouse_pos(state.converter) {
                         if let Some(wsid) = state.track_mouse_move(loc, mtm) {
-                            let key_focus_pid = window_server::get_key_focus_pid();
-                            self.events_tx.send(Event::MouseMovedOverWindow(wsid, key_focus_pid));
+                            if delay_ms == 0 {
+                                let key_focus_pid = window_server::get_key_focus_pid();
+                                state.pending_focus_request = None;
+                                state.waiting_to_focus = None;
+                                drop(state);
+                                self.events_tx.send(Event::MouseMovedOverWindow(wsid, key_focus_pid));
+                            } else {
+                                state.pending_focus_request = Some(PendingFocus {
+                                    window_id: wsid,
+                                    delay: Duration::from_millis(delay_ms),
+                                });
+                                state.waiting_to_focus = None;
+                            }
                         }
                     }
                 }

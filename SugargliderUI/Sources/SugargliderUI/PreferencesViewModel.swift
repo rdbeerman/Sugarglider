@@ -46,6 +46,7 @@ public class PreferencesViewModel: ObservableObject {
     @Published public var showMenuBarIcon: Bool = true
     @Published public var enableAnimations: Bool = true
     @Published public var focusFollowsMouse: Bool = false
+    @Published public var focusFollowsMouseDelayMs: Double = 0
     @Published public var mouseFollowsFocus: Bool = false
     @Published public var outerGap: Double = 0
     @Published public var innerGap: Double = 0
@@ -138,6 +139,7 @@ public class PreferencesViewModel: ObservableObject {
         showMenuBarIcon = config.statusIconEnable
         enableAnimations = config.animate
         focusFollowsMouse = config.focusFollowsMouse
+        focusFollowsMouseDelayMs = Double(config.focusFollowsMouseDelayMs)
         mouseFollowsFocus = config.mouseFollowsFocus
         outerGap = config.outerGap
         innerGap = config.innerGap
@@ -174,6 +176,7 @@ public class PreferencesViewModel: ObservableObject {
             $showMenuBarIcon.map { _ in () }.eraseToAnyPublisher(),
             $enableAnimations.map { _ in () }.eraseToAnyPublisher(),
             $focusFollowsMouse.map { _ in () }.eraseToAnyPublisher(),
+            $focusFollowsMouseDelayMs.map { _ in () }.eraseToAnyPublisher(),
             $mouseFollowsFocus.map { _ in () }.eraseToAnyPublisher(),
             $outerGap.map { _ in () }.eraseToAnyPublisher(),
             $innerGap.map { _ in () }.eraseToAnyPublisher(),
@@ -215,6 +218,7 @@ public class PreferencesViewModel: ObservableObject {
             statusIconEnable: showMenuBarIcon,
             animate: enableAnimations,
             focusFollowsMouse: focusFollowsMouse,
+            focusFollowsMouseDelayMs: UInt64(focusFollowsMouseDelayMs),
             mouseFollowsFocus: mouseFollowsFocus,
             outerGap: outerGap,
             innerGap: innerGap,

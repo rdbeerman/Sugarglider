@@ -13,6 +13,10 @@ default_disable = false
 # Focus the window under the mouse as it moves.
 focus_follows_mouse = true
 
+# Delay in milliseconds before focus follows mouse activates.
+# Set to 0 for instant focus switching.
+focus_follows_mouse_delay_ms = 0
+
 # Move the mouse to the middle of the window each time the focus changes.
 mouse_follows_focus = true
 
