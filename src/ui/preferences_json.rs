@@ -28,6 +28,7 @@ pub struct PreferencesJson {
     pub status_icon_enable: bool,
     pub animate: bool,
     pub focus_follows_mouse: bool,
+    pub focus_follows_mouse_delay_ms: u64,
     pub mouse_follows_focus: bool,
     pub outer_gap: f64,
     pub inner_gap: f64,
@@ -82,6 +83,7 @@ impl PreferencesJson {
             status_icon_enable: settings.status_icon.enable,
             animate: settings.animate,
             focus_follows_mouse: settings.focus_follows_mouse,
+            focus_follows_mouse_delay_ms: settings.focus_follows_mouse_delay_ms,
             mouse_follows_focus: settings.mouse_follows_focus,
             outer_gap: settings.outer_gap,
             inner_gap: settings.inner_gap,
@@ -150,6 +152,7 @@ impl PreferencesJson {
         settings.status_icon.enable = self.status_icon_enable;
         settings.animate = self.animate;
         settings.focus_follows_mouse = self.focus_follows_mouse;
+        settings.focus_follows_mouse_delay_ms = self.focus_follows_mouse_delay_ms;
         settings.mouse_follows_focus = self.mouse_follows_focus;
         settings.outer_gap = self.outer_gap;
         settings.inner_gap = self.inner_gap;
@@ -840,6 +843,7 @@ mod tests {
             status_icon_enable: true,
             animate: false,
             focus_follows_mouse: true,
+            focus_follows_mouse_delay_ms: 100,
             mouse_follows_focus: false,
             outer_gap: 10.0,
             inner_gap: 5.0,

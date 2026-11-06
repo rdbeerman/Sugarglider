@@ -82,6 +82,18 @@ struct GeneralPane: View {
 
             Section("Focus Behavior") {
                 Toggle("Focus follows mouse", isOn: $viewModel.focusFollowsMouse)
+                if viewModel.focusFollowsMouse {
+                    HStack {
+                        Text("Focus delay:")
+                        Slider(value: $viewModel.focusFollowsMouseDelayMs, in: 0...1000, step: 50)
+                            .onChange(of: viewModel.focusFollowsMouseDelayMs) { newValue in
+                                viewModel.focusFollowsMouseDelayMs = (newValue / 50).rounded() * 50
+                            }
+                        Text("\(Int(viewModel.focusFollowsMouseDelayMs))ms")
+                            .monospacedDigit()
+                            .frame(width: 55)
+                    }
+                }
                 Toggle("Mouse follows focus", isOn: $viewModel.mouseFollowsFocus)
             }
 

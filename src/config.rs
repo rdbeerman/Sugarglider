@@ -102,6 +102,8 @@ pub struct Settings {
     pub mouse_follows_focus: bool,
     pub mouse_hides_on_focus: bool,
     pub focus_follows_mouse: bool,
+    /// Delay in milliseconds before focus follows mouse activates.
+    pub focus_follows_mouse_delay_ms: u64,
     pub outer_gap: f64,
     pub inner_gap: f64,
     pub default_keys: bool,
@@ -625,6 +627,7 @@ pub fn write_preferences_to_file(
     // Update settings
     doc["settings"]["animate"] = value(prefs.animate);
     doc["settings"]["focus_follows_mouse"] = value(prefs.focus_follows_mouse);
+    doc["settings"]["focus_follows_mouse_delay_ms"] = value(prefs.focus_follows_mouse_delay_ms as i64);
     doc["settings"]["mouse_follows_focus"] = value(prefs.mouse_follows_focus);
     doc["settings"]["outer_gap"] = value(prefs.outer_gap);
     doc["settings"]["inner_gap"] = value(prefs.inner_gap);

@@ -12,6 +12,7 @@ public struct PreferencesConfig: Codable {
     public var statusIconEnable: Bool
     public var animate: Bool
     public var focusFollowsMouse: Bool
+    public var focusFollowsMouseDelayMs: UInt64
     public var mouseFollowsFocus: Bool
     public var outerGap: Double
     public var innerGap: Double
@@ -33,6 +34,7 @@ public struct PreferencesConfig: Codable {
         statusIconEnable: Bool = true,
         animate: Bool = true,
         focusFollowsMouse: Bool = false,
+        focusFollowsMouseDelayMs: UInt64 = 0,
         mouseFollowsFocus: Bool = false,
         outerGap: Double = 0,
         innerGap: Double = 0,
@@ -45,6 +47,7 @@ public struct PreferencesConfig: Codable {
         self.statusIconEnable = statusIconEnable
         self.animate = animate
         self.focusFollowsMouse = focusFollowsMouse
+        self.focusFollowsMouseDelayMs = focusFollowsMouseDelayMs
         self.mouseFollowsFocus = mouseFollowsFocus
         self.outerGap = outerGap
         self.innerGap = innerGap
@@ -75,6 +78,9 @@ public struct HotkeyBinding: Codable, Identifiable, Equatable {
     /// The default hotkey for this command (if any)
     public var defaultKey: String?
 
+    /// Sort order within the category (lower = earlier)
+    public var sortOrder: UInt32
+
     /// Whether this hotkey differs from its default
     public var isModified: Bool {
         guard let defaultKey = defaultKey else { return false }
@@ -89,12 +95,13 @@ public struct HotkeyBinding: Codable, Identifiable, Equatable {
         commandId == Self.heldModifierCommandId
     }
 
-    public init(key: String, commandId: String, description: String, category: String, defaultKey: String? = nil) {
+    public init(key: String, commandId: String, description: String, category: String, defaultKey: String? = nil, sortOrder: UInt32 = 0) {
         self.key = key
         self.commandId = commandId
         self.description = description
         self.category = category
         self.defaultKey = defaultKey
+        self.sortOrder = sortOrder
     }
 }
 
