@@ -84,7 +84,7 @@ impl MainWindowTracker {
             | Event::WindowDestroyed(..)
             | Event::WindowFrameChanged(..)
             | Event::ScreenParametersChanged { .. }
-            | Event::SpaceChanged(..)
+            | Event::SpaceChanged { .. }
             | Event::MouseUp
             | Event::MouseMovedOverWindow(..)
             | Event::RaiseCompleted { .. }
@@ -155,6 +155,7 @@ mod tests {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
 
+            space_positions: vec![],
             converter: CoordinateConverter::default(),
             scale_factors: vec![2.0],
             on_screen: Default::default(),
@@ -218,6 +219,7 @@ mod tests {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
 
+            space_positions: vec![],
             converter: CoordinateConverter::default(),
             scale_factors: vec![2.0],
             on_screen: Default::default(),
@@ -287,6 +289,7 @@ mod tests {
             frames: vec![CGRect::new(CGPoint::ZERO, CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
 
+            space_positions: vec![],
             converter: CoordinateConverter::default(),
             scale_factors: vec![2.0],
             on_screen: Default::default(),
@@ -334,6 +337,7 @@ mod tests {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
 
+            space_positions: vec![],
             converter: CoordinateConverter::default(),
             scale_factors: vec![2.0],
             on_screen: Default::default(),
@@ -346,7 +350,11 @@ mod tests {
             false,
         ));
 
-        reactor.handle_event(SpaceChanged(vec![None], WindowsOnScreen::new(vec![])));
+        reactor.handle_event(SpaceChanged {
+            spaces: vec![None],
+            space_positions: vec![],
+            on_screen: WindowsOnScreen::new(vec![]),
+        });
         reactor.handle_event(ApplicationActivated(3, Quiet::No));
         reactor.handle_event(ApplicationGloballyActivated(3));
         reactor.handle_event(WindowsDiscovered {
@@ -356,7 +364,11 @@ mod tests {
         });
         assert_eq!(Some(WindowId::new(3, 1)), reactor.main_window());
 
-        reactor.handle_event(SpaceChanged(vec![Some(space)], WindowsOnScreen::new(vec![])));
+        reactor.handle_event(SpaceChanged {
+            spaces: vec![Some(space)],
+            space_positions: vec![],
+            on_screen: WindowsOnScreen::new(vec![]),
+        });
         assert_eq!(reactor.layout.selected_window(space), Some(WindowId::new(3, 1)));
     }
 }

@@ -39,6 +39,7 @@ fn canonical_serialized() -> String {
     reactor.handle_event(Event::ScreenParametersChanged {
         frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
         spaces: vec![Some(SpaceId::new(1))],
+        space_positions: vec![],
         scale_factors: vec![2.0],
         converter: CoordinateConverter::default(),
         on_screen: Default::default(),

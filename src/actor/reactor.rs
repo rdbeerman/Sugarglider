@@ -46,7 +46,7 @@ use crate::model::NodeId;
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
 use crate::sys::geometry::{CGRectDef, CGRectExt, SameAs, round_to_physical};
-use crate::sys::screen::{CoordinateConverter, SpaceId};
+use crate::sys::screen::{CoordinateConverter, SpaceId, SpacePosition};
 use crate::sys::timer::Timer;
 use crate::sys::window_server::{WindowServerId, WindowServerInfo, WindowsOnScreen};
 use crate::ui::swift_bridge;
@@ -72,6 +72,7 @@ pub enum Event {
         #[serde_as(as = "Vec<CGRectDef>")]
         frames: Vec<CGRect>,
         spaces: Vec<Option<SpaceId>>,
+        space_positions: Vec<Option<(SpaceId, SpacePosition)>>,
         scale_factors: Vec<f64>,
         converter: CoordinateConverter,
         on_screen: WindowsOnScreen,
@@ -83,6 +84,10 @@ pub enum Event {
     /// event. `None` in the SpaceId vec disables managing windows on that
     /// screen until the next space change.
     ///
+    /// `space_positions` contains the logical position of each space within its
+    /// display, used to detect macOS space ID reassignments (same logical space,
+    /// different ID) vs genuine space switches.
+    ///
     /// WindowsOnScreen is included to avoid doing two updates in rapid
     /// succession. If there are windows we know were destroyed in the new
     /// space we'll start rearranging things, only to do so again if we
@@ -92,7 +97,11 @@ pub enum Event {
     /// of SpaceId to window list, and Reactor would maintain a list per
     /// space. Then we can update the windows on screen for the space before
     /// sending SpaceChanged.
-    SpaceChanged(Vec<Option<SpaceId>>, WindowsOnScreen),
+    SpaceChanged {
+        spaces: Vec<Option<SpaceId>>,
+        space_positions: Vec<Option<(SpaceId, SpacePosition)>>,
+        on_screen: WindowsOnScreen,
+    },
 
     /// All running apps at launch have been registered.
     StartupComplete,
@@ -289,6 +298,10 @@ pub struct Reactor {
     /// window server reports them. This handles Cmd+W closing where the window
     /// is hidden rather than destroyed.
     hidden_windows: HashSet<WindowServerId>,
+    /// Previous space positions for each screen, used to detect ID reassignments
+    /// vs. genuine space switches. When macOS reassigns space IDs (e.g., after
+    /// display reconnection), the position stays the same but the ID changes.
+    prev_space_positions: Vec<Option<(SpaceId, SpacePosition)>>,
 }
 
 /// How many times in a row we write the same frame to a window before giving
@@ -487,6 +500,7 @@ impl Reactor {
             debug_drop_zones_visible: false,
             startup_complete: false,
             hidden_windows: HashSet::default(),
+            prev_space_positions: Vec::new(),
         }
     }
 
@@ -634,9 +648,42 @@ impl Reactor {
             Event::WindowBecameVisible(wid) => {
                 if self.window_is_tracked(wid)
                     && let Some(window) = self.windows.get(&wid)
+                    // Only add the window if it's visible on the current space.
+                    // This prevents adding "ghost" windows when a window is created
+                    // on one space but the user switches to another space before
+                    // the WindowBecameVisible event is processed.
+                    && window
+                        .window_server_id
+                        .is_some_and(|wsid| self.visible_windows.contains(&wsid))
                     && let Some(space) = self.best_space_for_window(&window.frame_monotonic)
                     && let Some(info) = self.layout_window_info(wid)
                 {
+                    // Validation: check if visible_windows count for this app matches
+                    // the number of tracked windows. A mismatch suggests the window
+                    // server may be returning transitional data.
+                    let visible_for_app = self
+                        .visible_windows
+                        .iter()
+                        .filter(|wsid| {
+                            self.window_ids
+                                .get(wsid)
+                                .is_some_and(|w| w.pid == wid.pid && self.windows.contains_key(w))
+                        })
+                        .count();
+                    let tracked_for_app = self
+                        .windows
+                        .keys()
+                        .filter(|w| w.pid == wid.pid)
+                        .count();
+                    if visible_for_app != tracked_for_app {
+                        warn!(
+                            pid = wid.pid,
+                            visible_for_app,
+                            tracked_for_app,
+                            "WindowBecameVisible: count mismatch, possible transitional state"
+                        );
+                    }
+
                     // Check if there's already a visible window from the same app
                     // with the same frame (indicating this is a tab). If so, don't
                     // add - let the existing window represent this position.
@@ -875,6 +922,7 @@ impl Reactor {
             Event::ScreenParametersChanged {
                 frames,
                 spaces,
+                space_positions,
                 converter,
                 scale_factors,
                 on_screen,
@@ -911,6 +959,8 @@ impl Reactor {
                     }
                 }
                 self.update_active_screen();
+                // Initialize position tracking for detecting space ID reassignments
+                self.prev_space_positions = space_positions;
                 // FIXME: Update visible windows if space changed.
                 // Forward the event to group_indicators. We serialize these
                 // through the reactor instead of delivering directly from
@@ -919,7 +969,7 @@ impl Reactor {
                 self.group_indicators_tx
                     .send(group_bars::Event::ScreenParametersChanged(spaces, converter));
             }
-            Event::SpaceChanged(spaces, on_screen) => {
+            Event::SpaceChanged { spaces, space_positions, on_screen } => {
                 let visible_window_order = on_screen.visible.clone();
                 self.update_complete_window_server_info(on_screen);
                 if spaces.len() != self.screens.len() {
@@ -933,7 +983,36 @@ impl Reactor {
                 self.layout.cancel_interactive_state();
                 self.in_drag = false;
                 self.resizing_window = None;
-                info!("space changed");
+
+                // Detect space ID reassignments: same position, different ID.
+                // This happens when macOS reassigns space IDs (e.g., after display reconnection).
+                for (screen_idx, (old, new)) in self
+                    .prev_space_positions
+                    .iter()
+                    .zip(&space_positions)
+                    .enumerate()
+                {
+                    if let (Some((old_id, old_pos)), Some((new_id, new_pos))) = (old, new) {
+                        if old_pos == new_pos && old_id != new_id {
+                            info!(
+                                screen = screen_idx,
+                                ?old_id,
+                                ?new_id,
+                                ?old_pos,
+                                "Detected space ID reassignment, transferring layout"
+                            );
+                            self.layout.transfer_space_layout(*old_id, *new_id);
+                        }
+                    }
+                }
+
+                // Update stored positions for next comparison
+                self.prev_space_positions = space_positions;
+
+                // Log space changes for diagnostics
+                let old_spaces: Vec<Option<SpaceId>> =
+                    self.screens.iter().map(|s| s.space).collect();
+                info!(?old_spaces, new_spaces = ?spaces, "space changed");
                 for (space, screen) in spaces.iter().zip(&mut self.screens) {
                     screen.space = *space;
                 }
@@ -1416,15 +1495,23 @@ impl Reactor {
         // borrow checker issues with the iterator closures).
         let mut space_updates: Vec<(WindowId, SpaceId)> = Vec::new();
 
-        for wid in self
-            .visible_windows
-            .iter()
-            .flat_map(|wsid| self.window_ids.get(wsid).copied())
-            .filter(|wid| wid.pid == pid)
-            .filter(|wid| self.window_is_tracked(*wid))
-        {
+        for wsid in self.visible_windows.iter().copied().collect::<Vec<_>>() {
+            let Some(wid) = self.window_ids.get(&wsid).copied() else { continue };
+            if wid.pid != pid || !self.window_is_tracked(wid) {
+                continue;
+            }
             let Some(window) = self.windows.get(&wid) else { continue };
-            let Some(space) = self.best_space_for_window(&window.frame_monotonic) else {
+            // Use the current window server frame to determine which space the window
+            // belongs to. This prevents assigning windows to wrong spaces during space
+            // transitions, when windows from other spaces may briefly appear in
+            // visible_windows but at off-screen positions while being animated away.
+            // Fall back to frame_monotonic if window server info is not available.
+            let frame_for_space = self
+                .window_server_info
+                .get(&wsid)
+                .map(|info| &info.frame)
+                .unwrap_or(&window.frame_monotonic);
+            let Some(space) = self.best_space_for_window(frame_for_space) else {
                 continue;
             };
             let Some(layout_info) = self.layout_window_info(wid) else {
@@ -1454,6 +1541,29 @@ impl Reactor {
         for (wid, space) in space_updates {
             self.window_spaces.insert(wid, space);
         }
+
+        // Diagnostic logging: detect when layout will receive a different window
+        // count than what visible_windows has for this app. This helps diagnose
+        // race conditions where the window server returns transitional data.
+        let layout_window_count: usize = app_windows.values().map(|v| v.len()).sum();
+        let visible_count = self
+            .visible_windows
+            .iter()
+            .filter(|wsid| {
+                self.window_ids
+                    .get(wsid)
+                    .is_some_and(|wid| wid.pid == pid && self.window_is_tracked(*wid))
+            })
+            .count();
+        if layout_window_count != visible_count {
+            warn!(
+                pid,
+                layout_window_count,
+                visible_count,
+                "Window count mismatch: layout will receive different count than visible"
+            );
+        }
+
         let screens = self.screens.clone();
         for screen in screens {
             let Some(space) = screen.space else { continue };
@@ -1712,6 +1822,21 @@ impl Reactor {
             let (result, groups) =
                 self.layout.calculate_layout_and_groups(space, screen.frame, &self.config);
 
+            // Diagnostic logging: detect when layout calculates frames for windows
+            // that are not in reactor's tracking. This helps diagnose phantom windows.
+            let untracked_count = result
+                .iter()
+                .filter(|(wid, _)| !self.windows.contains_key(wid))
+                .count();
+            if untracked_count > 0 {
+                warn!(
+                    ?space,
+                    layout_count = result.len(),
+                    untracked_count,
+                    "Layout calculated frames for windows not in reactor tracking"
+                );
+            }
+
             self.group_indicators_tx
                 .send(group_bars::Event::GroupsUpdated { space_id: space, groups });
 
@@ -1915,6 +2040,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -1947,6 +2073,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -1977,6 +2104,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2033,6 +2161,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2065,6 +2194,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2104,6 +2234,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2147,6 +2278,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(SpaceId::new(1))],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2197,6 +2329,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(SpaceId::new(1))],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2220,6 +2353,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(SpaceId::new(1))],
+            space_positions: vec![],
             scale_factors: vec![1.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2266,6 +2400,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(SpaceId::new(1))],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2297,6 +2432,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![None],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2316,10 +2452,11 @@ pub mod tests {
         reactor.handle_event(Event::ApplicationGloballyActivated(1));
         reactor.handle_events(apps.simulate_events());
 
-        reactor.handle_event(Event::SpaceChanged(
-            vec![Some(SpaceId::new(1))],
-            WindowsOnScreen::new(ws_info),
-        ));
+        reactor.handle_event(Event::SpaceChanged {
+            spaces: vec![Some(SpaceId::new(1))],
+            space_positions: vec![],
+            on_screen: WindowsOnScreen::new(ws_info),
+        });
         reactor.handle_events(apps.simulate_events());
         assert_eq!(
             reactor.layout.selected_window(SpaceId::new(1)),
@@ -2337,6 +2474,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2348,6 +2486,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2365,6 +2504,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2384,6 +2524,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: WindowsOnScreen::new(on_screen),
@@ -2401,6 +2542,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2426,6 +2568,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: WindowsOnScreen::new(on_screen),
@@ -2443,6 +2586,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2468,6 +2612,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 900.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: WindowsOnScreen::new(on_screen),
@@ -2485,6 +2630,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2506,10 +2652,11 @@ pub mod tests {
                 frame: reactor.windows[wid].frame_monotonic,
             })
             .collect();
-        reactor.handle_event(Event::SpaceChanged(
-            vec![Some(space)],
-            WindowsOnScreen::new(on_screen),
-        ));
+        reactor.handle_event(Event::SpaceChanged {
+            spaces: vec![Some(space)],
+            space_positions: vec![],
+            on_screen: WindowsOnScreen::new(on_screen),
+        });
 
         assert!(raise_manager_rx.try_recv().is_err());
     }
@@ -2524,6 +2671,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2546,10 +2694,11 @@ pub mod tests {
                 frame: reactor.windows[wid].frame_monotonic,
             })
             .collect();
-        reactor.handle_event(Event::SpaceChanged(
-            vec![Some(space)],
-            WindowsOnScreen::new(on_screen),
-        ));
+        reactor.handle_event(Event::SpaceChanged {
+            spaces: vec![Some(space)],
+            space_positions: vec![],
+            on_screen: WindowsOnScreen::new(on_screen),
+        });
 
         assert!(raise_manager_rx.try_recv().is_err());
     }
@@ -2564,6 +2713,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2588,10 +2738,11 @@ pub mod tests {
             layer: 0,
             frame: reactor.windows[wid].frame_monotonic,
         }));
-        reactor.handle_event(Event::SpaceChanged(
-            vec![Some(space)],
-            WindowsOnScreen::new(on_screen),
-        ));
+        reactor.handle_event(Event::SpaceChanged {
+            spaces: vec![Some(space)],
+            space_positions: vec![],
+            on_screen: WindowsOnScreen::new(on_screen),
+        });
 
         let msg = raise_manager_rx.try_recv().expect("Should have sent an event").1;
         match msg {
@@ -2708,6 +2859,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2740,10 +2892,11 @@ pub mod tests {
             layer: 0,
             frame: reactor.windows[wid].frame_monotonic,
         }));
-        reactor.handle_event(Event::SpaceChanged(
-            vec![Some(space)],
-            WindowsOnScreen::new(on_screen),
-        ));
+        reactor.handle_event(Event::SpaceChanged {
+            spaces: vec![Some(space)],
+            space_positions: vec![],
+            on_screen: WindowsOnScreen::new(on_screen),
+        });
 
         assert!(raise_manager_rx.try_recv().is_err());
     }
@@ -2756,6 +2909,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![None],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2786,6 +2940,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen1, screen2],
             spaces: vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
+            space_positions: vec![],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2818,6 +2973,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen1, screen2],
             spaces: vec![Some(space1), Some(space2)],
+            space_positions: vec![],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2895,6 +3051,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen1, screen2],
             spaces: vec![Some(space1), Some(space2)],
+            space_positions: vec![],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -2946,6 +3103,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3022,6 +3180,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3088,6 +3247,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(SpaceId::new(1))],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3130,6 +3290,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen1, screen2],
             spaces: vec![Some(SpaceId::new(1)), Some(SpaceId::new(2))],
+            space_positions: vec![],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3215,6 +3376,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3242,6 +3404,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![CGRect::ZERO],
             spaces: vec![None],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3249,6 +3412,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3303,6 +3467,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(SpaceId::new(1))],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3325,6 +3490,7 @@ pub mod tests {
                 CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.)),
             ],
             spaces: vec![Some(SpaceId::new(1)), None],
+            space_positions: vec![],
             scale_factors: vec![2.0, 2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3360,6 +3526,7 @@ pub mod tests {
         reactor.handle_event(ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3393,6 +3560,7 @@ pub mod tests {
         reactor.handle_event(ScreenParametersChanged {
             frames: vec![CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.))],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3434,6 +3602,7 @@ pub mod tests {
         reactor.handle_event(ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3490,6 +3659,7 @@ pub mod tests {
         reactor1.handle_event(ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3514,6 +3684,7 @@ pub mod tests {
         reactor2.handle_event(ScreenParametersChanged {
             frames: vec![full_screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3559,6 +3730,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3584,6 +3756,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3715,6 +3888,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3763,6 +3937,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3810,6 +3985,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),
@@ -3866,6 +4042,7 @@ pub mod tests {
         reactor.handle_event(Event::ScreenParametersChanged {
             frames: vec![screen],
             spaces: vec![Some(space)],
+            space_positions: vec![],
             scale_factors: vec![2.0],
             converter: CoordinateConverter::default(),
             on_screen: Default::default(),

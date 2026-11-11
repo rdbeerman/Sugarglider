@@ -12,7 +12,7 @@ use std::time::Instant;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use redact::Secret;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::collections::{BTreeExt, BTreeSet, HashMap, HashSet};
@@ -623,6 +623,28 @@ impl LayoutManager {
         }
     }
 
+    /// Transfer layout from one space ID to another. This is used when macOS
+    /// reassigns space IDs (e.g., after display reconnection) to preserve
+    /// layouts instead of orphaning them.
+    pub fn transfer_space_layout(&mut self, from: SpaceId, to: SpaceId) {
+        if from == to {
+            return;
+        }
+        if let Some(mapping) = self.layout_mapping.remove(&from) {
+            info!(
+                ?from,
+                ?to,
+                "Transferring layout mapping from old space to new space"
+            );
+            // If there's already a mapping at `to`, we drop it in favor of the old one
+            // since the old one has the user's layout state.
+            if self.layout_mapping.contains_key(&to) {
+                warn!(?to, "Overwriting existing layout mapping at destination space");
+            }
+            self.layout_mapping.insert(to, mapping);
+        }
+    }
+
     fn convert_active_scroll_layouts_to_tree(&mut self) {
         for space in self.layout_mapping.keys().copied().collect::<Vec<_>>() {
             self.ensure_layout_kind_allowed_for_space(space);
@@ -758,6 +780,16 @@ impl LayoutManager {
             LayoutEvent::SpaceExposed(space, size) => {
                 self.debug_tree(space);
                 let kind = self.default_layout_kind;
+                let is_new_space = !self.layout_mapping.contains_key(&space);
+                if is_new_space {
+                    // Log existing space IDs to help diagnose layout orphaning
+                    let existing_spaces: Vec<_> = self.layout_mapping.keys().collect();
+                    info!(
+                        ?space,
+                        ?existing_spaces,
+                        "Creating new layout mapping for space"
+                    );
+                }
                 {
                     let mapping = self
                         .layout_mapping
