@@ -14,7 +14,7 @@ use crate::actor::wm_controller::WmEvent;
 use crate::actor::{group_bars, mouse, reactor, status, window_server, wm_controller};
 use crate::collections::HashSet;
 use crate::config::Config;
-use crate::sys::screen::{CoordinateConverter, ScreenId, SpaceId};
+use crate::sys::screen::{CoordinateConverter, ScreenId, SpaceId, SpacePosition};
 use crate::sys::window_server::WindowsOnScreen;
 
 #[derive(Debug)]
@@ -24,11 +24,16 @@ pub enum Event {
         screens: Vec<ScreenId>,
         frames: Vec<CGRect>,
         spaces: Vec<Option<SpaceId>>,
+        space_positions: Vec<Option<(SpaceId, SpacePosition)>>,
         scale_factors: Vec<f64>,
         converter: CoordinateConverter,
         on_screen: WindowsOnScreen,
     },
-    SpaceChanged(Vec<Option<SpaceId>>, WindowsOnScreen),
+    SpaceChanged {
+        spaces: Vec<Option<SpaceId>>,
+        space_positions: Vec<Option<(SpaceId, SpacePosition)>>,
+        on_screen: WindowsOnScreen,
+    },
     /// Forwarded directly to the reactor.
     ReactorEvent(reactor::Event),
 
@@ -42,6 +47,12 @@ pub enum Event {
     ExposeActive(bool),
     ReactorCommand(reactor::Command),
     ConfigUpdated(Arc<Config>),
+    /// Deferred window visibility check after window creation.
+    /// Gives the window server time to stabilize before querying.
+    DeferredWindowVisibilityCheck(crate::actor::app::WindowId),
+    /// Deferred visibility check for an app after main window change.
+    /// Gives the window server time to stabilize before querying.
+    DeferredVisibilityCheck(crate::actor::app::pid_t),
 }
 
 pub type Sender = crate::actor::Sender<Event>;
@@ -123,6 +134,7 @@ impl SpaceManager {
                 frames,
                 scale_factors,
                 spaces,
+                space_positions,
                 converter,
                 on_screen,
             } => {
@@ -131,6 +143,7 @@ impl SpaceManager {
                 self.reactor_tx.send(reactor::Event::ScreenParametersChanged {
                     frames: frames.clone(),
                     spaces: self.active_spaces(),
+                    space_positions,
                     converter,
                     scale_factors,
                     on_screen,
@@ -139,11 +152,14 @@ impl SpaceManager {
                 self.send_space_enabled_status();
                 self.mouse_tx.send(mouse::Request::ScreenParametersChanged(frames, converter));
             }
-            Event::SpaceChanged(spaces, on_screen) => {
+            Event::SpaceChanged { spaces, space_positions, on_screen } => {
                 self.handle_space_changed(&spaces);
                 if !self.expose_active {
-                    self.reactor_tx
-                        .send(reactor::Event::SpaceChanged(self.active_spaces(), on_screen));
+                    self.reactor_tx.send(reactor::Event::SpaceChanged {
+                        spaces: self.active_spaces(),
+                        space_positions,
+                        on_screen,
+                    });
                 }
                 self.status_tx.send(status::Event::SpaceChanged(spaces));
                 self.send_space_enabled_status();
@@ -199,6 +215,16 @@ impl SpaceManager {
                 self.send_hotkey_state();
                 self.send_space_enabled_status();
                 self.request_space_refresh();
+            }
+            Event::DeferredWindowVisibilityCheck(wid) => {
+                // Forward to window_server to perform the visibility check after
+                // the window server state has had time to stabilize.
+                self.ws_tx.send(window_server::Event::DeferredWindowVisibilityCheck(wid));
+            }
+            Event::DeferredVisibilityCheck(pid) => {
+                // Forward to window_server to perform the visibility check after
+                // the window server state has had time to stabilize.
+                self.ws_tx.send(window_server::Event::DeferredVisibilityCheck(pid));
             }
         }
     }
@@ -407,6 +433,7 @@ mod tests {
                 screens: vec![screen],
                 frames: vec![CGRect::ZERO],
                 spaces: vec![Some(space)],
+                space_positions: vec![],
                 scale_factors: vec![1.0],
                 converter: CoordinateConverter::default(),
                 on_screen: WindowsOnScreen::new(vec![]),
@@ -415,7 +442,11 @@ mod tests {
         }
 
         fn send_space_changed(&mut self, spaces: Vec<Option<SpaceId>>) {
-            self.on_event(Event::SpaceChanged(spaces, WindowsOnScreen::new(vec![])));
+            self.on_event(Event::SpaceChanged {
+                spaces,
+                space_positions: vec![],
+                on_screen: WindowsOnScreen::new(vec![]),
+            });
         }
 
         fn drain_all(&mut self) {
@@ -453,7 +484,7 @@ mod tests {
     /// Extract the spaces from a reactor SpaceChanged event.
     fn space_changed_spaces(events: &[reactor::Event]) -> Option<&Vec<Option<SpaceId>>> {
         events.iter().find_map(|e| match e {
-            reactor::Event::SpaceChanged(spaces, _) => Some(spaces),
+            reactor::Event::SpaceChanged { spaces, .. } => Some(spaces),
             _ => None,
         })
     }
@@ -517,6 +548,7 @@ mod tests {
             screens: vec![screen(1), screen(2)],
             frames: vec![CGRect::ZERO, CGRect::ZERO],
             spaces: vec![Some(space(10)), Some(space(20))],
+            space_positions: vec![],
             scale_factors: vec![1.0, 1.0],
             converter: CoordinateConverter::default(),
             on_screen: WindowsOnScreen::new(vec![]),
@@ -625,6 +657,7 @@ mod tests {
             screens: vec![screen(1)],
             frames: vec![CGRect::ZERO],
             spaces: vec![Some(space(10))],
+            space_positions: vec![],
             scale_factors: vec![1.0],
             converter: CoordinateConverter::default(),
             on_screen: WindowsOnScreen::new(vec![]),
@@ -690,6 +723,7 @@ mod tests {
             screens: vec![screen(1)],
             frames: vec![CGRect::ZERO],
             spaces: vec![Some(space(10))],
+            space_positions: vec![],
             scale_factors: vec![1.0],
             converter: CoordinateConverter::default(),
             on_screen: WindowsOnScreen::new(vec![]),
@@ -710,6 +744,7 @@ mod tests {
             screens: vec![screen(1)],
             frames: vec![CGRect::ZERO],
             spaces: vec![Some(space(10))],
+            space_positions: vec![],
             scale_factors: vec![1.0],
             converter: CoordinateConverter::default(),
             on_screen: WindowsOnScreen::new(vec![]),

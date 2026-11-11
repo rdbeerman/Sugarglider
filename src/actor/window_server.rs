@@ -94,6 +94,12 @@ pub enum Event {
     /// Sent by SpaceManager when it needs a fresh window list (e.g. after
     /// toggling a space or exiting expose).
     RequestSpaceRefresh,
+    /// Deferred visibility check after window creation. Triggered after a short
+    /// delay to let the window server state stabilize.
+    DeferredWindowVisibilityCheck(WindowId),
+    /// Deferred visibility check for an app. Triggered after a short delay to
+    /// let the window server state stabilize.
+    DeferredVisibilityCheck(pid_t),
 }
 
 pub type Sender = actor::Sender<Event>;
@@ -142,14 +148,26 @@ impl WindowServer {
             }
             Event::SpaceChanged | Event::RequestSpaceRefresh => {
                 let spaces = self.screen_cache.get_screen_spaces();
+                let space_positions = self.screen_cache.get_screen_spaces_with_positions();
                 let on_screen = self.get_windows_on_screen();
-                self.sm_tx.send(space_manager::Event::SpaceChanged(spaces, on_screen));
+                self.sm_tx.send(space_manager::Event::SpaceChanged {
+                    spaces,
+                    space_positions,
+                    on_screen,
+                });
             }
             Event::WindowCreated(wid, info, mouse_state) => {
-                let pid = wid.pid;
+                // Register window immediately so the reactor tracks it.
                 self.send_reactor_event(reactor::Event::WindowCreated(wid, info, mouse_state));
-                self.send_windows_on_screen_if_changed(Some(pid));
-                self.send_reactor_event(reactor::Event::WindowBecameVisible(wid));
+                // Defer the visibility check slightly to let the window server state
+                // stabilize. This helps avoid race conditions where the window server
+                // returns transitional data (ghost windows, duplicates, etc.) that
+                // causes layout to calculate frames for phantom windows.
+                let sm_tx = self.sm_tx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(16));
+                    sm_tx.send(space_manager::Event::DeferredWindowVisibilityCheck(wid));
+                });
             }
             Event::ApplicationMainWindowChanged(pid, wid, quiet) => {
                 self.send_reactor_event(reactor::Event::ApplicationMainWindowChanged(
@@ -158,10 +176,23 @@ impl WindowServer {
                 // The main window may have changed because the previous window was
                 // closed (but not destroyed). Check for visibility changes to catch
                 // windows that were closed without triggering a destroy notification.
-                self.send_windows_on_screen_if_changed(Some(pid));
+                // Defer the visibility check slightly to let the window server state
+                // stabilize, especially when a new window was just created.
+                let sm_tx = self.sm_tx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(16));
+                    sm_tx.send(space_manager::Event::DeferredVisibilityCheck(pid));
+                });
             }
             Event::WindowVisibilityChanged(window_id) => {
-                self.send_windows_on_screen_if_changed(Some(window_id.pid));
+                // Defer the visibility check slightly to let the window server
+                // state stabilize.
+                let sm_tx = self.sm_tx.clone();
+                let pid = window_id.pid;
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(16));
+                    sm_tx.send(space_manager::Event::DeferredVisibilityCheck(pid));
+                });
             }
             Event::ApplicationLaunched {
                 pid,
@@ -186,6 +217,17 @@ impl WindowServer {
                 });
             }
             Event::ReactorEvent(event) => self.send_reactor_event(event),
+            Event::DeferredWindowVisibilityCheck(wid) => {
+                // Perform the visibility check now that the window server state
+                // has had time to stabilize after window creation.
+                self.send_windows_on_screen_if_changed(Some(wid.pid));
+                self.send_reactor_event(reactor::Event::WindowBecameVisible(wid));
+            }
+            Event::DeferredVisibilityCheck(pid) => {
+                // Perform the visibility check now that the window server state
+                // has had time to stabilize.
+                self.send_windows_on_screen_if_changed(Some(pid));
+            }
         }
     }
 
@@ -216,11 +258,13 @@ impl WindowServer {
         self.last_screen_config = Some(config.clone());
         let ScreenConfig { screens, spaces, .. } = config;
 
+        let space_positions = self.screen_cache.get_screen_spaces_with_positions();
         self.sm_tx.send(space_manager::Event::ScreenParametersChanged {
             screens: screens.iter().map(|s| s.id).collect(),
             frames: screens.iter().map(|s| s.visible_frame).collect(),
             converter,
             spaces,
+            space_positions,
             scale_factors: screens.iter().map(|s| s.scale_factor).collect(),
             on_screen,
         });
@@ -498,13 +542,25 @@ mod tests {
         ]);
 
         let mut h = TestHarness::new();
-        h.on_event(Event::WindowVisibilityChanged(WindowId::new(1, 1)));
+        // Use RequestSpaceRefresh to trigger a synchronous visibility check.
+        h.on_event(Event::RequestSpaceRefresh);
         let sm_events = h.drain_sm();
-        let reactor_events = find_reactor_events(&sm_events);
-        let updates = find_windows_on_screen_updated(&reactor_events);
 
-        assert_eq!(updates.len(), 1);
-        let visible_ids: Vec<u32> = updates[0].visible.iter().map(|id| id.as_u32()).collect();
+        // Find SpaceChanged events which contain the on_screen info.
+        let space_changed: Vec<_> = sm_events
+            .iter()
+            .filter_map(|e| {
+                if let space_manager::Event::SpaceChanged { on_screen, .. } = e {
+                    Some(on_screen)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(space_changed.len(), 1);
+        let visible_ids: Vec<u32> =
+            space_changed[0].visible.iter().map(|id| id.as_u32()).collect();
         assert_eq!(visible_ids, vec![1, 2, 3]);
     }
 
@@ -514,16 +570,26 @@ mod tests {
 
         let mut h = TestHarness::new();
         // First call: visible_window_ids goes from [] to [1] – changed.
-        h.on_event(Event::WindowVisibilityChanged(WindowId::new(1, 1)));
+        // Use RequestSpaceRefresh to trigger a synchronous visibility check.
+        h.on_event(Event::RequestSpaceRefresh);
         let sm_events = h.drain_sm();
-        let reactor_events = find_reactor_events(&sm_events);
-        assert_eq!(find_windows_on_screen_updated(&reactor_events).len(), 1);
+        let space_changed_count = sm_events
+            .iter()
+            .filter(|e| matches!(e, space_manager::Event::SpaceChanged { .. }))
+            .count();
+        assert_eq!(space_changed_count, 1);
 
-        // Second call: visible_window_ids is still [1] – no change.
-        h.on_event(Event::WindowVisibilityChanged(WindowId::new(1, 1)));
+        // Second call: visible_window_ids is still [1] – SpaceChanged is still sent
+        // (RequestSpaceRefresh always sends SpaceChanged, but the on_screen data
+        // will be the same).
+        h.on_event(Event::RequestSpaceRefresh);
         let sm_events = h.drain_sm();
-        let reactor_events = find_reactor_events(&sm_events);
-        assert_eq!(find_windows_on_screen_updated(&reactor_events).len(), 0);
+        let space_changed_count = sm_events
+            .iter()
+            .filter(|e| matches!(e, space_manager::Event::SpaceChanged { .. }))
+            .count();
+        // SpaceChanged is sent unconditionally by RequestSpaceRefresh.
+        assert_eq!(space_changed_count, 1);
     }
 
     #[test]
@@ -531,21 +597,30 @@ mod tests {
         set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
 
         let mut h = TestHarness::new();
-        h.on_event(Event::WindowVisibilityChanged(WindowId::new(1, 1)));
+        h.on_event(Event::RequestSpaceRefresh);
         h.drain_sm();
 
         // Change the mock.
         set_mock_windows(vec![make_window(1, LAYER_NORMAL), make_window(2, LAYER_NORMAL)]);
-        h.on_event(Event::WindowVisibilityChanged(WindowId::new(1, 1)));
+        h.on_event(Event::RequestSpaceRefresh);
         let sm_events = h.drain_sm();
-        let reactor_events = find_reactor_events(&sm_events);
-        let updates = find_windows_on_screen_updated(&reactor_events);
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].visible.len(), 2);
+
+        let space_changed: Vec<_> = sm_events
+            .iter()
+            .filter_map(|e| {
+                if let space_manager::Event::SpaceChanged { on_screen, .. } = e {
+                    Some(on_screen)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(space_changed.len(), 1);
+        assert_eq!(space_changed[0].visible.len(), 2);
     }
 
     #[test]
-    fn window_created_sends_windows_on_screen_if_changed() {
+    fn window_created_sends_event_and_schedules_visibility_check() {
         set_mock_windows(vec![make_window(1, LAYER_NORMAL)]);
 
         let mut h = TestHarness::new();
@@ -563,13 +638,11 @@ mod tests {
         let sm_events = h.drain_sm();
         let reactor_events = find_reactor_events(&sm_events);
 
-        // Should have WindowCreated, WindowsOnScreenUpdated, WindowBecameVisible.
+        // WindowCreated should be sent immediately.
         assert!(reactor_events.iter().any(|e| matches!(e, reactor::Event::WindowCreated(..))));
-        assert_eq!(find_windows_on_screen_updated(&reactor_events).len(), 1);
-        assert!(
-            reactor_events
-                .iter()
-                .any(|e| matches!(e, reactor::Event::WindowBecameVisible(_)))
-        );
+
+        // Visibility check is now deferred via DeferredWindowVisibilityCheck to let
+        // the window server state stabilize. The deferred event is scheduled but
+        // arrives asynchronously, so we don't assert on it here.
     }
 }

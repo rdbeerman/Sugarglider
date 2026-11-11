@@ -27,6 +27,16 @@ impl SpaceId {
     }
 }
 
+/// A stable logical identifier for a space: its position within its display.
+/// Survives macOS space ID reassignments (e.g., after display reconnection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SpacePosition {
+    /// Index in the screen list (corresponds to ScreenCache.uuids / reactor.screens)
+    pub screen_index: usize,
+    /// Index within that display's space list (0-based)
+    pub space_index: usize,
+}
+
 /// Calculates the screen and space configuration.
 pub struct ScreenCache<S: System = Actual> {
     system: S,
@@ -126,6 +136,13 @@ impl<S: System> ScreenCache<S> {
             })
             .map(|id| Some(SpaceId(NonZeroU64::new(id)?)))
             .collect()
+    }
+
+    /// Returns (SpaceId, SpacePosition) for each screen's current space.
+    /// Position includes the space's index within its display, useful for
+    /// detecting when macOS reassigns space IDs.
+    pub fn get_screen_spaces_with_positions(&self) -> Vec<Option<(SpaceId, SpacePosition)>> {
+        get_space_positions(&self.uuids)
     }
 }
 
@@ -304,6 +321,94 @@ pub fn get_active_space_number() -> Option<usize> {
         }
     }
     None
+}
+
+/// Returns (SpaceId, SpacePosition) for each screen's current space.
+/// Uses CGSCopyManagedDisplaySpaces to find each space's index within its display.
+pub fn get_space_positions(
+    screen_uuids: &[CFRetained<CFString>],
+) -> Vec<Option<(SpaceId, SpacePosition)>> {
+    let cid = unsafe { CGSMainConnectionID() };
+    let Some(space_info) = (unsafe { Retained::from_raw(CGSCopyManagedDisplaySpaces(cid)) }) else {
+        return vec![None; screen_uuids.len()];
+    };
+
+    let mut result = Vec::with_capacity(screen_uuids.len());
+
+    for (screen_index, screen_uuid) in screen_uuids.iter().enumerate() {
+        // Get current space ID for this screen
+        let current_id = unsafe { CGSManagedDisplayGetCurrentSpace(cid, screen_uuid) };
+        let Some(space_id) = NonZeroU64::new(current_id).map(SpaceId) else {
+            result.push(None);
+            continue;
+        };
+
+        // Find this display in space_info and locate the space's index
+        let mut found_position = None;
+        for display_info in &space_info {
+            let Ok(display_dict): Result<Retained<NSDictionary>, _> = display_info.downcast()
+            else {
+                continue;
+            };
+
+            // Check if this is the matching display (by comparing UUIDs)
+            let Some(display_uuid) = (|| {
+                let uuid: Retained<NSNumber> = display_dict
+                    .valueForKey(ns_string!("Display Identifier"))?
+                    .downcast()
+                    .ok()?;
+                Some(uuid)
+            })() else {
+                // Try as NSString instead
+                let Some(display_uuid_str) = (|| {
+                    let uuid_obj = display_dict.valueForKey(ns_string!("Display Identifier"))?;
+                    // Get the description as a string for comparison
+                    Some(format!("{:?}", uuid_obj))
+                })() else {
+                    continue;
+                };
+                let screen_uuid_str = screen_uuid.to_string();
+                if !display_uuid_str.contains(&screen_uuid_str) {
+                    continue;
+                }
+
+                // Found our display, now find the space's index
+                let Some(spaces): Option<Retained<NSArray>> = (|| {
+                    display_dict.valueForKey(ns_string!("Spaces"))?.downcast().ok()
+                })() else {
+                    continue;
+                };
+
+                for (space_index, space) in spaces.iter().enumerate() {
+                    let Some(managed_id) = (|| {
+                        let space_dict: Retained<NSDictionary> = space.downcast().ok()?;
+                        let id: Retained<NSNumber> = space_dict
+                            .valueForKey(ns_string!("ManagedSpaceID"))?
+                            .downcast()
+                            .ok()?;
+                        Some(id)
+                    })() else {
+                        continue;
+                    };
+
+                    if managed_id.as_u64() == current_id {
+                        found_position = Some(SpacePosition { screen_index, space_index });
+                        break;
+                    }
+                }
+                break;
+            };
+
+            // Display Identifier matched as NSNumber path - shouldn't normally happen
+            // but handle it for robustness
+            let _ = display_uuid;
+            continue;
+        }
+
+        result.push(found_position.map(|pos| (space_id, pos)));
+    }
+
+    result
 }
 
 /// Utilities for querying the current system configuration. For diagnostic purposes only.
